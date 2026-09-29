@@ -249,7 +249,14 @@ void ternary_pq2_gemv_w_kernel(const __nv_bfloat16* __restrict__ x,
 // against the ~28 the group itself costs, so M=2 lands at 1.67x the kT=1 tile rather than ~1.05x.
 // What the probe did find is pure waste: instantiating kT=4 for a 2-token verify measured 1.283 ms
 // against 1.024 ms for a real kT=2, so the launcher now picks kT from the token count.
-template <int kT>
+// kUnroll is the group-walk unroll, and on this kernel it is the same lever the T=1 GEMV is tuned
+// with -- that kernel's own curve is 1 -> 29.9, 2 -> 34.1, 4 -> 40.4, 8 -> 41.6, 12 -> 33.9, and the
+// document calls it the only control on memory-level parallelism. The tile kernel carried NO pragma
+// on this loop, so ptxas chose for itself while the per-token work (a load, two converts and five
+// FMAs per token per group) was added on top. One extra token costs 0.60 of a whole T=1 step, which
+// is what makes MTP lose on prose, so if that cost is a missing pipeline rather than real traffic
+// this is where it shows.
+template <int kT, int kUnroll = 4>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
 void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                                   const std::uint8_t* __restrict__ codes,
@@ -278,6 +285,7 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
 #pragma unroll
     for (int t = 0; t < kT; ++t) { accumulator[t] = 0.0f; }
 
+#pragma unroll(kUnroll)
     for (int group = 0; group < groups_per_row; ++group) {
         // Weights: one byte of codes + one 16-bit scale, reused across every token in the tile.
         const std::uint8_t raw = code_row[group * kGemvCodeBytesPerGroup + lane];
@@ -352,7 +360,13 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
 // runs 43 registers at ~83% occupancy, and this file's own note says occupancy is what the
 // GEMV family is tuned for. Pinning the bound makes ptxas trade registers for resident warps;
 // the measured effect is in the plan document.
-template <int kR, int kT>
+// kUnroll is the group-walk unroll. Unlike the small-tile kernel above, this one measures BEST
+// UNROLLED AT DEPTH 1 -- i.e. with no pragma at all, which is what it shipped with. The token loop
+// inside it is already fully unrolled at kT=8, so deepening the group walk multiplies an
+// already-large body: on the repeated-sentence prompt at K=7 the arms measure depth 1 -> 62.9,
+// 2 -> 46.9, 4 -> 34.9, 8 -> 34.7, 16 -> 18.8 t/s. The default is therefore 1 and
+// NINFER_TERNARY_BLOCK_UNROLL exists only to keep the negative result reproducible.
+template <int kR, int kT, int kUnroll = 1>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32, kBlockMinCtasPerSm)
 void ternary_pq2_gemv_tile_block_kernel(const __nv_bfloat16* __restrict__ x,
                                         const std::uint8_t* __restrict__ codes,
@@ -387,9 +401,9 @@ void ternary_pq2_gemv_tile_block_kernel(const __nv_bfloat16* __restrict__ x,
         for (int t = 0; t < kT; ++t) { accumulator[r][t] = 0.0f; }
     }
 
+#pragma unroll(kUnroll)
     for (int group = 0; active && group < groups_per_row; ++group) {
         const std::int32_t base = group * kGemvGroupK + lane * 4;
-
         // Activations: loaded ONCE per group and reused by every row this warp owns. This is the
         // whole point of kR -- with kR == 1 they are re-loaded for each row the warp covers.
         float2 low[kT];

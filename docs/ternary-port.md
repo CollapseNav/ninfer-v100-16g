@@ -578,6 +578,58 @@ Upstream's V100 and 5090 numbers are not mysterious by comparison: on the 5090 t
 with a 0.10 marginal gives a break-even acceptance of 0.15, which is why their story fixtures still
 win 1.63x at 37.9% acceptance.
 
+**The missing unroll -- this one shipped, and it flips prose MTP from a loss into a win.** The
+small-tile GEMV's group walk carried **no `#pragma unroll` at all**. The T=1 GEMV's own curve
+(1 -> 29.9, 2 -> 34.1, 4 -> 40.4, 8 -> 41.6, 12 -> 33.9 t/s) is this family's only control on
+memory-level parallelism, and it was simply absent here while the per-token work was layered on top.
+Measured at MTP K=3 (T=4), prose:
+
+| tile unroll | 1 | 2 | **4** | 8 | 16 |
+|---|---:|---:|---:|---:|---:|
+| decode t/s | 31.7 | 36.6 | **42.0** | 38.8 | 36.8 |
+
+and at K=1 (T=2), where depth 8 is the better arm: unroll 4 -> 50.5, **8 -> 51.8**. The default is
+therefore per-`kT` (8 at two tokens, 4 at three and four) with `NINFER_TERNARY_GEMV_TILE_UNROLL`
+overriding it.
+
+The row-blocked kernel, which serves every verify pass wider than four tokens, has the same shape of
+loop and behaves the **opposite** way: its token loop is already fully unrolled at kT=8, so deepening
+the group walk only inflates an already-large body. K=7 on the repeated-sentence prompt:
+
+| block unroll | **1** | 2 | 4 | 8 | 16 |
+|---|---:|---:|---:|---:|---:|
+| decode t/s | **63.1** | 46.9 | 34.9 | 34.7 | 18.8 |
+
+Depth 1 is what it shipped with, so the kernel keeps no pragma and `NINFER_TERNARY_BLOCK_UNROLL`
+exists only to keep the negative result reproducible.
+
+The K sweep after the fix, same prose prompt as the acceptance table above:
+
+| K | no spec | 1 | 2 | 3 | 4 | 5 | 7 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| decode t/s | 43.7 | **51.8** | **48.1** | 41.9 | 20.8 | 18.4 | 18.8 |
+| acceptance length | -- | 1.58 | 1.89 | 1.93 | 2.16 | 1.95 | 2.07 |
+
+**K=1 is +18.5% and K=2 is +10.1% over no spec on ordinary prose**, which is the first time this
+port beats its own baseline with speculation on text that is not reproducing the prompt. Note what
+the fix did *not* change: the acceptance, the cost model, or the shape of the curve. It removed dead
+latency from the verify kernel and the two smallest windows fell out on the winning side of the 0.60
+break-even. K=4 and K=5 are still far below the model's 27.8 and 21.4 because `T >= 5` switches to
+the row-blocked kernel; extending the small-tile GEMV past four tokens is the next thing to measure
+there.
+
+**Correctness caveat, pre-existing and unexplained.** Under `--greedy --print-token-ids` the
+speculative paths do **not** always reproduce the no-spec token sequence. On this prompt the greedy
+ids agree for twelve tokens and then fork: `{K=1, K=3}` continue one way and `{K=7, no spec}` the
+other, each group deterministically. The unroll is **not** the cause -- `NINFER_TERNARY_GEMV_TILE_UNROLL`
+1, 4 and 8 produce byte-identical ids and the no-spec arm is stable across repetitions -- so this has
+been true of the port all along. The prime suspect is the attention kernel the verify band selects:
+the T=2..4 pass runs `causal_attention_small_t_tc_volta_partial_i8_kernel` (tensor-core, fp16
+accumulation) where a T=1 step runs the fp32 `gqa_attention_volta_flash` kernel, and a single flipped
+argmax at a near-tie forks everything after it. The K=7 arm landing on the no-spec side is not
+evidence of exactness, only of a different rounding pattern. This needs its own investigation before
+the MTP path can be called token-exact; the throughput numbers above are unaffected by it.
+
 **Three fixes were attempted and all are refuted.**
 
 *Occupancy.* The tile kernel was the obvious suspect: the T=1 kernel is pinned at 62 registers and

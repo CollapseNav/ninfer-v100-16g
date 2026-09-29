@@ -273,27 +273,52 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
     } else {
         // kT follows the real token count. Instantiating <4> for every verify measured 1.283 ms at
         // two live tokens against 1.024 ms for a real kT=2, so the guard waste is a fifth of the pass.
+        //
+        // The unroll is a separate knob because one extra verified token costs 0.60 of a whole T=1
+        // step, and this loop had no pragma at all: ptxas chose for itself while the per-token work
+        // (a load, two converts and five FMAs per token per group) was layered on top of it. The T=1
+        // GEMV's own curve is 1 -> 29.9, 2 -> 34.1, 4 -> 40.4, 8 -> 41.6, 12 -> 33.9 t/s, so the
+        // depth is worth measuring rather than inheriting. 4 is the unmeasured starting point.
+        static const int unroll = [] {
+            const char* value = std::getenv("NINFER_TERNARY_GEMV_TILE_UNROLL");
+            const int parsed  = value == nullptr ? 0 : std::atoi(value);
+            return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8 || parsed == 16) ? parsed
+                                                                                               : 0;
+        }();
+        // Measured on prose with MTP K=1..3: the two-token tile wants depth 8 (51.8 t/s against
+        // 50.5 at 4), the four-token tile wants 4 (42.0 against 38.8 at 8). One default per kT is
+        // therefore the honest encoding of the sweep, and the env still overrides both.
+        const int depth = unroll != 0 ? unroll : (tokens == 2 ? 8 : 4);
+        const auto launch_tile = [&](auto token_tag, auto unroll_tag) {
+            ternary_pq2_gemv_tile_kernel<decltype(token_tag)::value,
+                                         decltype(unroll_tag)::value><<<grid, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales),
+                static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens, out_row_stride);
+        };
+        using std::integral_constant;
         switch (tokens) {
         case 2:
-            ternary_pq2_gemv_tile_kernel<2><<<grid, block, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const std::uint8_t*>(w.qdata),
-                static_cast<const std::uint8_t*>(w.scales),
-                static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens, out_row_stride);
+            if (depth == 1) { launch_tile(integral_constant<int, 2>{}, integral_constant<int, 1>{}); }
+            else if (depth == 2) { launch_tile(integral_constant<int, 2>{}, integral_constant<int, 2>{}); }
+            else if (depth == 4) { launch_tile(integral_constant<int, 2>{}, integral_constant<int, 4>{}); }
+            else if (depth == 16) { launch_tile(integral_constant<int, 2>{}, integral_constant<int, 16>{}); }
+            else { launch_tile(integral_constant<int, 2>{}, integral_constant<int, 8>{}); }
             break;
         case 3:
-            ternary_pq2_gemv_tile_kernel<3><<<grid, block, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const std::uint8_t*>(w.qdata),
-                static_cast<const std::uint8_t*>(w.scales),
-                static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens, out_row_stride);
+            if (depth == 1) { launch_tile(integral_constant<int, 3>{}, integral_constant<int, 1>{}); }
+            else if (depth == 2) { launch_tile(integral_constant<int, 3>{}, integral_constant<int, 2>{}); }
+            else if (depth == 8) { launch_tile(integral_constant<int, 3>{}, integral_constant<int, 8>{}); }
+            else if (depth == 16) { launch_tile(integral_constant<int, 3>{}, integral_constant<int, 16>{}); }
+            else { launch_tile(integral_constant<int, 3>{}, integral_constant<int, 4>{}); }
             break;
         default:
-            ternary_pq2_gemv_tile_kernel<4><<<grid, block, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const std::uint8_t*>(w.qdata),
-                static_cast<const std::uint8_t*>(w.scales),
-                static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens, out_row_stride);
+            if (depth == 1) { launch_tile(integral_constant<int, 4>{}, integral_constant<int, 1>{}); }
+            else if (depth == 2) { launch_tile(integral_constant<int, 4>{}, integral_constant<int, 2>{}); }
+            else if (depth == 8) { launch_tile(integral_constant<int, 4>{}, integral_constant<int, 8>{}); }
+            else if (depth == 16) { launch_tile(integral_constant<int, 4>{}, integral_constant<int, 16>{}); }
+            else { launch_tile(integral_constant<int, 4>{}, integral_constant<int, 4>{}); }
             break;
         }
     }
@@ -389,14 +414,14 @@ void launch_ternary_gemm_t1(const Tensor& x, const Weight& w, Tensor& out,
 
 // One (kR, kT) instantiation of the blocked GEMV: grid.x tiles the rows in strides of
 // warps*kR, grid.y tiles the tokens in kT.
-template <int kR, int kT>
+template <int kR, int kT, int kUnroll = 1>
 void launch_pq2_gemv_tile_block_shape(const Tensor& x, const Weight& w, Tensor& out,
                                       std::int32_t out_row_stride, std::int32_t groups_per_row,
                                       std::int32_t tokens, cudaStream_t stream) {
     const dim3 grid(static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock * kR)),
                     static_cast<unsigned>(div_up(tokens, kT)), 1u);
     const dim3 block(kGemvWarpsPerBlock * 32, 1u, 1u);
-    ternary_pq2_gemv_tile_block_kernel<kR, kT><<<grid, block, 0, stream>>>(
+    ternary_pq2_gemv_tile_block_kernel<kR, kT, kUnroll><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
         groups_per_row, tokens, out_row_stride);
@@ -434,7 +459,30 @@ void launch_pq2_gemv_tile_block(const Tensor& x, const Weight& w, Tensor& out,
             x, w, out, out_row_stride, groups_per_row, tokens, stream);
         CUDA_CHECK(cudaGetLastError());
     };
+    // The shipped 4x8 shape is the one the wide verify passes use, so it gets the unroll sweep; the
+    // other eleven shapes stay at the default depth to keep the (kR,kT) sweep compilable.
+    const auto shape_u = [&](auto rows_tag, auto token_tag, auto unroll_tag) {
+        launch_pq2_gemv_tile_block_shape<decltype(rows_tag)::value, decltype(token_tag)::value,
+                                         decltype(unroll_tag)::value>(
+            x, w, out, out_row_stride, groups_per_row, tokens, stream);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    static const int block_unroll = [] {
+        const char* value = std::getenv("NINFER_TERNARY_BLOCK_UNROLL");
+        const int parsed  = value == nullptr ? 0 : std::atoi(value);
+        return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8 || parsed == 16) ? parsed : 1;
+    }();
     using std::integral_constant;
+
+    if (block_unroll != 1) {
+        switch (block_unroll) {
+        case 2: shape_u(integral_constant<int, 4>{}, integral_constant<int, 8>{}, integral_constant<int, 2>{}); return;
+        case 4: shape_u(integral_constant<int, 4>{}, integral_constant<int, 8>{}, integral_constant<int, 4>{}); return;
+        case 8: shape_u(integral_constant<int, 4>{}, integral_constant<int, 8>{}, integral_constant<int, 8>{}); return;
+        case 16: shape_u(integral_constant<int, 4>{}, integral_constant<int, 8>{}, integral_constant<int, 16>{}); return;
+        default: break;
+        }
+    }
 
     if (rows_block == 1 && token_block == 2) { shape(integral_constant<int, 1>{}, integral_constant<int, 2>{}); }
     else if (rows_block == 1 && token_block == 4) { shape(integral_constant<int, 1>{}, integral_constant<int, 4>{}); }
