@@ -256,8 +256,9 @@ void launch_pq2_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t
     launch_gemv_t1(x, w, out, groups_per_row, stream);
 }
 
-// NINFER_TERNARY_FP16_ACT=2 selects the bit-exact fp16 variant (container only, fp32 dot chain);
-// =1 selects the half2 dot, which rounds the group sum once to fp16.
+// NINFER_TERNARY_FP16_ACT selects the verify band's dot. Unset or "1" is the half2 dot, which
+// rounds the group sum once to fp16 and is the default; "2" is the control arm (same fp16 container,
+// original fp32 chain); "0" keeps the bf16 activation entirely.
 bool fp16_mode2() {
     static const bool value = [] {
         const char* env = std::getenv("NINFER_TERNARY_FP16_ACT");

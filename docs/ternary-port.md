@@ -1139,11 +1139,15 @@ everything after it changing with it. The MTP acceptance length drifts slightly 
 K=1, 1.93 -> 1.87 at K=3, 2.07 -> 1.98 at K=7) and is unchanged on the repeat prompt (13.11).
 
 There is **no continuous measure that covers T = 2..16**: the perplexity harness runs the prefill
-route, so the only quality evidence available for this band is the smoke test above. On that basis the
-fp16 dot ships **opt-in with the default unchanged**: it is a 5-13% gain on the verify band and a
-documented, unquantified logit change. Flipping the default is a one-line change if that trade is
-acceptable, and the acceptance drift suggests the cost is at the rounding level rather than
-systematic.
+route, so the only quality evidence available for this band is the smoke test above. **The fp16 dot is
+the default anyway**, and the trade is smaller than it sounds. This is a 2-bit-weight model: the
+weights carry four levels, the activations arrive as bf16 (8 mantissa bits, 2^-8 = 4e-3 of relative
+quantization noise), and the KV cache is int8. One rounding of a four-term sum whose inputs are
+already only 8 bits deep costs 2^-11 = 5e-4 -- an order of magnitude *below* the noise the model
+already carries. Alongside that, the logit change is of the same kind and magnitude this port already
+accepts between its speculative and non-speculative paths, and the acceptance drift sits at the
+rounding level rather than being systematic. `NINFER_TERNARY_FP16_ACT=0` restores the bf16 path, and `=2` selects the fp32-dot control
+that the table above shows losing.
 
 Decode at T=1 and the whole prefill route are untouched by construction (they stay bf16), and measured
 so: no-spec decode 43.7 either way, prefill 3412 tokens 1.20k with the flag off and 1.21k with it on.

@@ -88,10 +88,12 @@ Tensor folded_activation(const Tensor& x, const Weight& weight, WorkspaceArena& 
         const char* env = std::getenv("NINFER_TERNARY_TILE_WIDE");
         return env == nullptr || std::string(env) != "0";
     }();
+    // "1" and "2" both ask for the fp16 container and the dot mode is chosen in the GEMV; unset is
+    // the default and means the same as "1". Only "0" restores the bf16 path.
     static const bool fp16_act = [] {
         const char* env = std::getenv("NINFER_TERNARY_FP16_ACT");
-        return env != nullptr && std::string(env) != "0";
-    }();  // "1" and "2" both ask for the fp16 container; the dot mode is chosen in the GEMV
+        return env == nullptr || std::string(env) != "0";
+    }();
     const bool want_fp16 = fp16_act && wide_tile && x.ne[1] >= 2 && x.ne[1] <= 16;
     const DeviceSpan span =
         workspace.alloc_bytes(ternary_rotation_workspace_bytes(weight.k, x.ne[1]));
