@@ -994,6 +994,9 @@ is built on, measured on a second implementation on the same hardware, and it sa
 achievable. How the weight is shared across the token dimension inside the kernel is the difference,
 and it is the most concrete lead left for this port's verify path.
 
-Operational note: `--spec-draft-n-max 7` takes the server down on a 16 GB card (the connection is
-dropped mid-run and the port stops accepting); 1/3/5 are stable. The 9.90 GB model plus a 0.93 GB
-mmproj plus an 8,192-token KV cache leaves no room for the widest draft window.
+Operational note, measured: after the model loads, `nvidia-smi` reports **16,063 of 16,384 MiB in
+use** -- the 9.90 GB model plus the 0.93 GB mmproj plus the KV/graph allocations leave almost nothing.
+At `--spec-draft-n-max 7` a 42-token request still completes (47.3 t/s, 93/219 drafts accepted,
+42.5%), but the 3,360-token request drops the connection and the server then refuses further ones.
+n-max 1, 3 and 5 all complete the same long-prompt request. So the widest window is not usable at
+this context on 16 GB, which is a memory limit rather than a throughput one.
