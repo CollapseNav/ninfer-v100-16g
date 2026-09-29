@@ -545,6 +545,74 @@ group and reuses them for every token in the tile. Three defects were found and 
    replaces them.
 3. The per-token activation pointer was recomputed inside the group walk; it is now hoisted.
 
+**Why an MTP round costs what it costs, and why prose cannot win.** A profile of one decode round
+(`nvprof --print-gpu-trace`, slice between two consecutive once-per-token sample kernels, 88-token
+context) gives the verify pass's true price. Per round, 401 routed linears each:
+
+| round | verify kernel | calls | total | per call | vs a T=1 step |
+|---|---|---:|---:|---:|---:|
+| no spec (T=1) | `ternary_pq2_gemv_w_kernel` | 401 | 18.06 ms | 45 µs | 1.00x |
+| K=3 (T=4) | `ternary_pq2_gemv_tile_kernel<4>` | 401 | 50.59 ms | 126 µs | **2.80x** |
+| K=7 (T=8) | `ternary_pq2_gemv_tile_block_kernel<4,8>` | 401 | 93.43 ms | 233 µs | **5.17x** |
+
+Both differences give the same **marginal cost of one extra verified token: 0.60 of a whole T=1
+step**, and that single number decides the whole feature. A round costs `1 + 0.60*(T-1)` and yields
+`1 + sum(position acceptances)`, so a verified slot only pays for itself when its acceptance exceeds
+0.60. Measured acceptance by draft position on the same prose prompt (counts over the rounds):
+
+| K | decode t/s | rounds | pos1 | pos2 | pos3 | pos4 | pos5 | pos6 | pos7 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 43.1 | 125 | 58.4% | -- | -- | -- | -- | -- | -- |
+| 2 | 40.8 | 105 | 60.0% | 28.6% | -- | -- | -- | -- | -- |
+| 3 | 31.7 | 103 | 48.5% | 30.1% | 14.6% | -- | -- | -- | -- |
+| 4 | 20.8 | 92 | 55.4% | 38.0% | 13.0% | 9.8% | -- | -- | -- |
+| 5 | 18.4 | 102 | 47.1% | 27.5% | 13.7% | 5.9% | 1.0% | -- | -- |
+| 7 | 18.8 | 96 | 54.2% | 30.2% | 15.6% | 6.3% | 1.0% | **0** | **0** |
+| no spec | 43.8 | -- | -- | -- | -- | -- | -- | -- | -- |
+
+The model reproduces the measurements to a few percent: K=3 costs 2.80 for 1.93 tokens = 0.69x
+(measured 31.7/43.8 = 0.72), K=7 costs 5.20 for 2.07 = 0.40x (measured 0.43). **No position and no
+window wins**: positions 6 and 7 are never accepted, position 5 once in 102 rounds, and even
+position 1 at 48-60% is at or below the 0.60 break-even. K=1 is the best arm and it is a 1.6% loss.
+Upstream's V100 and 5090 numbers are not mysterious by comparison: on the 5090 the same arithmetic
+with a 0.10 marginal gives a break-even acceptance of 0.15, which is why their story fixtures still
+win 1.63x at 37.9% acceptance.
+
+**Three fixes were attempted and all are refuted.**
+
+*Occupancy.* The tile kernel was the obvious suspect: the T=1 kernel is pinned at 62 registers and
+32 warps/SM, while the tile kernel carried no `__launch_bounds__` second argument at all. It does not
+need one -- `tile_kernel<4>` compiles to **32 registers**, the minimum of the family, and therefore
+already runs at maximum occupancy. There is no register budget to reclaim.
+
+*Routing the verify band to the row-blocked kernel.* The tile kernel re-reads the activation once per
+output row, and the row-blocked kernel exists precisely to amortise that over `kR` rows (loads per
+FMA 0.56 at kR=1/kT=4 against 0.19 at kR=4/kT=4). The author measured it losing on Ada (MTP decode
+43.0 -> 32.8 t/s) because there the tile kernel was issue-bound at 95% occupancy; on Volta that
+argument is gone, so it was re-measured in situ at K=3:
+
+| (kR,kT) | 1,2 | 1,4 | 1,8 | 2,2 | 2,4 | 2,8 | 4,2 | 4,4 | 4,8 | 8,2 | 8,4 | tile<4> |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| decode t/s | 19.6 | 23.5 | 14.5 | 22.3 | 30.3 | 17.1 | 23.1 | 26.7 | 19.0 | 16.6 | 17.9 | **31.7** |
+
+The Ada result reproduces on Volta: nothing in that family reaches the tile kernel. The switch is kept
+as `NINFER_TERNARY_T2BLOCK` (off by default) so the measurement can be repeated.
+
+*Shape sweeping the wide verify band.* K=7's T=8 pass goes to `gemv_tile_block_kernel<kR,kT>`; swept
+with `NINFER_TERNARY_ROWS` x `NINFER_TERNARY_TILE` on the repeated-sentence prompt (no spec 43.5,
+default kR=4/kT=8 = 63.1): r4t4 **63.8**, r2t4 58.2, r2t8 57.0, r8t4 50.5, r1t8 48.5, r1t4 44.8,
+r2t2 44.3, r4t2 43.9, r8t2 39.7, r1t2 37.3, r8t8 22.5. The shipped default is within 1.1% of the best
+of twelve.
+
+**The strategic conclusion.** MTP's marginal token is expensive here for one reason only: the T=1
+decode step is not bandwidth-bound. It moves 7.19 GB of weights in 22.9 ms = **314 GB/s, a third of
+the card's 900 GB/s**, so a second or third token through the same weights costs real issue/latency
+time rather than riding along free. Fix the base decode and MTP follows; tune MTP first and it cannot
+pay. Two corollaries that are easy to get wrong: the K=4 and K=5 arms are worse than the model
+predicts (20.8 and 18.4 against 27.8 and 21.4) because `T >= 5` switches kernels, so the small-tile
+GEMV's `kT` should be extended past 4 before that band is judged; and the draft stack itself is cheap
+-- 15 `w8` and 3 `q4` kernels, 4.2 ms of a 63.6 ms round, 6.6%.
+
 Then the context-lookup fast path, which is what `docs/v100.md`'s 100+ decode numbers actually ride on.
 `lookup_draft()` takes the last 16 tokens and searches the ledger for an earlier occurrence of that
 exact suffix; if it finds one it proposes the tokens that followed it, up to

@@ -73,6 +73,17 @@ std::int64_t rotation_warps(std::int32_t k, std::int32_t tokens) {
     return static_cast<std::int64_t>(k / kBlockSize) * static_cast<std::int64_t>(tokens);
 }
 
+// PROBE: launch the copy-only kernel instead of the real rotation, so the transform's cost can be
+// separated from the launch and memory cost. The output is wrong by construction; see the kernel's
+// comment. `NINFER_TERNARY_ROTATE_PROBE=copy`.
+bool rotation_copy_probe() {
+    static const bool value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_ROTATE_PROBE");
+        return env != nullptr && std::string(env) == "copy";
+    }();
+    return value;
+}
+
 } // namespace
 
 void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
@@ -104,8 +115,16 @@ void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
 
     const std::int64_t warps = rotation_warps(weight.k, x.ne[1]);
     const int warp_block     = rotation_warps_per_block(warps);
-    ternary_rotate_bf16_kernel<<<static_cast<unsigned>((warps + warp_block - 1) / warp_block),
-                                 warp_block * kThreadsPerWarp, 0, stream>>>(
+    const unsigned grid      = static_cast<unsigned>((warps + warp_block - 1) / warp_block);
+    const dim3 block(warp_block * kThreadsPerWarp);
+    if (rotation_copy_probe()) {
+        ternary_rotate_copy_probe_kernel<<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data),
+            weight.k, x.ne[1]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    ternary_rotate_bf16_kernel<<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data),
         weight.hadamard_signs, weight.hadamard_n_blk, weight.k, x.ne[1], perm_hd, perm_nk,
         perm_rep, /*inverse=*/0);

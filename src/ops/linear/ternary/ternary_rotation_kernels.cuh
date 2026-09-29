@@ -69,6 +69,14 @@ __device__ __forceinline__ void normalized_hadamard_d1024_inplace(float (&values
 //     hd = j % perm_hd, q = j / perm_hd, nk = q / perm_rep, rep = q % perm_rep
 //     i  = hd + perm_hd * nk + perm_hd * perm_nk * rep
 // which is the inverse of llama-graph.cpp's reshape(perm_hd, perm_nk, perm_rep) + permute(0,2,1).
+//
+// kPermuted was tried as a TEMPLATE parameter, to make the executed path small and contiguous: the
+// permutation is two integer divisions and a modulo per element and the divisors are runtime values,
+// so as a runtime `if` the compiler emits all of it into the forward-only path (3648 instructions,
+// 80 registers) where it is never executed. Splitting it into <forward,forward+perm,inverse>
+// instantiations cut the hot path to 1784 instructions and 56 registers -- and measured **43.5 t/s
+// against 43.7**, reproducibly, on both repetitions. So code size is not what the kernel's 3.0 us of
+// transform time per call is made of, and the split was reverted.
 __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
                                            __nv_bfloat16* __restrict__ out,
                                            const float* __restrict__ signs, int n_blk, int k,
@@ -87,10 +95,10 @@ __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
     const int block = warp % blocks;
     const int token = warp / blocks;
 
-    const float* const signs_row  = signs + (block % n_blk) * kBlockSize;
-    const bool permuted           = !inverse && perm_rep > 1;
-    const __nv_bfloat16* x_token  = x + static_cast<std::int64_t>(token) * k;
-    __nv_bfloat16* out_token      = out + static_cast<std::int64_t>(token) * k;
+    const float* const signs_row = signs + (block % n_blk) * kBlockSize;
+    const bool permuted          = !inverse && perm_rep > 1;
+    const __nv_bfloat16* x_token = x + static_cast<std::int64_t>(token) * k;
+    __nv_bfloat16* out_token     = out + static_cast<std::int64_t>(token) * k;
 
     float values[32];
 
@@ -167,6 +175,45 @@ __global__ void ternary_rotate_inverse_inplace_bf16_kernel(__nv_bfloat16* __rest
     for (int r = 0; r < 32; ++r) {
         const float value = __fmul_rn(values[r], signs_row[r * 32 + lane]);
         base[(block << 10) + r * 32 + lane] = __float2bfloat16_rn(value);
+    }
+}
+
+// PROBE ONLY -- the output is wrong by construction, never a default.
+//
+// Why this exists: the fold transform is 258 launches per decode token and each one costs ~8.1 us in
+// situ (the NINFER_TERNARY_HADAMARD=0 delta), while its arithmetic accounts for ~0.5 us. The
+// question is what the other 7.5 us is, and no counter is available to ask. This kernel keeps
+// EVERYTHING except the transform: the same one-warp-per-(1024-block, token) grid, the same 32
+// strided 2-byte loads, the same 32 stores, the same register footprint. What is missing is the sign
+// load, the sign multiply, the butterfly and the normalizer. So:
+//
+//   copy probe  vs  real kernel      -> the transform's cost
+//   HADAMARD=0  vs  copy probe       -> the launch plus the memory traffic's cost
+//
+// If the copy probe lands on the real kernel's number, no amount of kernel-side work can help and
+// the only lever is launching fewer of them.
+__global__ void ternary_rotate_copy_probe_kernel(const __nv_bfloat16* __restrict__ x,
+                                                __nv_bfloat16* __restrict__ out, int k,
+                                                int tokens) {
+    const int lane            = threadIdx.x & (kThreadsPerWarp - 1);
+    const int warps_per_block = static_cast<int>(blockDim.x) >> 5;
+    const int warp   = static_cast<int>(blockIdx.x) * warps_per_block + (threadIdx.x >> 5);
+    const int blocks = k >> 10;
+    if (warp >= blocks * tokens) { return; }
+    const int block = warp % blocks;
+    const int token = warp / blocks;
+
+    const __nv_bfloat16* x_token = x + static_cast<std::int64_t>(token) * k;
+    __nv_bfloat16* out_token     = out + static_cast<std::int64_t>(token) * k;
+
+    float values[32];
+#pragma unroll
+    for (int r = 0; r < 32; ++r) {
+        values[r] = __bfloat162float(x_token[(block << 10) + r * 32 + lane]);
+    }
+#pragma unroll
+    for (int r = 0; r < 32; ++r) {
+        out_token[(block << 10) + r * 32 + lane] = __float2bfloat16_rn(values[r]);
     }
 }
 

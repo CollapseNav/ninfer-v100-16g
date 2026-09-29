@@ -357,6 +357,26 @@ bool gemv_admits(const Tensor& x, const Weight& w, std::int32_t max_tokens) {
            (w.k % 128) == 0 && x.ne[1] >= 1 && x.ne[1] <= max_tokens && x.ne[0] == w.k;
 }
 
+// Routing switch for the speculative VERIFY band (T = 2..4), which the small-tile GEMV serves by
+// default. That kernel reads each weight byte once for every token in the tile, but it re-reads the
+// ACTIVATION for every output row: per group per lane it loads 2*kT activation elements against one
+// weight byte. The row-blocked kernel below amortises the activation over kR output rows
+// (loads per FMA = (2*kT + kR) / (4*kR*kT): 0.56 at kR=1,kT=4 against 0.19 at kR=4,kT=4), and it is
+// already the shape used for T = 5..8.
+//
+// Routing T = 2..4 to it LOST on the Ada card the author tuned this on (MTP decode 43.0 -> 32.8 t/s)
+// because there the tile kernel was issue-bound at 95% occupancy. On Volta the balance is different
+// -- the tile kernel<4> compiles to 32 registers and already sits at maximum occupancy, so there is
+// nothing to buy on that side and the activation traffic is all that is left. This switch exists to
+// measure that rather than assume it, with the (kR, kT) pair left to NINFER_TERNARY_ROWS/_TILE.
+bool t2_block_enabled() {
+    static const bool value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_T2BLOCK");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    return value;
+}
+
 void launch_ternary_gemm_t1(const Tensor& x, const Weight& w, Tensor& out,
                             std::int32_t out_row_stride, cudaStream_t stream,
                             TernaryS8Scratch /*scratch*/) {
@@ -734,6 +754,10 @@ void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
     // band as well, so one build can A/B it against the tile GEMV on both shapes that matter.
     if (route == PrefillRoute::Simt && simt_admits(x, w)) {
         launch_ternary_simt_selected(x, w, out, out_row_stride, stream);
+        return;
+    }
+    if (t2_block_enabled() && gemv_admits(x, w, std::numeric_limits<std::int32_t>::max())) {
+        launch_pq2_gemv_tile_block(x, w, out, out_row_stride, stream);
         return;
     }
     if (gemv_admits(x, w, 4)) {
