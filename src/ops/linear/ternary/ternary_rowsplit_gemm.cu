@@ -298,7 +298,26 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
                 static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens, out_row_stride);
         };
         using std::integral_constant;
-        switch (tokens) {
+        // kMaxKt is 8 -- the tile kernel serves the whole verify band -- unless
+        // NINFER_TERNARY_TILE_WIDE=0 hands T >= 5 back to the row-blocked kernel.
+        static const int kMaxKt = [] {
+            const char* value = std::getenv("NINFER_TERNARY_TILE_WIDE");
+            return (value != nullptr && std::string(value) == "0") ? 4 : 8;
+        }();
+        const std::int32_t kt = tokens < kMaxKt ? tokens : kMaxKt;
+        switch (kt) {
+        case 5:
+            launch_tile(integral_constant<int, 5>{}, integral_constant<int, 4>{});
+            break;
+        case 6:
+            launch_tile(integral_constant<int, 6>{}, integral_constant<int, 4>{});
+            break;
+        case 7:
+            launch_tile(integral_constant<int, 7>{}, integral_constant<int, 4>{});
+            break;
+        case 8:
+            launch_tile(integral_constant<int, 8>{}, integral_constant<int, 4>{});
+            break;
         case 2:
             if (depth == 1) { launch_tile(integral_constant<int, 2>{}, integral_constant<int, 1>{}); }
             else if (depth == 2) { launch_tile(integral_constant<int, 2>{}, integral_constant<int, 2>{}); }
@@ -394,6 +413,25 @@ bool gemv_admits(const Tensor& x, const Weight& w, std::int32_t max_tokens) {
 // -- the tile kernel<4> compiles to 32 registers and already sits at maximum occupancy, so there is
 // nothing to buy on that side and the activation traffic is all that is left. This switch exists to
 // measure that rather than assume it, with the (kR, kT) pair left to NINFER_TERNARY_ROWS/_TILE.
+// True (the default) when the small-tile GEMV serves the whole T = 2..8 verify band instead of
+// handing T >= 5 to the row-blocked kernel. The row-blocked kernel amortises the activation over kR
+// output rows, which is right in principle, but measured in situ the small-tile kernel wins the
+// whole band, and by a distance that grows with the window:
+//
+//   K (prose)     4      5      6      7     |  K=7 on the repeated-sentence prompt
+//   block        20.8   18.4   19.0   18.8   |  63.1
+//   tile         38.8   29.3   28.1   25.0   |  84.0
+//
+// That is +87% at K=4 and +33% on the repetition workload the context-lookup path rides on.
+// NINFER_TERNARY_TILE_WIDE=0 restores the row-blocked kernel for T >= 5 as the A/B arm.
+bool tile_wide_enabled() {
+    static const bool value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_TILE_WIDE");
+        return env == nullptr || std::string(env) != "0";
+    }();
+    return value;
+}
+
 bool t2_block_enabled() {
     static const bool value = [] {
         const char* env = std::getenv("NINFER_TERNARY_T2BLOCK");
@@ -806,6 +844,12 @@ void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
     }
     if (t2_block_enabled() && gemv_admits(x, w, std::numeric_limits<std::int32_t>::max())) {
         launch_pq2_gemv_tile_block(x, w, out, out_row_stride, stream);
+        return;
+    }
+    // T = 5..8 lives here only when the wide tile instantiations are selected; otherwise the
+    // dispatcher below hands it to the row-blocked kernel.
+    if (tile_wide_enabled() && gemv_admits(x, w, 8)) {
+        launch_pq2_gemv_tile(x, w, out, out_row_stride, x.ne[1], stream);
         return;
     }
     if (gemv_admits(x, w, 4)) {

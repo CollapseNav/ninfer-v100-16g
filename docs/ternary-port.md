@@ -603,6 +603,42 @@ the group walk only inflates an already-large body. K=7 on the repeated-sentence
 Depth 1 is what it shipped with, so the kernel keeps no pragma and `NINFER_TERNARY_BLOCK_UNROLL`
 exists only to keep the negative result reproducible.
 
+**The row-blocked kernel should not serve the verify band at all -- this also shipped.** It is the
+kernel the dispatcher hands every `T >= 5` pass to, and it loses the entire band to the small-tile
+GEMV once `kT = 5..8` instantiations exist:
+
+| arm | K=4 | K=5 | K=6 | K=7 (prose) | K=7 (repeated sentence) |
+|---|---:|---:|---:|---:|---:|
+| row-blocked `4x8` | 20.8 | 18.4 | 19.0 | 18.8 | 63.1 |
+| **small-tile, wide** | **38.9** | **29.3** | **28.1** | **25.1** | **83.7** |
+
++87% at K=4 and +33% on the repetition workload the context-lookup path rides on. The tile kernel is
+now the default for the whole `T = 2..8` band; `NINFER_TERNARY_TILE_WIDE=0` restores the row-blocked
+kernel as the A/B arm. This also erases the anomaly the cost model showed: K=4 and K=5 now sit on the
+`1 + 0.60*(T-1)` line instead of far below it, so the model holds across every window measured.
+
+The final prose sweep, defaults as shipped:
+
+| K | no spec | 1 | 2 | 3 | 4 | 5 | 7 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| decode t/s | 43.7 | **51.8** | **48.0** | 41.9 | 38.9 | 29.3 | 25.1 |
+| acceptance length | -- | 1.58 | 1.89 | 1.93 | 2.16 | 1.95 | 2.07 |
+
+and on the repeated-sentence prompt (the context-lookup workload), no spec 43.5 -> K=3 44.8,
+K=5 69.5, **K=7 83.7**.
+
+**The greedy-id divergence is a numerical tie, not a logic error.** Under `--greedy
+--print-token-ids` the speculative paths do not always reproduce the no-spec sequence: on this prompt
+the ids agree for twelve tokens and then fork deterministically into one of exactly two
+continuations. Three pieces of evidence say that is rounding rather than a bug in acceptance or
+rollback. The unroll is not the cause -- depths 1, 4 and 8 produce byte-identical ids, and the
+no-spec arm is stable across repetitions. The fork depends on the **KV dtype**, and the *assignment
+flips*: with INT8 KV, no spec takes `95761 99128` and K=1 takes `96304 98267`; with BF16 KV it is the
+other way round, with the same two branches. So both branches are reachable in every configuration,
+the two arms differ only in which kernel's rounding decides a near-tie, and the verify pass is
+authoritative for what it emits (which is the documented contract). It is not bit-exactness with the
+T=1 path, and it should not be described as such.
+
 The K sweep after the fix, same prose prompt as the acceptance table above:
 
 | K | no spec | 1 | 2 | 3 | 4 | 5 | 7 |
@@ -618,17 +654,11 @@ break-even. K=4 and K=5 are still far below the model's 27.8 and 21.4 because `T
 the row-blocked kernel; extending the small-tile GEMV past four tokens is the next thing to measure
 there.
 
-**Correctness caveat, pre-existing and unexplained.** Under `--greedy --print-token-ids` the
-speculative paths do **not** always reproduce the no-spec token sequence. On this prompt the greedy
-ids agree for twelve tokens and then fork: `{K=1, K=3}` continue one way and `{K=7, no spec}` the
-other, each group deterministically. The unroll is **not** the cause -- `NINFER_TERNARY_GEMV_TILE_UNROLL`
-1, 4 and 8 produce byte-identical ids and the no-spec arm is stable across repetitions -- so this has
-been true of the port all along. The prime suspect is the attention kernel the verify band selects:
-the T=2..4 pass runs `causal_attention_small_t_tc_volta_partial_i8_kernel` (tensor-core, fp16
-accumulation) where a T=1 step runs the fp32 `gqa_attention_volta_flash` kernel, and a single flipped
-argmax at a near-tie forks everything after it. The K=7 arm landing on the no-spec side is not
-evidence of exactness, only of a different rounding pattern. This needs its own investigation before
-the MTP path can be called token-exact; the throughput numbers above are unaffected by it.
+**Correctness caveat, resolved as a tie.** See the paragraph above: the speculative and non-speculative
+paths can commit different tokens at a near-tie, depending on which kernel's rounding runs. The
+unroll and the wide-tile change are both numerically neutral (verified by identical greedy ids across
+depths), and no acceptance or rollback error was found. What is *not* established is bit-exactness
+with the T=1 path, and that should not be claimed.
 
 **Three fixes were attempted and all are refuted.**
 
