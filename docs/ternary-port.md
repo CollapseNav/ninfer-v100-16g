@@ -1035,3 +1035,44 @@ only for the GEMV to convert straight back. The catch is dtype selection by toke
 T <= 16 and bf16 above it, the workspace reservation would double for that band, and both GEMV
 kernels would need fp32-input variants. It is a multi-file change and it is the largest single item
 left on the decode side.
+
+### The fp32-activation experiment: bit-identical, and much slower
+
+The probe above prices the activation side of the tile loop at +23-34%. The obvious way to collect
+that is to stop converting: have the rotation emit the folded activation as **fp32** for the decode
+band, so no GEMV widens bf16. The trick that makes it free of any numerical change is to store
+`fp32(bf16(v))` -- round to bf16 exactly as today, then widen, which is precisely what the bf16
+buffer held plus the exact widen the GEMV performed on load.
+
+That property held exactly. With `NINFER_TERNARY_FP32_ACT` on and off, greedy ids are **identical in
+all six comparisons** (two prompts x no-spec / K=1 / K=7, 40 tokens each) -- a useful confirmation
+that the bf16 round trip in the pipeline is lossless, independent of the outcome below.
+
+The throughput was not close:
+
+| arm | bf16 activation | fp32 activation | delta |
+|---|---:|---:|---:|
+| no spec, prose | 43.8 | 41.8 | -5% |
+| K=1 | 51.8 | 29.8 | -42% |
+| K=3 | 42.0 | 19.5 | -54% |
+| K=7 | 25.1 | 8.6 | -66% |
+| K=7, repeat prompt (kT=16) | 107.7 | 8.5 | **-92%** |
+| prefill 3412 (stays bf16 by construction) | 1.21k | 1.20k | unchanged |
+
+**What that means, and it corrects the reading of the probe.** The share-activation probe removed
+*kT-1 loads and their converts*; this experiment removed only the converts and **doubled the
+activation bytes**. It lost, and lost more the wider the tile. So the +23-34% the probe measured was
+mostly the removed **loads**, not the removed conversion instructions: the verify band is bound by
+activation *traffic*, not by the bf16->fp32 ALU.
+
+That points the remaining search at one quantity -- activation bytes re-read per output row -- and
+there are only two ways to reduce it. More output rows per warp does exactly that and was already
+measured losing in this band (`NINFER_TERNARY_T2BLOCK`, 12 shapes, best 30.3 against the tile
+kernel's 31.7 at K=3), because kR costs registers and a per-(row, token) epilogue. The untried one is
+**staging the activation once per CTA in shared memory**: a CTA's eight warps all read the same
+activation, so an 8x-redundant L1/L2 stream could become one coalesced read plus a barrier. The
+constraint is sm_70's 96 KiB of shared per block against kT=16 at k=17408, which is 557 KiB, so it
+would have to be staged in K-chunks and re-staged as the group walk advances.
+
+The code was reverted rather than parked behind a switch: it changes the rotation's output pointer
+type and the workspace reservation, and it is a loss on every arm.
