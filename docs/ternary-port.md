@@ -1059,20 +1059,42 @@ The throughput was not close:
 | K=7, repeat prompt (kT=16) | 107.7 | 8.5 | **-92%** |
 | prefill 3412 (stays bf16 by construction) | 1.21k | 1.20k | unchanged |
 
-**What that means, and it corrects the reading of the probe.** The share-activation probe removed
-*kT-1 loads and their converts*; this experiment removed only the converts and **doubled the
-activation bytes**. It lost, and lost more the wider the tile. So the +23-34% the probe measured was
-mostly the removed **loads**, not the removed conversion instructions: the verify band is bound by
-activation *traffic*, not by the bf16->fp32 ALU.
+**Why it collapsed -- and it is not activation traffic.** `cuobjdump -res-usage` on the same build,
+for `<kT, kUnroll>` with the fp32 flag off and on. Nothing spills anywhere (STACK and LOCAL both 0):
 
-That points the remaining search at one quantity -- activation bytes re-read per output row -- and
-there are only two ways to reduce it. More output rows per warp does exactly that and was already
-measured losing in this band (`NINFER_TERNARY_T2BLOCK`, 12 shapes, best 30.3 against the tile
-kernel's 31.7 at K=3), because kR costs registers and a per-(row, token) epilogue. The untried one is
-**staging the activation once per CTA in shared memory**: a CTA's eight warps all read the same
-activation, so an 8x-redundant L1/L2 stream could become one coalesced read plus a barrier. The
-constraint is sm_70's 96 KiB of shared per block against kT=16 at k=17408, which is 557 KiB, so it
-would have to be staged in K-chunks and re-staged as the group walk advances.
+| kernel | bf16 registers | fp32 registers | CTAs/SM (256 threads) |
+|---|---:|---:|---|
+| kT=2, u8 | 79 | 117 | 3 -> 2 |
+| kT=4, u4 | **64** | **108** | **4 -> 2** |
+| kT=4, u8 | 103 | 180 | 2 -> 1 |
+| kT=8, u4 | 111 | 162 | 2 -> 1 |
+| kT=16, u4 | 128 | **206** | **2 -> 1** |
+| kT=16, u8 | 170 | 254 | 1 -> 1 |
+
+An fp32 activation costs four registers per token instead of two, and the unroll keeps several tokens'
+worth live at once, so the resident warp count halves -- and at kT=16 the shipped shape is the one
+that loses a CTA. That is the measured cause of the collapse, and it matches its shape: the loss grows
+with kT because the register footprint grows with kT.
+
+**It also corrects the reading of the share-activation probe** (a first draft of this section blamed
+activation traffic, which the numbers do not support). That probe removed kT-1 loads *and* their
+converts, and it *reduced* the per-token footprint from kT tokens' worth to one, so its +23-34% is
+consistent with instruction count and register pressure. This experiment kept the load count, removed
+the converts, and doubled the footprint -- and lost, badly. **The verify kernel is bound by
+instructions and registers, not by activation bandwidth**, and any further attempt has to reduce both
+at once.
+
+The one lever this document already carries that does exactly that is the fp16 group-dot, which was
+shelved as "not taken": packing the four activations into two `half2` registers instead of four fp32
+registers halves the per-token footprint, and `__hfma2` performs two multiply-accumulates per
+instruction, so the dot's instruction count falls with it. It is a precision change -- each group of
+128 weights would be summed in fp16 before joining the fp32 accumulator -- so it must be qualified
+against the FP32 `block` oracle rather than assumed, and the bf16 -> fp16 conversion it needs may eat
+part of the saving.
+
+On the second question in this section, shared-memory staging is still the untried idea, but this
+result removes its motivation: it was proposed to cut activation *traffic*, and traffic is not what
+binds. It would add a staging loop and a barrier per K-chunk on top of an instruction-bound loop.
 
 The code was reverted rather than parked behind a switch: it changes the rotation's output pointer
 type and the workspace reservation, and it is a loss on every arm.
