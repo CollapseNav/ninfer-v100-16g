@@ -308,7 +308,11 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
         const std::int32_t kt = tokens < kMaxKt ? tokens : kMaxKt;
         switch (kt) {
         case 16:
-            launch_tile(integral_constant<int, 16>{}, integral_constant<int, 4>{});
+            if (depth == 1) { launch_tile(integral_constant<int, 16>{}, integral_constant<int, 1>{}); }
+            else if (depth == 2) { launch_tile(integral_constant<int, 16>{}, integral_constant<int, 2>{}); }
+            else if (depth == 8) { launch_tile(integral_constant<int, 16>{}, integral_constant<int, 8>{}); }
+            else if (depth == 16) { launch_tile(integral_constant<int, 16>{}, integral_constant<int, 16>{}); }
+            else { launch_tile(integral_constant<int, 16>{}, integral_constant<int, 4>{}); }
             break;
         case 5:
             launch_tile(integral_constant<int, 5>{}, integral_constant<int, 4>{});
@@ -320,7 +324,11 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
             launch_tile(integral_constant<int, 7>{}, integral_constant<int, 4>{});
             break;
         case 8:
-            launch_tile(integral_constant<int, 8>{}, integral_constant<int, 4>{});
+            if (depth == 1) { launch_tile(integral_constant<int, 8>{}, integral_constant<int, 1>{}); }
+            else if (depth == 2) { launch_tile(integral_constant<int, 8>{}, integral_constant<int, 2>{}); }
+            else if (depth == 8) { launch_tile(integral_constant<int, 8>{}, integral_constant<int, 8>{}); }
+            else if (depth == 16) { launch_tile(integral_constant<int, 8>{}, integral_constant<int, 16>{}); }
+            else { launch_tile(integral_constant<int, 8>{}, integral_constant<int, 4>{}); }
             break;
         case 2:
             if (depth == 1) { launch_tile(integral_constant<int, 2>{}, integral_constant<int, 1>{}); }
