@@ -956,3 +956,44 @@ than from a profiler, which is why each probe is documented with what it deletes
 
 `launch_pq2_gemv` in `ternary_rowsplit_gemm.cu` is declared but never referenced (the T=1 path goes
 through `launch_pq2_gemv_tile`). Harmless; one nvcc warning. Dead in the author's tree too.
+
+## External comparison: llama.cpp on the same card
+
+`llama.cpp:cuda12.8-sm70-mtp-server` (the sm_70 build already on this host) running
+`Swift-Qwen3.8-27B-GGUF/IQ2_S` from the local Ollama blob store -- the same Qwen3.8-27B family, a
+different quantization -- with `-ngl 99 -c 8192`, greedy sampling, `cache_prompt=false`, one
+request per point. Its MTP is `--spec-type draft-mtp`, whose window is a server-start argument, so
+every row is a fresh server.
+
+| metric | this port (ternary PQ2, 6.70 GiB) | llama.cpp (IQ2_S, 9.90 GB) |
+|---|---:|---:|
+| prefill, ~3.4k-token prompt | **1,200 t/s** | 693 t/s |
+| decode, no spec, short prompt | **43.7 t/s** | 35.2 t/s |
+| decode, no spec, after a 3.4k prefill | 39.7 t/s | 32.4 t/s |
+| decode + speculation, ordinary prose | 51.8 t/s (K=1) | **55.4 t/s** (n-max 3) |
+| decode + speculation, repetitive text | **105-108 t/s** (context lookup) | 85.9 t/s (n-max 5) |
+| effective weight bandwidth per token | 314 GB/s | 348 GB/s |
+
+Three things this settles.
+
+**The prefill route is the port's real win.** 1.7x llama.cpp at the same prompt length and the same
+card, which is what the dequantise-once-plus-CUTLASS arm was built for.
+
+**The T=1 GEMV is not badly underperforming.** llama.cpp, a much more mature implementation, lands
+at 348 GB/s of weight stream against this port's 314 GB/s -- 11% better per byte, not 2-3x. That
+also revises the ceiling estimate above downwards: at llama.cpp's efficiency this model's 7.19 GB
+per token would decode at ~48 t/s, so the GEMV-side headroom is about 10%, not 40%. The earlier
+"120 t/s is the floor" figure is the DRAM peak, which neither implementation is remotely near.
+
+**The verify band is where llama.cpp is genuinely better, and it is measured.** Its MTP on ordinary
+prose is 1.57x (35.2 -> 55.4) where this port manages 1.19x (43.7 -> 51.8). Backing that out of its
+own timings: draft_n=128 with draft_n_accepted=83 over 128 committed tokens is 45 rounds, so a round
+costs 51.3 ms against a 28.4 ms single step = 1.81x for a T=4 verify, i.e. a **marginal cost of 0.27
+per extra verified token against this port's 0.60**. That is the same quantity the cost model above
+is built on, measured on a second implementation on the same hardware, and it says 0.27 is
+achievable. How the weight is shared across the token dimension inside the kernel is the difference,
+and it is the most concrete lead left for this port's verify path.
+
+Operational note: `--spec-draft-n-max 7` takes the server down on a 16 GB card (the connection is
+dropped mid-run and the port stops accepting); 1/3/5 are stable. The 9.90 GB model plus a 0.93 GB
+mmproj plus an 8,192-token KV cache leaves no room for the widest draft window.
