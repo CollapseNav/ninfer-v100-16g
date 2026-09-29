@@ -78,10 +78,10 @@ Tensor folded_activation(const Tensor& x, const Weight& weight, WorkspaceArena& 
             "folded ternary weight has no sign block; the artifact must carry "
             "text/hadamard_signs and text/hadamard_widths");
     }
-    // The speculative verify band (T = 2..16) gets an fp16 activation container so the tile GEMV can
-    // run the group dot with half2 math; T = 1 keeps bf16 because it uses a different kernel that has
-    // not been converted, and prefill keeps bf16 because its consumers (the fused MMA arm and the
-    // CUTLASS arm) read bf16. fp16 is still 2 bytes, so the workspace reservation is unchanged.
+    // The decode band (T = 1 and the speculative verify widths) gets an fp16 activation container so
+    // the GEMV can run the group dot with half2 math -- T = 1 included, which routes through the same
+    // tile kernel at kT = 1 rather than through the dedicated T = 1 kernel. Prefill keeps bf16 because
+    // its consumers (the fused MMA arm and the CUTLASS arm) read bf16. fp16 is still 2 bytes, so the workspace reservation is unchanged.
     // The wide-tile predicate is duplicated on purpose: with NINFER_TERNARY_TILE_WIDE=0 the T = 5..16
     // band runs the row-blocked kernel, which is bf16-only.
     static const bool wide_tile = [] {
@@ -94,7 +94,7 @@ Tensor folded_activation(const Tensor& x, const Weight& weight, WorkspaceArena& 
         const char* env = std::getenv("NINFER_TERNARY_FP16_ACT");
         return env == nullptr || std::string(env) != "0";
     }();
-    const bool want_fp16 = fp16_act && wide_tile && x.ne[1] >= 2 && x.ne[1] <= 16;
+    const bool want_fp16 = fp16_act && wide_tile && x.ne[1] >= 1 && x.ne[1] <= 16;
     const DeviceSpan span =
         workspace.alloc_bytes(ternary_rotation_workspace_bytes(weight.k, x.ne[1]));
     Tensor rotated(span.data, want_fp16 ? DType::FP16 : DType::BF16, {weight.k, x.ne[1]});

@@ -1149,5 +1149,35 @@ accepts between its speculative and non-speculative paths, and the acceptance dr
 rounding level rather than being systematic. `NINFER_TERNARY_FP16_ACT=0` restores the bf16 path, and `=2` selects the fp32-dot control
 that the table above shows losing.
 
-Decode at T=1 and the whole prefill route are untouched by construction (they stay bf16), and measured
-so: no-spec decode 43.7 either way, prefill 3412 tokens 1.20k with the flag off and 1.21k with it on.
+### What the model's own precision is, which is the real justification
+
+The activation container is worth stating against what the artifact already carries. The ternary
+linear tensors are `PQ2_0_G128`: **2 bits per weight** in a 32-byte group of 128, plus one fp16 scale
+per group, i.e. 2 + 16/128 = **2.125 bits = 0.266 bytes per weight**. Four code levels exist but the
+quantization is effectively ternary -- the code histogram measures approximately 33 / 32 / 33 / 1
+percent, so the fourth level is essentially unused.
+
+The precision ladder is therefore: 2-bit weights (four levels, three used) < int8 KV cache < bf16
+activations (8 mantissa bits, 2^-8) < the fp16 group sum (11 mantissa bits, 2^-11). **The rounding this
+section adds is the finest step in the pipeline** -- eight times finer than the bf16 activation
+quantization that feeds it, and the products going into it are exact because a weight is -1, 0 or +1.
+That is the argument that decided the default, and the T=1 measurement below agrees with it.
+
+### The T = 1 path
+
+The same half2 dot reaches the headline decode. It routes a single token through the tile kernel at
+`kT = 1` instead of the dedicated T = 1 kernel (which is bf16-only and pinned at `kMinBlocks = 4`):
+
+| arm | decode | registers | CTAs/SM | greedy ids |
+|---|---:|---:|---:|---|
+| dedicated T = 1 kernel, bf16 (`FP16_TERNARY_FP16_ACT=0`) | 43.7 | 62 | 4 | reference |
+| **tile kernel, kT = 1, fp16 half2 (default)** | **44.7** | **42** | **6** | **identical** |
+
++2.3%, and at T = 1 the greedy ids are bit-identical, unlike the verify band. The unroll does not
+matter at `kT = 1` (1/2/4/8/16 all measure 44.7-44.8) and the occupancy gain from 32 to 48 resident
+warps buys nothing either, which says the single-token step is not instruction- or occupancy-bound:
+it is waiting on the code stream, as the `codealu` probe (removing that one load alone is worth 17%)
+already showed.
+
+Prefill is untouched by construction and measured so: 3412 tokens at 1.20k tok/s with the flag off and
+1.21k with it on.

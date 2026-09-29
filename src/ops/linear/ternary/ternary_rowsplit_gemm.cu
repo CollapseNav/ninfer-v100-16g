@@ -279,7 +279,9 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
     const std::int32_t groups_per_row = w.k / 128;
     const unsigned grid               = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
     const dim3 block(kGemvWarpsPerBlock * 32, 1u, 1u);
-    if (tokens <= 1) {
+    if (tokens <= 1 && x.dtype != DType::FP16) {
+        // The dedicated T = 1 kernel is bf16-only; an fp16 activation falls through to the tile kernel
+        // at kT = 1, which has the half2 dot.
         launch_gemv_t1(x, w, out, groups_per_row, stream);
     } else {
         // kT follows the real token count. Instantiating <4> for every verify measured 1.283 ms at
@@ -371,6 +373,9 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
             return;
         }
         switch (kt) {
+        case 1:
+            launch_tile(integral_constant<int, 1>{}, integral_constant<int, 4>{});
+            break;
         case 16:
             if (depth == 1) { launch_tile(integral_constant<int, 16>{}, integral_constant<int, 1>{}); }
             else if (depth == 2) { launch_tile(integral_constant<int, 16>{}, integral_constant<int, 2>{}); }
