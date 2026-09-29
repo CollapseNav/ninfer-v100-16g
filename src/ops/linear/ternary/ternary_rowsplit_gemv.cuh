@@ -137,9 +137,19 @@ enum TernaryGemvProbe {
 // the default shape already sits at 72 registers, i.e. 28 of the 64 warps per SM, and asking each
 // warp to do more work costs more resident warps than the saved instructions buy back. Kept as a
 // selectable arm (NINFER_TERNARY_GEMV_ROWS) so the measurement can be repeated, never a default.
+//
+// kMinBlocks is `__launch_bounds__`'s second argument: ptxas then caps registers at
+// 65536/(kThreads*kMinBlocks). At kThreads=256 that is 256/128/85/64/51/42/32 registers for
+// kMinBlocks = 1/2/3/4/5/6/8, so only 4 and above constrain the shipped kernel's 72. kMinBlocks = 1
+// is the previous single-argument form: the cap lands at 256, above the 255 architectural maximum,
+// so it compiles exactly what it compiled before. This is the clean test of the memory-level-
+// parallelism hypothesis: the unroll curve (1->29.9, 2->34.1, 4->40.4, 8->41.6, 12->33.9, 16->30.9,
+// 20->25.7 t/s at 36/48/72/95/116/134 registers) says more in-flight loads per warp help until
+// register pressure takes resident warps away, so forcing registers DOWN at unroll 8 buys warps
+// without giving up the unroll. No semantic change either way.
 template <int kWarps, bool kSkipBias = false, int kUnroll = 1, int kProbe = kGemvProbeOff,
-          int kRows = 1>
-__global__ __launch_bounds__(kWarps * 32)
+          int kRows = 1, int kMinBlocks = 1>
+__global__ __launch_bounds__(kWarps * 32, kMinBlocks)
 void ternary_pq2_gemv_w_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ scales,

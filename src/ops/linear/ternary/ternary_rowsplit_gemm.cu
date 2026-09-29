@@ -92,11 +92,12 @@ PrefillRoute prefill_route() {
 // T=1 dispatch with an env-selectable warps-per-block. NINFER_TERNARY_GEMV_WARPS picks one of
 // 4 / 8 / 16 / 32; anything else keeps the original 8. Read once, because the choice decides which
 // kernel enters a captured CUDA graph.
-template <int kWarps, bool kSkipBias, int kUnroll = 1, int kProbe = kGemvProbeOff, int kRows = 1>
+template <int kWarps, bool kSkipBias, int kUnroll = 1, int kProbe = kGemvProbeOff, int kRows = 1,
+          int kMinBlocks = 1>
 void launch_gemv_w(const Tensor& x, const Weight& w, Tensor& out, std::int32_t groups_per_row,
                    cudaStream_t stream) {
     const unsigned grid = static_cast<unsigned>(div_up(w.n, kWarps * kRows));
-    ternary_pq2_gemv_w_kernel<kWarps, kSkipBias, kUnroll, kProbe, kRows>
+    ternary_pq2_gemv_w_kernel<kWarps, kSkipBias, kUnroll, kProbe, kRows, kMinBlocks>
         <<<grid, kWarps * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), w.n,
@@ -157,6 +158,30 @@ bool gemv_nobias_probe() {
     return enabled;
 }
 
+// NINFER_TERNARY_GEMV_MINBLOCKS=1|2|3|4|5|6|8 picks __launch_bounds__'s second argument, which caps
+// registers at 65536/(256*kMinBlocks). At kThreads=256 that is 256/128/85/64/51/42/32 registers.
+//
+// MEASURED. The cap only bites from 4 up:
+//   minBlocks  1    2    3    4    5    6    8
+//   registers 72   72   72   62   48   40   32
+//   warps/SM  28   28   28   32   42   50   64
+//   decode  41.6 41.6 41.5 43.6 42.5 38.5 33.5   t/s, 2 reps each, identical
+// 4 wins, so it is the default: +4.8% for a build-time knob with no semantic change (greedy token
+// ids are unchanged at every value). Below 48 registers it falls off, which is the unroll-8 arm
+// running out of room for its eight in-flight loads.
+int gemv_min_blocks() {
+    static const int value = [] {
+        const char* env   = std::getenv("NINFER_TERNARY_GEMV_MINBLOCKS");
+        const int parsed  = env == nullptr ? 0 : std::atoi(env);
+        switch (parsed) {
+        case 1: case 2: case 3: case 5: case 6: case 8: return parsed;
+        case 4: return 4;
+        default: return 4;   // measured default
+        }
+    }();
+    return value;
+}
+
 void launch_gemv_t1(const Tensor& x, const Weight& w, Tensor& out, std::int32_t groups_per_row,
                     cudaStream_t stream) {
     static const int warps = [] {
@@ -188,20 +213,36 @@ void launch_gemv_t1(const Tensor& x, const Weight& w, Tensor& out, std::int32_t 
     case 4: launch_gemv_w<8, false, 8, kGemvProbeOff, 4>(x, w, out, groups_per_row, stream); return;
     default: break;
     }
+    // Register-cap arm. 4 is the measured default; the others exist only to re-run the sweep, and
+    // each is instantiated at unroll 8 alone.
+    const int min_blocks = gemv_min_blocks();
+    if (min_blocks != 4) {
+        switch (min_blocks) {
+        case 1: launch_gemv_w<8, false, 8, kGemvProbeOff, 1, 1>(x, w, out, groups_per_row, stream); return;
+        case 2: launch_gemv_w<8, false, 8, kGemvProbeOff, 1, 2>(x, w, out, groups_per_row, stream); return;
+        case 3: launch_gemv_w<8, false, 8, kGemvProbeOff, 1, 3>(x, w, out, groups_per_row, stream); return;
+        case 5: launch_gemv_w<8, false, 8, kGemvProbeOff, 1, 5>(x, w, out, groups_per_row, stream); return;
+        case 6: launch_gemv_w<8, false, 8, kGemvProbeOff, 1, 6>(x, w, out, groups_per_row, stream); return;
+        default: launch_gemv_w<8, false, 8, kGemvProbeOff, 1, 8>(x, w, out, groups_per_row, stream); return;
+        }
+    }
+    // Re-sweep the unroll INSIDE the winning cap. Unroll 12/16/20 lost on their own because ptxas
+    // spent 95/116/134 registers on them; at a 64-register ceiling the extra in-flight loads may pay.
     switch (unroll_factor()) {
-    case 2: launch_gemv_w<8, false, 2>(x, w, out, groups_per_row, stream); return;
-    case 4: launch_gemv_w<8, false, 4>(x, w, out, groups_per_row, stream); return;
-    case 8: launch_gemv_w<8, false, 8>(x, w, out, groups_per_row, stream); return;
-    case 12: launch_gemv_w<8, false, 12>(x, w, out, groups_per_row, stream); return;
-    case 16: launch_gemv_w<8, false, 16>(x, w, out, groups_per_row, stream); return;
-    case 20: launch_gemv_w<8, false, 20>(x, w, out, groups_per_row, stream); return;
+    case 2:  launch_gemv_w<8, false, 2,  kGemvProbeOff, 1, 4>(x, w, out, groups_per_row, stream); return;
+    case 4:  launch_gemv_w<8, false, 4,  kGemvProbeOff, 1, 4>(x, w, out, groups_per_row, stream); return;
+    case 12: launch_gemv_w<8, false, 12, kGemvProbeOff, 1, 4>(x, w, out, groups_per_row, stream); return;
+    case 16: launch_gemv_w<8, false, 16, kGemvProbeOff, 1, 4>(x, w, out, groups_per_row, stream); return;
+    case 20: launch_gemv_w<8, false, 20, kGemvProbeOff, 1, 4>(x, w, out, groups_per_row, stream); return;
     default: break;
     }
+    // The warps-per-block arm deliberately gets no cap: at 512 and 1024 threads a min-blocks of 4
+    // would demand 32 and 16 registers and spill the kernel to death. It is flat-to-inverse anyway.
     switch (warps) {
-    case 4: launch_gemv_w<4, false>(x, w, out, groups_per_row, stream); return;
+    case 4:  launch_gemv_w<4,  false>(x, w, out, groups_per_row, stream); return;
     case 16: launch_gemv_w<16, false>(x, w, out, groups_per_row, stream); return;
     case 32: launch_gemv_w<32, false>(x, w, out, groups_per_row, stream); return;
-    default: launch_gemv_w<8, false>(x, w, out, groups_per_row, stream); return;
+    default: launch_gemv_w<8, false, 8, kGemvProbeOff, 1, 4>(x, w, out, groups_per_row, stream); return;
     }
 }
 
