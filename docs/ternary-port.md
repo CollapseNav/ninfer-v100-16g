@@ -627,6 +627,58 @@ The final prose sweep, defaults as shipped:
 and on the repeated-sentence prompt (the context-lookup workload), no spec 43.5 -> K=3 44.8,
 K=5 69.5, **K=7 83.7**.
 
+### The full 15-token lookup window
+
+The context-lookup path is real and now measured end to end. Its gate is in `program_impl.h` and has
+three conditions, only the first of which is documented elsewhere: an earlier **exact** occurrence of
+the last 16 tokens must exist, `max_lookup_extent > draft_window` (so any K below 15), and -- the one
+that explains why the same prompt fires at some windows and not others -- **the MTP head's first K
+drafts must agree exactly with the lookup's**, via `std::equal(found->begin(), found->begin()+K,
+mtp_drafts.begin())`. When it fires, `verify_k` becomes `kMtpLookupMaximumDrafts` = 15, so the verify
+pass is **T = 16**, and the `mtp accepted by pos` histogram grows from `draft_window + 1` entries to
+15 -- that histogram is the diagnostic.
+
+On a prompt that asks the model to repeat a sentence ten times (no spec 43.8 t/s):
+
+| K | decode t/s | acceptance length | lookup active |
+|---:|---:|---:|:--:|
+| 1 | 100.8 | 7.37 | yes |
+| 2 | 103.6 | 9.05 | yes |
+| 3 | 104.6 | 9.95 | yes |
+| 7 | **104.7** | 12.44 | yes |
+
+**2.3-2.4x over no spec.** On the 16x-repeated-sentence prompt it fires at K=2 (82.6), K=5 (81.7) and
+K=7 (83.9) but not at K=1 or K=3, which is condition three doing the selecting.
+
+The T=16 pass used to go to the row-blocked kernel. Extending the small-tile GEMV to `kT = 16` -- the
+`kT <= 8` static assert was the only thing stopping it -- and routing it there is worth:
+
+| lookup prompt | tile `kT=16` | row-blocked | delta |
+|---|---:|---:|---:|
+| K=7 | **105.0** | 74.1 | +42% |
+| K=1 | **100.8** | 76.1 | +32% |
+
+The 80.5 t/s this document previously quoted for the lookup path was the row-blocked kernel's number.
+
+### Bit-exactness: an in-tree claim that does not hold here
+
+`src/product/speculative_options.h:41` records that the sm_70 "width-6+ drift" was caused by the
+Volta small_t verify kernels being dropped in the DFlash2 merge, and that with them restored "**every
+draft window through 7 is bit-exact against `--spec none` again**". Measured on this artifact that is
+not true, and the pattern is the opposite of the one described: **K=7 is exact and K=1 and K=3 are
+not.** With one prompt, one KV setting (int8, capacity 4096, 53 prompt tokens), greedy and 40
+generated tokens, K=1 and K=3 fork at position 12 into a deterministic continuation that no-spec and
+K=7 do not take. Reproducible across repetitions, and five causes are ruled out: the unroll depth
+(1/4/8 give byte-identical ids), the wide-tile routing, `--lm-head-draft` (`k1_plain` == `k1_draft`),
+run-to-run noise, and a settings confound (prompt tokens, KV capacity, token count and finish reason
+all match). `--greedy` is honoured in every arm (`sampling greedy (temperature 0)`).
+
+What is established is that a near-tie exists: with BF16 KV the same two continuations appear but the
+*assignment flips*, so no-spec takes the branch K=1 took under int8. That is consistent with rounding
+deciding a near-tie, but it does not establish which arm is right, and it does not reconcile the
+in-tree claim. **Either that comment is stale or the small-window verify path has a real defect.**
+Until it is settled, the speculative path should not be described as bit-exact with `--spec none`.
+
 **The greedy-id divergence is a numerical tie, not a logic error.** Under `--greedy
 --print-token-ids` the speculative paths do not always reproduce the no-spec sequence: on this prompt
 the ids agree for twelve tokens and then fork deterministically into one of exactly two
@@ -654,11 +706,17 @@ break-even. K=4 and K=5 are still far below the model's 27.8 and 21.4 because `T
 the row-blocked kernel; extending the small-tile GEMV past four tokens is the next thing to measure
 there.
 
-**Correctness caveat, resolved as a tie.** See the paragraph above: the speculative and non-speculative
-paths can commit different tokens at a near-tie, depending on which kernel's rounding runs. The
-unroll and the wide-tile change are both numerically neutral (verified by identical greedy ids across
-depths), and no acceptance or rollback error was found. What is *not* established is bit-exactness
-with the T=1 path, and that should not be claimed.
+**Correctness caveat.** See the bit-exactness section above: the speculative and non-speculative paths
+can commit different tokens at a near-tie, deterministically per draft window, and the in-tree claim
+that all windows through 7 are bit-exact does not reproduce. The unroll and the wide-tile changes are
+both numerically neutral (identical greedy ids across unroll depths 1/4/8), so neither is the cause.
+Until the claim is reconciled, no speculative window should be described as bit-exact with
+`--spec none`.
+
+**A measurement that is not available on this host.** `nvprof --print-gpu-trace` works, but
+`nvprof --metrics` does not: any metric collection fails with "No events/metrics were profiled" /
+CUDA profiling error (exit 12). So there is no DRAM/L2 counter read for the decode step; the
+bandwidth figures in this document come from byte counts and wall time, not from counters.
 
 **Three fixes were attempted and all are refuted.**
 

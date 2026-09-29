@@ -256,6 +256,10 @@ void ternary_pq2_gemv_w_kernel(const __nv_bfloat16* __restrict__ x,
 // FMAs per token per group) was added on top. One extra token costs 0.60 of a whole T=1 step, which
 // is what makes MTP lose on prose, so if that cost is a missing pipeline rather than real traffic
 // this is where it shows.
+// kT is capped at 16 because the context-lookup path verifies the full
+// qwen3_6::kMtpLookupMaximumDrafts = 15 proposal window, i.e. T = 16. The row-blocked kernel was
+// the only thing that could serve that width before, and it loses the whole T = 5..8 band to this
+// kernel in situ, so the wide tile is the one to reach for.
 template <int kT, int kUnroll = 4>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
 void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
@@ -264,7 +268,7 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                                   __nv_bfloat16* __restrict__ out, std::int32_t rows,
                                   std::int32_t groups_per_row, std::int32_t tokens,
                                   std::int32_t out_row_stride) {
-    static_assert(kT >= 1 && kT <= 8, "tile size must be small enough to keep accumulators in registers");
+    static_assert(kT >= 1 && kT <= 16, "tile size must stay small enough to keep accumulators in registers");
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp =
         static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + (static_cast<int>(threadIdx.x) >> 5);

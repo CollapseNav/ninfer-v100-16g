@@ -298,14 +298,18 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
                 static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens, out_row_stride);
         };
         using std::integral_constant;
-        // kMaxKt is 8 -- the tile kernel serves the whole verify band -- unless
+        // kMaxKt is 16 -- the tile kernel serves the whole verify band, including the 15-token
+        // context-lookup window that makes the verify pass T = 16 -- unless
         // NINFER_TERNARY_TILE_WIDE=0 hands T >= 5 back to the row-blocked kernel.
         static const int kMaxKt = [] {
             const char* value = std::getenv("NINFER_TERNARY_TILE_WIDE");
-            return (value != nullptr && std::string(value) == "0") ? 4 : 8;
+            return (value != nullptr && std::string(value) == "0") ? 4 : 16;
         }();
         const std::int32_t kt = tokens < kMaxKt ? tokens : kMaxKt;
         switch (kt) {
+        case 16:
+            launch_tile(integral_constant<int, 16>{}, integral_constant<int, 4>{});
+            break;
         case 5:
             launch_tile(integral_constant<int, 5>{}, integral_constant<int, 4>{});
             break;
@@ -846,9 +850,9 @@ void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
         launch_pq2_gemv_tile_block(x, w, out, out_row_stride, stream);
         return;
     }
-    // T = 5..8 lives here only when the wide tile instantiations are selected; otherwise the
-    // dispatcher below hands it to the row-blocked kernel.
-    if (tile_wide_enabled() && gemv_admits(x, w, 8)) {
+    // T = 5..16 lives here when the wide tile instantiations are selected; otherwise the dispatcher
+    // below hands it to the row-blocked kernel. 16 is the context-lookup width.
+    if (tile_wide_enabled() && gemv_admits(x, w, 16)) {
         launch_pq2_gemv_tile(x, w, out, out_row_stride, x.ne[1], stream);
         return;
     }
