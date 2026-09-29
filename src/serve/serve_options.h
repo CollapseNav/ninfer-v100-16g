@@ -32,7 +32,9 @@ struct ServeOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    // 1024 makes the server re-enter the prefill forward pass ceil(T/chunk) times, and every entry
+    // re-materialises the entire weight set. See apps/cli/options.h for the measurement.
+    std::uint32_t prefill_chunk        = 4096;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;

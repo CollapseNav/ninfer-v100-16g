@@ -68,14 +68,73 @@ void require_positive_finite(std::uint32_t bits, std::string_view label) {
     }
 }
 
+// The grouped row-split family is interchangeable at the container level: every member shares
+// the row-split-k128-v1 layout and differs only in group geometry and code packing, and the
+// artifact declares which member it stores. So resolve the DECLARED format rather than trusting
+// the plan's expectation -- that is what lets one runtime read both a groupwise-int conversion
+// (Q4G64/Q5G64/Q6G64/W8G32) and the ternary port (PTQ1_0_G128/PQ2_0_G128). (V100 ternary port.)
+//
+// The loosening is deliberately narrow: the declared format must itself be a grouped row-split
+// format, and bind_tensor() still validates layout AND shape, so a mismatch in either direction
+// is still rejected. Everything downstream reads WeightPlan::format, so resolving it here
+// propagates to all materialized_weight() call sites without touching them.
+bool is_row_split_grouped(NumericFormat format) {
+    switch (format) {
+    case NumericFormat::Q4G64_F16S:
+    case NumericFormat::Q5G64_F16S:
+    case NumericFormat::Q6G64_F16S:
+    case NumericFormat::W8G32_F16S:
+    case NumericFormat::PTQ1_0_G128:
+    case NumericFormat::PQ2_0_G128:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Folded-basis feature permutation P. Only the GDN output projection stores grouped columns
+// while the runtime produces tiled v-head geometry, so this is gated on BOTH the object's role
+// and its input width rather than on the width alone. Head counts are the model's: n_v = 48
+// v-heads, n_k = 16 k-groups (so K = 6144 = 128 * 16 * 3). (V100 ternary port.)
+void set_folded_perm(WeightPlan& plan, std::string_view name, std::uint64_t columns) {
+    constexpr std::uint64_t kGdnOutputWidth = 6144;
+    constexpr std::int32_t kNv             = 48;
+    constexpr std::int32_t kNk             = 16;
+    if (name.ends_with("/gdn/output") && columns == kGdnOutputWidth) {
+        plan.hadamard_perm_hd  = static_cast<std::int32_t>(columns) / kNv;
+        plan.hadamard_perm_nk  = kNk;
+        plan.hadamard_perm_rep = kNv / kNk;
+    }
+}
+
 WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericFormat format,
                        std::initializer_list<std::uint64_t> shape,
                        artifact::TensorPlacement placement = artifact::TensorPlacement::Device) {
     if (format == NumericFormat::NVFP4) {
         throw std::logic_error("NVFP4 weight requires a paired input divisor");
     }
-    return WeightPlan{.object = artifact::bind_tensor(binder, name, format, shape, placement),
-                      .format = format};
+    const std::uint64_t columns = shape.size() > 1 ? shape.begin()[1] : 0;
+    if (is_row_split_grouped(format)) {
+        const artifact::ObjectDescriptor* descriptor = binder.find(name);
+        if (descriptor == nullptr ||
+            !std::holds_alternative<artifact::TensorDescriptor>(*descriptor)) {
+            throw artifact::ArtifactError(std::string(name) + ": expected a tensor object");
+        }
+        const NumericFormat declared = std::get<artifact::TensorDescriptor>(*descriptor).format;
+        if (!is_row_split_grouped(declared)) {
+            throw artifact::ArtifactError(std::string(name) +
+                                          ": artifact declares a non-grouped format for a "
+                                          "row-split weight");
+        }
+        WeightPlan plan{.object = artifact::bind_tensor(binder, name, declared, shape, placement),
+                        .format = declared};
+        set_folded_perm(plan, name, columns);
+        return plan;
+    }
+    WeightPlan plan{.object = artifact::bind_tensor(binder, name, format, shape, placement),
+                    .format = format};
+    set_folded_perm(plan, name, columns);
+    return plan;
 }
 
 WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, std::int32_t rows,
@@ -103,9 +162,73 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, st
                       .input_scale_divisor_bits  = input_bits};
 }
 
+// --- folded (rotated-basis) sign table (V100 ternary port) --------------------
+//
+// The ternary artifact contract: 1024-wide normalized Sylvester-Hadamard blocks, 28672 explicit
+// signs, and widths that partition the signs exactly.
+inline constexpr std::int32_t kHadamardBlockSize = 1024;
+inline constexpr std::size_t kHadamardSignValues = 28672;
+inline constexpr std::size_t kHadamardWidthCount = 3;
+
+// Load-scoped: installed for exactly one materialization pass, then removed, so no global state
+// outlives a load. Attaching the sign block here -- at the single funnel that builds every
+// Weight -- is what keeps all materialized_weight() call sites untouched.
+struct FoldedSigns {
+    const float* base = nullptr;
+    std::vector<std::pair<std::int32_t, std::uint64_t>> width_offsets;
+
+    [[nodiscard]] const float* for_width(std::int32_t width) const noexcept {
+        for (const auto& entry : width_offsets) {
+            if (entry.first == width) { return base + entry.second; }
+        }
+        return nullptr;
+    }
+};
+
+FoldedSigns* g_folded_signs = nullptr;
+
+class FoldedSignsScope {
+public:
+    FoldedSignsScope(const std::optional<HadamardSignsPlan>& plan,
+                     const artifact::MaterializedArtifact& materialized) {
+        if (!plan.has_value()) { return; }
+        if (plan->width_offsets.empty()) { return; }
+        table_.base          = static_cast<const float*>(materialized.device_data(plan->values));
+        table_.width_offsets = plan->width_offsets;
+        if (table_.base != nullptr) { g_folded_signs = &table_; }
+    }
+    ~FoldedSignsScope() { g_folded_signs = nullptr; }
+
+    FoldedSignsScope(const FoldedSignsScope&)            = delete;
+    FoldedSignsScope& operator=(const FoldedSignsScope&) = delete;
+
+private:
+    FoldedSigns table_;
+};
+
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
                            const WeightPlan& plan, std::int32_t rows, std::int32_t columns,
                            bool prepack_for_qpn = true) {
+    // Ternary weights are exactly the folded weights, so the format alone decides that a sign
+    // block is required.
+    const auto attach_folded_signs = [&](Weight& w) {
+        if (g_folded_signs == nullptr) { return; }
+        if (plan.format != NumericFormat::PTQ1_0_G128 &&
+            plan.format != NumericFormat::PQ2_0_G128) {
+            return;
+        }
+        const float* signs = g_folded_signs->for_width(columns);
+        if (signs == nullptr) {
+            throw artifact::ArtifactError(
+                "folded ternary weight has no sign block for input width " +
+                std::to_string(columns));
+        }
+        w.hadamard_signs    = signs;
+        w.hadamard_n_blk    = columns / kHadamardBlockSize;
+        w.hadamard_perm_hd  = plan.hadamard_perm_hd;
+        w.hadamard_perm_nk  = plan.hadamard_perm_nk;
+        w.hadamard_perm_rep = plan.hadamard_perm_rep;
+    };
     if (plan.format != NumericFormat::NVFP4) {
         Weight out = artifact::materialized_weight(materialized, plan.object, plan.format, rows,
                                                    columns);
@@ -119,6 +242,7 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
 #else
         (void)prepack_for_qpn;
 #endif
+        attach_folded_signs(out);
         return out;
     }
     (void)prepack_for_qpn;
@@ -148,6 +272,7 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
     out.padded_shape[1]      = columns;
     out.weight_scale_divisor = std::bit_cast<float>(plan.weight_scale_divisor_bits);
     out.input_scale_divisor  = std::bit_cast<float>(plan.input_scale_divisor_bits);
+    attach_folded_signs(out);
     return out;
 }
 
@@ -484,6 +609,9 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 } // namespace
 
+// Defined below, next to the materialization pass that consumes it.
+std::optional<HadamardSignsPlan> bind_hadamard_signs(artifact::Binder& binder);
+
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
@@ -571,13 +699,54 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         out.dflash2                               = bind_dflash2(binder, placement);
     }
 
+    out.hadamard_signs = bind_hadamard_signs(binder);
+
     load_plan.materialization = binder.finish();
     return load_plan;
+}
+
+// Bind the folded sign table when the artifact carries one. Artifacts whose weights are not
+// folded simply omit these objects, and every object must be bound or Binder::finish() rejects
+// the artifact as unconsumed -- so this is not optional when the objects are present.
+std::optional<HadamardSignsPlan> bind_hadamard_signs(artifact::Binder& binder) {
+    if (!binder.contains("text/hadamard_signs")) { return std::nullopt; }
+
+    HadamardSignsPlan plan;
+    plan.values = artifact::bind_tensor(binder, "text/hadamard_signs", NumericFormat::FP32,
+                                        {kHadamardSignValues}, artifact::TensorPlacement::Device);
+    plan.widths = artifact::bind_tensor(binder, "text/hadamard_widths", NumericFormat::I32,
+                                        {kHadamardWidthCount},
+                                        artifact::TensorPlacement::ValidateOnly);
+
+    // The widths only need to reach the host: they are read here to derive each width's element
+    // offset, which is what lets a weight find its block from its input dimension alone.
+    const artifact::PayloadSpan payload = binder.payload(plan.widths);
+    if (payload.data.size() < kHadamardWidthCount * sizeof(std::uint32_t)) {
+        throw artifact::ArtifactError("text/hadamard_widths is shorter than its declared count");
+    }
+    std::uint64_t offset = 0;
+    for (std::size_t i = 0; i < kHadamardWidthCount; ++i) {
+        const std::uint32_t width = read_u32_le(payload.data, i * sizeof(std::uint32_t),
+                                                "text/hadamard_widths");
+        if (width == 0) {
+            throw artifact::ArtifactError("text/hadamard_widths entries must be positive");
+        }
+        plan.width_offsets.emplace_back(static_cast<std::int32_t>(width), offset);
+        offset += width;
+    }
+    if (offset != kHadamardSignValues) {
+        throw artifact::ArtifactError("text/hadamard_widths must sum to " +
+                                      std::to_string(kHadamardSignValues) + ", got " +
+                                      std::to_string(offset));
+    }
+    return plan;
 }
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
+    // Install the folded sign table for the whole materialization pass below.
+    const FoldedSignsScope folded_signs_scope(plan.hadamard_signs, backing);
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;

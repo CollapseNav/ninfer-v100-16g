@@ -64,6 +64,20 @@ ops::LinearPolicy text_policy(const Weight& weight) {
 
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
+// Folded (rotated-basis) ternary activation scratch: a [input_width, last] BF16 buffer that
+// ternary weights need before their matmul (P, then the signs, then the nominal Hadamard).
+//
+// The folded ternary port deliberately keeps the groupwise-int identity -- the binding layer
+// resolves each weight's format from the artifact's own declaration, so the weights profile only
+// decides which tensors exist, not how they are encoded -- which means this profile is shared by
+// both artifacts and the reservation cannot be made conditional on it. The cost is one
+// activation-sized buffer per ternary op, the same order as the activation roots the stage
+// already reserves, and it is what lets the ternary artifact construct its CUDA graphs at all.
+std::size_t folded_rotation_bytes(std::int32_t input_width, std::int32_t last) {
+    return ops::linear_workspace_capacity_bytes(QType::PQ2_0_G128, input_width, input_width,
+                                                ops::LinearPolicy::A16Only, 1, last);
+}
+
 std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
                                          const Variant::GdnProjectionWeights& weights) {
     const std::int32_t batch = hidden.ne[2];
@@ -359,7 +373,10 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return ops::q4_q5_attn_input_proj_workspace_capacity_bytes(first, last);
+        // Fused groupwise-int routes need no transient bytes; the folded ternary port shares this
+        // profile and does (see folded_rotation_bytes). This projection consumes the raw hidden
+        // state, so the activation is 5120 wide.
+        return folded_rotation_bytes(TextConfig::hidden, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
@@ -376,7 +393,11 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+        // The folded ternary port shares the groupwise-int profile: this projection folds into the
+        // residual, and the ternary route needs a [hidden, T] projection scratch plus the
+        // [query_size, T] activation rotation buffer. That is a superset of the zero bytes the
+        // fused Q5 route needs, so one query serves both artifacts.
+        return ops::linear_add_workspace_capacity_bytes(QType::PQ2_0_G128, TextConfig::hidden,
                                                         TextConfig::query_size,
                                                         ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36Nvfp4:
@@ -399,7 +420,9 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(first, last);
+        // See attention_projection_workspace_capacity_bytes: the folded ternary port shares the
+        // groupwise-int profile. This projection also consumes the raw hidden state.
+        return folded_rotation_bytes(TextConfig::hidden, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
@@ -468,7 +491,9 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
+        // See attention_output_projection_workspace_capacity_bytes: the ternary route feeds the
+        // 6144-wide GDN output into a [hidden, T] scratch and rotates a [value_dim, T] activation.
+        return ops::linear_add_workspace_capacity_bytes(QType::PQ2_0_G128, TextConfig::hidden,
                                                         TextConfig::value_dim,
                                                         ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36Nvfp4:
@@ -484,8 +509,12 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
 
 std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first,
                                                                           std::int32_t last) {
+    // This query carries no weights profile, and the A/B control projections are among the folded
+    // ternary weights, so the folded rotation scratch is reserved unconditionally. It is one
+    // activation-sized buffer per token tile, matching what the stage already reserves.
     return ops::gdn_norm_gating_proj_workspace_capacity_bytes(TextConfig::gdn_value_heads,
-                                                              TextConfig::hidden, first, last);
+                                                              TextConfig::hidden, first, last) +
+           folded_rotation_bytes(TextConfig::hidden, last);
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
@@ -495,7 +524,10 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S,
+        // The folded ternary port shares the groupwise-int profile: the SwiGLU gate/up parent is
+        // projected whole (2 * intermediate rows) and the down projection folds into the residual,
+        // so one query reserving both ternary routes serves both artifacts.
+        return post_mixer_workspace_bytes(QType::PQ2_0_G128, QType::PQ2_0_G128,
                                           ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36Nvfp4:
         return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,

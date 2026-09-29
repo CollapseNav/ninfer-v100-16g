@@ -27,7 +27,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::CausalScoring:
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
-        options.prefill_chunk        = 1024;
+        // Was 1024. The scorer's default window is 4096 tokens (apps/perplexity), so a 1024-token
+        // chunk makes it re-enter the forward pass four times per window, and EVERY entry
+        // re-materialises the whole weight set -- on this ternary artifact that is 25.6e9 weights
+        // dequantised to fp16 again. 4096 covers the default window in one entry. The value is
+        // clamped to the capacity downstream, so a smaller --context is unaffected, and the
+        // scored NLL is bit-identical (verified against the 1024 arm).
+        options.prefill_chunk        = 4096;
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;

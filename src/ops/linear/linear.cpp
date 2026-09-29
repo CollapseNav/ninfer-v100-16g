@@ -8,6 +8,9 @@
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
+#include "ops/linear/ternary/ternary_cutlass_sm70.h"
+#include "ops/linear/ternary/ternary_dispatch.h"
+#include "ops/linear/ternary/ternary_rotation.h"
 #include "ops/linear/w8/w8_dispatch.h"
 
 #include <cstdint>
@@ -100,6 +103,10 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16S:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
+    case QType::PTQ1_0_G128:
+    case QType::PQ2_0_G128:
+        detail::ternary_dispatch(x, w, out, policy, workspace, stream);
+        return;
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;
@@ -158,6 +165,20 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16S:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
+    case QType::PTQ1_0_G128:
+    case QType::PQ2_0_G128:
+        // The GEMM itself decodes inside the kernel and needs no workspace, but the folded basis
+        // does: the activation must be mapped into the rotated basis (P, then signs, then the
+        // normalized Hadamard) before the matmul, and that needs a [K, T] BF16 scratch. Omitting
+        // these cases would make every ternary weight die here with "linear workspace:
+        // unsupported weight qtype" before reaching dispatch.
+        (void)detail::select_ternary_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_ternary_launch(output_rows, input_rows, max_tokens, policy);
+        // Plus the CUTLASS arm's dequantised weight chunk when that route admits the shape. Unlike
+        // the two fused wrappers this op owns its output, so the projection scratch is the caller's
+        // `out` tensor and is not part of this number.
+        return detail::ternary_rotation_workspace_bytes(input_rows, max_tokens) +
+               detail::ternary_cutlass_sm70_workspace_bytes(input_rows, max_tokens);
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;

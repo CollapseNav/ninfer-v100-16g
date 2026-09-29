@@ -20,6 +20,8 @@ StorageLayout storage_layout_for(NumericFormat format) {
     case NumericFormat::Q5G64_F16S:
     case NumericFormat::Q6G64_F16S:
     case NumericFormat::W8G32_F16S:
+    case NumericFormat::PTQ1_0_G128:
+    case NumericFormat::PQ2_0_G128:
         return StorageLayout::RowSplitK128V1;
     case NumericFormat::NVFP4:
         return StorageLayout::BlockScaleK16M128x4V1;
@@ -49,6 +51,10 @@ QType qtype_for(NumericFormat format) {
         return QType::NVFP4;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return QType::FP8_E4M3FN_ROW_BF16S;
+    case NumericFormat::PTQ1_0_G128:
+        return QType::PTQ1_0_G128;
+    case NumericFormat::PQ2_0_G128:
+        return QType::PQ2_0_G128;
     }
     throw std::logic_error("unhandled numeric format");
 }

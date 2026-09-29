@@ -3,7 +3,9 @@
 
 #include "ops/common/math.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/ternary/ternary_rotation.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
+#include "core/device.h"
 #include "core/weight.h"
 
 #include <cstdint>
@@ -168,6 +170,81 @@ void require_w8_metadata(const Weight& table, const Tensor& out) {
     }
 }
 
+// Prism ternary tables: group 128, base plane (qs) + optional high plane (qh, PTQ1_0 only) +
+// one binary16 scale per group. The plane geometry mirrors row_split_geometry(), whose sizes
+// were checked byte for byte against the artifact reader ([248320,5120] -> PTQ1_0 278,118,400 B
+// / PQ2_0 337,715,200 B). (V100 ternary port.)
+void require_ternary_metadata(const Weight& table, const Tensor& out, std::int32_t code_bytes,
+                              std::int32_t high_bytes, const char* label) {
+    constexpr std::int32_t kGroup = 128;
+    const std::string tag         = std::string("embedding: ") + label;
+
+    if (table.layout != QuantLayout::RowSplit) {
+        throw std::invalid_argument(tag + " table must be RowSplit");
+    }
+    require_weight_2d(table);
+    if (table.group_size != kGroup || table.group != kGroup) {
+        throw std::invalid_argument(tag + " table group must be 128");
+    }
+    if (table.scale_dtype != DType::FP16) {
+        throw std::invalid_argument(tag + " table scale dtype must be FP16");
+    }
+    if (table.padded_shape[0] != table.shape[0] ||
+        table.padded_shape[1] != align_up_i32(table.shape[1], 128)) {
+        throw std::invalid_argument(tag + " padded shape is invalid");
+    }
+    if (table.shape[1] != out.ne[0]) {
+        throw std::invalid_argument(tag + " table d must match out.ne[0]");
+    }
+
+    const std::uint64_t rows = static_cast<std::uint64_t>(table.shape[0]);
+    const std::uint64_t kg   = static_cast<std::uint64_t>(table.padded_shape[1] / kGroup);
+    const std::uint64_t code_plane_bytes =
+        checked_mul_u64(checked_mul_u64(rows, kg), static_cast<std::uint64_t>(code_bytes));
+    const std::uint64_t high_plane_bytes =
+        checked_mul_u64(checked_mul_u64(rows, kg), static_cast<std::uint64_t>(high_bytes));
+    const std::uint64_t scale_plane_bytes = checked_mul_u64(checked_mul_u64(rows, kg), 2);
+    const std::uint64_t high_plane_off    = ((code_plane_bytes + 255u) / 256u) * 256u;
+    const std::uint64_t scale_plane_off =
+        high_plane_off + ((high_plane_bytes + 255u) / 256u) * 256u;
+    const std::uint64_t expected = scale_plane_off + scale_plane_bytes;
+    if (table.payload_bytes != 0 && table.payload_bytes < expected) {
+        throw std::invalid_argument(tag + " payload is too small");
+    }
+    if (table.qdata == nullptr || table.scales == nullptr) {
+        throw std::invalid_argument(tag + " planes must be non-null");
+    }
+    if (high_bytes == 0) {
+        if (table.qhigh != nullptr || table.high_plane_bytes != 0) {
+            throw std::invalid_argument(tag + " high plane must be empty");
+        }
+    } else {
+        if (table.qhigh == nullptr) {
+            throw std::invalid_argument(tag + " high plane must be non-null");
+        }
+        if (table.high_plane_bytes < high_plane_bytes) {
+            throw std::invalid_argument(tag + " high plane is too small");
+        }
+    }
+}
+
+// The Prism ternary embedding table stores its rows folded into the rotated basis, so a gathered
+// row is not yet an admissible residual stream: the model computes h = s * (H * z) after the
+// lookup, which is the one inverse-mapped transform in the whole model.
+//
+// Mapping in place costs no scratch buffer, which is what keeps the workspace-free embedding op
+// signature intact. With NINFER_TERNARY_HADAMARD=0 the mapping is skipped along with every other
+// folded-basis transform.
+void unrotate_folded_embedding(Tensor& out, const Weight& table, cudaStream_t stream) {
+    if (!detail::ternary_rotation_enabled()) { return; }
+    if (!detail::ternary_weight_is_folded(table)) {
+        throw std::invalid_argument(
+            "embedding: folded ternary table has no sign block; the artifact must carry "
+            "text/hadamard_signs and text/hadamard_widths");
+    }
+    detail::launch_ternary_rotation_inverse_inplace(out, table, stream);
+}
+
 void require_fp8_metadata(const Weight& table, const Tensor& out) {
     constexpr std::int32_t kVocabulary = 248320;
     constexpr std::int32_t kHidden     = 5120;
@@ -231,6 +308,20 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
         detail::embed_gather_fp8_launch(ids, table, out, stream);
+        break;
+    case QType::PQ2_0_G128:
+        require_ternary_metadata(table, out, 32, 0, "PQ2_0_G128");
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_pq2_launch(ids, table, out, stream);
+        unrotate_folded_embedding(out, table, stream);
+        break;
+    case QType::PTQ1_0_G128:
+        require_ternary_metadata(table, out, 24, 2, "PTQ1_0_G128");
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_ptq1_launch(ids, table, out, stream);
+        unrotate_folded_embedding(out, table, stream);
         break;
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");

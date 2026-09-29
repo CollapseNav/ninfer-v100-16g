@@ -1129,7 +1129,10 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
             Tensor target_ids  = work.alloc(DType::I32, {columns});
             Tensor logprobs    = work.alloc(DType::FP32, {columns});
             Tensor hidden      = score_hidden->slice(1, 0, columns);
-            ops::linear(hidden, model.output_head, logits, device.stream);
+            // The workspace overload: the folded (rotated-basis) ternary output head needs a
+            // [hidden, columns] activation rotation buffer.
+            ops::linear(hidden, model.output_head, logits, ops::LinearPolicy::A16Only, work,
+                        device.stream);
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
                                                     cudaMemcpyHostToDevice, device.stream));
             ops::target_logprobs(logits, target_ids, TextConfig::token_domain, logprobs,

@@ -571,7 +571,8 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
                                       ctx_.stream);
     } else {
         Tensor output_logits = matrix_window(logits, T);
-        ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);
+        ops::linear(hidden, *lm_head_, output_logits, ops::LinearPolicy::A16Only, work_,
+                    ctx_.stream);
         ops::argmax(output_logits, proposal_tokens, kCfg.token_domain, ctx_.stream);
     }
 }
@@ -684,7 +685,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
-        ops::linear(hidden, *lm_head_, logits, stream);
+        ops::linear(hidden, *lm_head_, logits, ops::LinearPolicy::A16Only, work_, stream);
     }
     work_.reset();
 }
@@ -744,7 +745,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
-        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+        ops::linear(flat_hidden, *lm_head_, flat_logits, ops::LinearPolicy::A16Only, work_, stream);
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
     work_.reset();
@@ -1210,7 +1211,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
-                ops::linear(last_xf, *lm_head_, logits, s);
+                ops::linear(last_xf, *lm_head_, logits, ops::LinearPolicy::A16Only, work_, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).

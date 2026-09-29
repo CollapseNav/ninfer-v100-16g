@@ -21,7 +21,12 @@ struct Options {
     std::uint32_t max_new        = 128;
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
-    std::uint32_t prefill_chunk  = 1024;
+    // 1024 measured badly on the Volta tree: the prefill forward pass is entered ceil(T/chunk) times
+    // and EVERY entry re-materialises the whole weight set (the CUTLASS arm dequantises 25.6e9
+    // weights, the fused arm re-reads the PQ2 planes). On a 3412-token prompt the audit counter shows
+    // 4 entries at 1024 and 1 at 4096, worth 996 -> 1190 t/s. The cost is workspace that scales with
+    // the chunk, which is why this is not simply the maximum context.
+    std::uint32_t prefill_chunk  = 4096;
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;

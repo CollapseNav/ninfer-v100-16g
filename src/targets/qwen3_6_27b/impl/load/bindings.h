@@ -16,6 +16,7 @@
 #include <optional>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 
@@ -28,6 +29,22 @@ struct WeightPlan {
     artifact::NumericFormat format          = artifact::NumericFormat::BF16;
     std::uint32_t weight_scale_divisor_bits = 0;
     std::uint32_t input_scale_divisor_bits  = 0;
+    // Folded-basis feature permutation for this weight; perm_rep == 1 means "none".
+    // Set at bind time from the weight's identity (only /gdn/output carries one).
+    // (V100 ternary port.)
+    std::int32_t hadamard_perm_hd  = 0;
+    std::int32_t hadamard_perm_nk  = 0;
+    std::int32_t hadamard_perm_rep = 1;
+};
+
+// Folded (rotated-basis) sign table, present only on artifacts whose weights are folded into a
+// rotated basis -- the ternary port. `values` is one contiguous FP32 +-1 block; `widths` names
+// consecutive sign rows. `width_offsets` is the prefix sum of `widths`, so a weight can find its
+// own block without knowing anything but its input dimension. (V100 ternary port.)
+struct HadamardSignsPlan {
+    artifact::ObjectHandle values;
+    artifact::ObjectHandle widths;
+    std::vector<std::pair<std::int32_t, std::uint64_t>> width_offsets;
 };
 
 struct MlpPlan {
@@ -148,6 +165,8 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
+    // Absent unless the artifact stores folded (rotated-basis) weights; the ternary port does.
+    std::optional<HadamardSignsPlan> hadamard_signs;
     std::optional<DFlash2Plan> dflash2;
 
     qwen3_6::VisionBackbonePlan vision_backbone;

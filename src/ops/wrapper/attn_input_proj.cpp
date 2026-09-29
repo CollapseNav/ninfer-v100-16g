@@ -9,6 +9,10 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/ternary/ternary_dispatch.h"
+#include "ops/linear/ternary/ternary_row_view.h"
+#include "ops/linear/ternary/ternary_cutlass_sm70.h"
+#include "ops/linear/ternary/ternary_rotation.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -209,6 +213,23 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         (void)detail::w8_attn_input_resolve_plan(
             {input_rows, 4096, 512, parent_rows, input_rows, max_tokens});
         return 0;
+    case QType::PTQ1_0_G128:
+    case QType::PQ2_0_G128:
+        // The folded ternary parents carry a 128-wide group geometry, so they are not the Q4/Q5
+        // profile, and the projection itself needs no workspace (the GEMM decodes in-kernel). The
+        // only arena user is the [input_rows, T] activation rotation, so that is what to reserve.
+        // NOTE: the author's tree leaves these qtypes to the throw below; this case is a deliberate
+        // deviation because the ternary route definitely allocates the rotation buffer, and a
+        // capacity query that under-reports is what makes the arena reject the graph at run time.
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("attn_input_proj workspace: ternary admits only A16");
+        }
+        // Plus the CUTLASS prefill arm's dequantised weight chunk and its fp16 copy of the shared
+        // activation. One chunk is reused across all four projections, and the fp16 activation is
+        // rebuilt per projection (it is cheap next to the chunk), so the reservation is the sum of
+        // the per-op figures and not four times the chunk.
+        return detail::ternary_rotation_workspace_bytes(input_rows, max_tokens) +
+               detail::ternary_cutlass_sm70_workspace_bytes(input_rows, max_tokens);
     case QType::Q4G64_F16S:
     case QType::Q5G64_F16S:
     case QType::Q6G64_F16S:
@@ -218,6 +239,62 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     }
     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
 }
+
+namespace {
+
+// --- folded (rotated-basis) ternary split parents -----------------------------------------
+//
+// The ternary parents carry the row-split layout of Q4/Q5 but a 128-wide group geometry, so the
+// Q4/Q5 required-geometry checks cannot accept them and their fused dispatch cannot run them.
+
+bool is_ternary_attn_parent(QType qtype) noexcept {
+    return qtype == QType::PTQ1_0_G128 || qtype == QType::PQ2_0_G128;
+}
+
+void require_ternary_attn_parents(const Weight& query_key_weight,
+                                  const Weight& gate_value_weight, std::int32_t rows,
+                                  std::int32_t hidden) {
+    const Weight* const parents[]{&query_key_weight, &gate_value_weight};
+    for (const Weight* parent : parents) {
+        if (!is_ternary_attn_parent(parent->qtype) || parent->layout != QuantLayout::RowSplit ||
+            parent->scale_dtype != DType::FP16 || parent->group != 128 || parent->ndim != 2 ||
+            parent->k != hidden || parent->shape[1] != hidden ||
+            parent->padded_shape[1] != hidden || (parent->k % 1024) != 0) {
+            throw std::invalid_argument(
+                "attn_input_proj: unsupported ternary split parent geometry");
+        }
+    }
+    const Weight* const both[]{&query_key_weight, &gate_value_weight};
+    for (const Weight* parent : both) {
+        if (parent->n != rows || parent->shape[0] != rows) {
+            throw std::invalid_argument(
+                "attn_input_proj: ternary split parent has the wrong row count");
+        }
+    }
+    if (query_key_weight.qtype != gate_value_weight.qtype) {
+        throw std::invalid_argument(
+            "attn_input_proj: both ternary split parents must use the same format");
+    }
+}
+
+// The activation is `hidden` wide for all four projections, so one rotation serves all of them.
+// Only the first of the four pays for the fp16 copy the CUTLASS arm needs; the rest reuse it, which
+// is why the arena has to be threaded through here rather than left to each projection.
+void launch_ternary_attn(const Tensor& activation, const Weight& query_key_weight,
+                         const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                         Tensor& v, std::int32_t query_rows, std::int32_t kv_rows,
+                         WorkspaceArena* workspace, cudaStream_t stream) {
+    const Weight q_head = detail::ternary_row_view(query_key_weight, 0, query_rows);
+    const Weight k_tail = detail::ternary_row_view(query_key_weight, query_rows, kv_rows);
+    const Weight g_head = detail::ternary_row_view(gate_value_weight, 0, query_rows);
+    const Weight v_tail = detail::ternary_row_view(gate_value_weight, query_rows, kv_rows);
+    detail::ternary_dispatch_basis(activation, q_head, q, LinearPolicy::A16Only, workspace, stream);
+    detail::ternary_dispatch_basis(activation, g_head, gate, LinearPolicy::A16Only, workspace, stream);
+    detail::ternary_dispatch_basis(activation, k_tail, k, LinearPolicy::A16Only, workspace, stream);
+    detail::ternary_dispatch_basis(activation, v_tail, v, LinearPolicy::A16Only, workspace, stream);
+}
+
+} // namespace
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
@@ -231,6 +308,24 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_matrix(gate, kQRows, cols, "gate");
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
+    if (is_ternary_attn_parent(query_key_weight.qtype)) {
+        require_ternary_attn_parents(query_key_weight, gate_value_weight, kQRows + kKvRows, kHidden);
+        if (detail::ternary_rotation_enabled()) {
+            // Scoped: the rotation scratch is handed back when this call returns, so it does not
+            // accumulate across the (many) graph constructions of one load.
+            auto scope = workspace.scope();
+            const Tensor activation =
+                detail::folded_activation(x, query_key_weight, workspace, stream);
+            launch_ternary_attn(activation, query_key_weight, gate_value_weight, q, gate, k, v,
+                                kQRows, kKvRows, &workspace, stream);
+            return;
+        }
+        // NINFER_TERNARY_HADAMARD=0: run the GEMM against the raw activation so the forward pass
+        // is measurable without the rotation. Numerically meaningless, which is the point.
+        launch_ternary_attn(x, query_key_weight, gate_value_weight, q, gate, k, v, kQRows, kKvRows,
+                            &workspace, stream);
+        return;
+    }
     require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, "gate/value weight");
 

@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1
+# NInfer V100 (sm_70) 构建
+#   - CUDA 12.8.1：sm_70 需要 >=12.8，且 CUDA 13 已不再汇编 Volta 设备码
+#   - git：上游 CMakeLists 在 sm_70 分支用 FetchContent 取 CUTLASS
+#   - CUTLASS 已预先放到 third_party/cutlass，并用 FETCHCONTENT_SOURCE_DIR_CUTLASS
+#     指过去，容器里不需要联网 clone
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        cmake \
+        ninja-build \
+        pkg-config \
+        build-essential \
+        git \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libswscale-dev \
+        libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+        -DCMAKE_CUDA_ARCHITECTURES=70 \
+        -DFETCHCONTENT_SOURCE_DIR_CUTLASS=/src/third_party/cutlass \
+        -DCUTLASS_ENABLE_HEADERS_ONLY=ON \
+        -DCUTLASS_ENABLE_TESTS=OFF \
+        -DCUTLASS_ENABLE_EXAMPLES=OFF \
+        -DNINFER_BUILD_APPS=ON \
+        -DBUILD_TESTING=OFF \
+        -DNINFER_BUILD_BENCHMARKS=OFF \
+    && cmake --build /build --parallel --target ninfer ninfer-serve
+
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        libavcodec60 \
+        libavformat60 \
+        libavutil58 \
+        libcurl4t64 \
+        libswscale7 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
+COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+
+WORKDIR /workspace
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+CMD ["ninfer-serve", "--help"]

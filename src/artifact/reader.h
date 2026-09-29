@@ -28,6 +28,8 @@ enum class NumericFormat {
     W8G32_F16S,
     NVFP4,
     FP8_E4M3FN_ROW_BF16S,
+    PTQ1_0_G128,
+    PQ2_0_G128,
 };
 
 enum class StorageLayout {

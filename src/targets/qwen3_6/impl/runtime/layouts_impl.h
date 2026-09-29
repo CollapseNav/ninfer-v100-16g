@@ -13,6 +13,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/linear/ternary/ternary_rotation.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -417,6 +418,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        // Ternary port: the folded output-head linear maps the activation through the Hadamard
+        // basis from the same workspace (ternary_rotation_workspace_bytes). Without this the
+        // first scored window dies with bad_alloc out of DeviceArena::alloc, because the
+        // output-head linear now needs a [hidden, tile] rotation buffer it cannot get.
+        scratch(causal_score, ops::detail::ternary_rotation_workspace_bytes(
+                                  TextConfig::hidden, static_cast<std::int32_t>(kCausalScoreTile)));
         out.causal_score = finish(causal_score);
     }
 

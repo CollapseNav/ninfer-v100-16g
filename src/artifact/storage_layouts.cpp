@@ -43,6 +43,13 @@ QuantGeometry quant_geometry(NumericFormat format) {
         return {64, 32, 16};
     case NumericFormat::W8G32_F16S:
         return {32, 32, 0};
+    // Prism ternary: 128-weight group -> base plane {qs} + high plane {qh} + fp16 scale.
+    // PTQ1_0 = 24 B base-3 trits (5/byte) + 2 B extra trits (4/byte) + 2 B scale = 28 B/128.
+    case NumericFormat::PTQ1_0_G128:
+        return {128, 24, 2};
+    // PQ2_0 = 32 B of 2-bit codes (no high plane) + 2 B scale = 34 B/128.
+    case NumericFormat::PQ2_0_G128:
+        return {128, 32, 0};
     default:
         throw ArtifactError("row-split-k128-v1 requires a grouped quantized format");
     }
@@ -82,6 +89,10 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "NVFP4";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
+    case NumericFormat::PTQ1_0_G128:
+        return "PTQ1_0_G128";
+    case NumericFormat::PQ2_0_G128:
+        return "PQ2_0_G128";
     }
     return {};
 }
