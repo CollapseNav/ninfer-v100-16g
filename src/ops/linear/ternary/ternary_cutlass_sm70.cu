@@ -35,6 +35,16 @@ using ElementOutput          = cutlass::bfloat16_t;
 // BN is the lever that matters: at BN=128 the whole-model A traffic is ~1.1 TB against ~0.55 TB at
 // BN=256, on top of ~1.1 TB of unavoidable B traffic. NINFER_TERNARY_CUTLASS_TILE picks between
 // them at run time so one build can A/B the traffic model.
+//
+// kStages is not a parameter here, and there is no env knob for it. CUTLASS's sm70 tensor-op path
+// has exactly one kernel: `kernel::DefaultGemm<... arch::Sm70 ...>` is specialised only for
+// Stages == 2, and the threadblock kernel it selects is MmaPipelined, which asserts
+// `kStages == 2` (mma_pipelined.h:137). Asking device::Gemm for Stages 3 or 4 leaves
+// kernel::DefaultGemm an incomplete type and the compile dies inside cutlass/gemm/device/gemm.h.
+// Measured: 55 errors, all downstream of that one missing specialisation. Deeper software
+// pipelining on Volta is therefore not a tuning knob but a hand-written kernel, and the sm70
+// MmaMultistage path does not exist either (the multistage DefaultMma specialisations are all
+// keyed on Sm80/Sm75, and the sm70 shared-memory iterators have no stage dimension to index).
 template <int BN>
 using GemmT = cutlass::gemm::device::Gemm<
     ElementInput, cutlass::layout::RowMajor, ElementInput, cutlass::layout::ColumnMajor,
@@ -362,9 +372,7 @@ void ternary_cutlass_sm70_launch(const Tensor& x_folded, const Weight& w, Tensor
 
 bool ternary_cutlass_sm70_admits(const Weight&, std::int32_t) noexcept { return false; }
 
-std::size_t ternary_cutlass_sm70_workspace_bytes(std::int32_t, std::int32_t, std::int32_t) {
-    return 0;
-}
+std::size_t ternary_cutlass_sm70_workspace_bytes(std::int32_t, std::int32_t) { return 0; }
 
 void ternary_cutlass_sm70_launch(const Tensor&, const Weight&, Tensor&, std::int32_t,
                                  WorkspaceArena&, cudaStream_t) {

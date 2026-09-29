@@ -3,11 +3,14 @@
 Standalone CUDA microbenchmarks used to justify the numbers in
 [`docs/ternary-port.md`](../../../docs/ternary-port.md).
 
-They exist because **this host has no working profiler**: `ncu` is present in the build image but the
-driver returns `ERR_NVGPUCTRPERM` (it needs `NVreg_RestrictProfilingToAdminUsers=0` plus a module
-reload), and even then ncu sees nothing inside CUDA graphs. Every claim in that document about *why*
-a kernel is slow was therefore obtained by isolating its memory access pattern, or by deleting one
-load class at a time on the real model, rather than by reading counters.
+They exist because **this host has no usable *counter* profiler**: `ncu` is present in the build image
+but the driver returns `ERR_NVGPUCTRPERM` (it needs `NVreg_RestrictProfilingToAdminUsers=0` plus a
+module reload), and even then ncu sees nothing inside CUDA graphs. `nvprof` DOES work, however — it
+gives a per-kernel duration trace (`--print-gpu-trace`) that is accurate to a few percent in a
+captured graph, which is how the decode budget in
+[`docs/ternary-port.md`](../../../docs/ternary-port.md) was obtained. Claims about *why* a kernel is
+slow still come from isolating its memory access pattern or from deleting one load class at a time on
+the real model, because nvprof reports timing, not stall reasons.
 
 Build and run one inside the build container:
 
@@ -28,6 +31,7 @@ source is at `/w/<name>.cu`; copy the `.cu` next to the script first, or adjust 
 | `gemv_probe.cu` | Is the T=1 GEMV's decode limited by its **one-code-byte-per-lane** load pattern? | No. The row pattern reaches **869.6 GB/s** against an **882.6 GB/s** flat `uint4` ceiling — 98.5%. Widening to 2/4/8/16 bytes per lane buys 3%. This **refuted** the "wide transactions" plan |
 | `tile_probe.cu` | Does the MTP verify kernel (`ternary_pq2_gemv_tile_kernel`) actually amortise the weights across its token tile? | Only partly. Against the shipped T=1 kernel on the same weights it costs **1.91x at M=2** and **2.56x at M=4**, where weight-residency would be ~1.05x. It also showed `kT=4` running with only two live tokens wastes **20%** (1.283 ms vs 1.024 ms) — which is now fixed by dispatching `kT` from the token count |
 | `dq_probe.cu` | Why was the PQ2 -> fp16 dequant kernel slow? | Its store pattern. One 16-byte store per thread at byte-stride 32 measured **367 GB/s**; putting one contiguous 16-byte store in each thread measured **1112 GB/s** (the `cudaMemset` reference on the same buffer is 892). This is the one probe whose finding became a shipped change |
+| `tile_occ.cu` | Is the CUTLASS sm70 GEMM's 84 TFLOP/s in situ a tile problem? | No. `cudaFuncGetAttributes` on the real `cutlass::Kernel<GemmKernel>` gives the shipped 128x128x32/w64x64 tile **232 registers and 2 CTAs/SM**; every higher-occupancy tile (64x128, 128x64, 64x64) is slower, 26-78 TFLOP/s, and 128x128x64 loses too (61.2). The shipped tile's isolated ceiling is 86.1/95.4 TFLOP/s on the two dominant shapes, so in situ 84 is 93% of it. Also the reason `NINFER_TERNARY_CUTLASS_STAGES` does not exist: `Stages != 2` does not compile |
 
 Two probes that belong with these but are env-gated arms of the real kernels rather than standalone
 files: `NINFER_TERNARY_MMA_PROBE` (fused tensor-core prefill: `nodecode` +20.6%, `noaload` +13.9%)

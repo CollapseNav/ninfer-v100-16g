@@ -88,7 +88,8 @@ Both fast prefill arms are selected automatically; `NINFER_TERNARY_CUTLASS=0` re
 | `NINFER_TERNARY_ROWS` / `_TILE` | row/token block of the blocked GEMV, defaults 4 / 8. Only read on the `block` route |
 | `NINFER_TERNARY_SIMT` | shape of the `simt` route: `r8c4` (default) / `r8c8` / `r16c4` / `r8c8p2` / `r16c8` / `r32c4` |
 | `NINFER_TERNARY_GEMV_WARPS` | warps per block of the T=1 GEMV: 4/8/16/32, default 8. Measured 41.2 / 40.4 / 38.3 / 35.8 — flat to inverse |
-| `NINFER_TERNARY_GEMV_UNROLL` | group-walk unroll, default **8**. 1->29.9, 2->34.1, 4->40.4, **8->41.6**, 12->33.9, 16->30.9, 20->25.7 t/s. Register counts: 2->36, 4->48, **8->72**, 12->95, 16->116, 20->134 |
+| `NINFER_TERNARY_GEMV_UNROLL` | group-walk unroll, default **8**. 1->29.9, 2->34.1, 4->40.4, **8->41.6**, 12->33.9, 16->30.9, 20->25.7 t/s uncapped; register counts 2->36, 4->48, **8->72**, 12->95, 16->116, 20->134. Inside the shipped 64-register cap: 4->39.7, **8->43.6**, 12->41.1, 16->39.6, 20->42.4 |
+| `NINFER_TERNARY_GEMV_MINBLOCKS` | `__launch_bounds__`'s min-blocks, default **4** (measured best: 41.6 -> 43.6 t/s). 1/2/3/5/6/8 exist to re-run the sweep; registers 72/72/72/62/48/40/32 and decode 41.6/41.6/41.5/**43.6**/42.5/38.5/33.5 |
 | `NINFER_TERNARY_GEMV_ROWS` | output rows per warp, 1 (default) / 2 / 4. **2 and 4 lose** (24.0 and 16.2 t/s against 41.6) because register pressure binds before the shared activation pays |
 | `NINFER_TERNARY_GEMV_PROBE` | `noact` / `nocode` / `codealu` / `noscale`. Deletes one load class at a time, **numerically wrong by design**. This is how the decode step's cost was located |
 | `NINFER_TERNARY_HADAMARD=0` | skip the folded-basis rotation. **Numerically meaningless** — diagnostic only |
@@ -256,8 +257,9 @@ max-context 8192. Explicit `--prefill-chunk` still overrides.
 | dequant | 0.145 s | one pass, 382 GB/s. Was 0.579 s |
 | everything else | 0.64 s | rotations, norms, attention/GDN, embeddings, the <256-token tail |
 
-The GEMM is near both ceilings at once, so it has little left; the reachable remainder is roughly
-15-20%, not the 30-40% this document previously projected. A run with `NINFER_TERNARY_CUTLASS=0` on
+The GEMM is at 93% of what the same tile reaches with the card to itself (`tile_occ.cu`, below), so
+the reachable prefill remainder is inside the 0.64 s of "everything else", not inside the GEMM — the
+15-20% this document projected for the GEMM is not there. A run with `NINFER_TERNARY_CUTLASS=0` on
 the new default isolates the arm: 791 -> 1190 is the route, 717 -> 791 is the chunk.
 
 ### A cheaper alternative that is not worth it
@@ -265,7 +267,51 @@ the new default isolates the arm: 791 -> 1190 is the route, 717 -> 791 is the ch
 Cutting the B re-reads by raising the M tile from 128 to 256 halves the dominant traffic term
 (27 -> 14 re-reads). Standing alone, the 256x128 tile measures 84.5 TFLOP/s against 128x128's 94.0,
 which gives back exactly what the traffic saves. `NINFER_TERNARY_CUTLASS_TILE=128x256` is selectable
-and likewise loses (862.8 against 877.8).
+and likewise loses (862.8 against 877.8). See the tile table below for the one-CTA occupancy that
+explains the loss.
+
+### Software-pipeline depth is not a knob on Volta
+
+Nothing in CUTLASS's sm70 tensor-op path accepts a stage count above two, so there is no
+`NINFER_TERNARY_CUTLASS_STAGES`. `kernel::DefaultGemm<..., arch::Sm70, ..., Stages, ...>` is
+specialised for `Stages == 2` only (`cutlass/gemm/kernel/default_gemm.h:685`), and the threadblock
+kernel it selects is `MmaPipelined`, which asserts `kStages == 2`
+(`cutlass/gemm/threadblock/mma_pipelined.h:137`). Asking `device::Gemm` for 3 or 4 stages leaves
+`kernel::DefaultGemm` an incomplete type and the compile dies inside `cutlass/gemm/device/gemm.h`:
+55 errors, all downstream of that one missing specialisation, and **no static_assert names the real
+cause** — the first symptom is "incomplete type ... is not allowed" on a 4000-character template
+dump. The multistage route is closed too: every multistage `DefaultMma` specialisation is keyed on
+`Sm80`/`Sm75`, and the sm70 shared-memory iterators carry no stage dimension to index. Deeper
+pipelining on Volta is a hand-written kernel, not a parameter.
+
+### Tile and occupancy sweep: the GEMM is already at its own ceiling
+
+With stages out, the only remaining lever on loads-in-flight is resident CTAs per SM, which the
+threadblock tile fixes through the per-thread accumulator count. Measured by
+`tools/v100/ternary-probes/tile_occ.cu`, which reads registers and occupancy out of the real
+`cutlass::Kernel<GemmKernel>` via `cudaFuncGetAttributes` /
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` rather than estimating them, then times the GEMM at
+M=3412 on this model's two dominant shapes:
+
+| tile | warp | thr | regs | CTAs/SM | gate_up 34816x5120 | down 5120x17408 |
+|---|---:|---:|---:|---:|---:|---:|
+| **128x128x32** | **64x64** | **128** | **232** | **2** | **86.1 TFLOP/s** | **95.4 TFLOP/s** |
+| 128x128x32 | 32x64 | 256 | 138 | 1 | 78.2 | 79.1 |
+| 128x64x32 | 64x32 | 128 | 148 | 3 | 76.6 | 33.5 |
+| 64x128x32 | 32x64 | 128 | 152 | 3 | 71.2 | 56.6 |
+| 64x128x32 | 64x64 | 64 | 250 | 4 | 67.5 | 78.1 |
+| 128x128x64 | 64x64 | 128 | — | — | 61.2 | 59.2 |
+| 64x64x32 | 32x32 | 128 | 100 | 4 | 26.4 | 25.8 |
+| 256x128x32 | 64x64 | 256 | 226 | 1 | (84.5 standalone) | (—) |
+
+Rows smaller than the shipped tile are not neutral, they are strictly worse twice over: a smaller
+warp tile costs more shared-memory traffic per MMA than the extra resident CTAs give back, and a
+smaller M tile doubles the B re-reads. The 64x128 rows make that second effect visible without
+benefit — 1127 GB/s of apparent B traffic on gate_up, *above* HBM peak because it is L2-served, for
+71 TFLOP/s against 86. So the shipped 128x128x32/64x64 at 2 CTAs/SM and 232 registers is the
+measured optimum of this family, and its in-situ 84 TFLOP/s is 93% of the 86.1/95.4 it reaches with
+nothing else on the card. (The older "84 of 99" comparison was against a different tile's standalone
+number.)
 
 ### The bigger structural idea, and why it is not next
 
@@ -369,20 +415,52 @@ code load ~8%. That the load is only ~15% is the decisive number, because:
 7.15 GB at the bandwidth this access pattern actually reaches is 8.2 ms. There is nothing left to win
 there.
 
+### In-situ kernel budget, and what else is in the step (nvprof)
+
+`nvprof` works on this host even though `ncu` needs `NVreg_RestrictProfilingToAdminUsers=0`. A full
+`--print-gpu-trace` of a decode-only window (slice after the last CUTLASS prefill kernel) accounts for
+**22.5 ms of GPU kernel time per token at a 96% busy rate** with only 0.84 ms/token of inter-kernel
+gap, so the step is not host- or launch-bound. Sorted by summed duration, at a 612-token context
+(37.4 t/s, i.e. 26.7 ms/token):
+
+| kernel | calls/token | µs/call | ms/token | share |
+|---|---:|---:|---:|---:|
+| `ternary_pq2_gemv_w_kernel` (T=1 GEMV) | 301 | 45.8 | 13.8 | **50%** |
+| `ternary_pq2_gemv_tile_kernel<2>` (T=2) | 100 | 70.4 | 7.0 | **26%** |
+| `ternary_rotation` (folded-basis transform) | 258 | 13.4 | 3.45 | **13%** |
+| `causal_attention_small_t_*` | 16 | 44 | 0.71 | 3% |
+| `rmsnorm_cta` / `rmsnorm_warp` | 209 | 4-5 | 1.0 | 4% |
+| `gdn recurrent/gating/conv` | 96 | 4-10 | 0.83 | 3% |
+| `residual_add`, `silu_and_mul` | 320 | 3-5 | 0.69 | 3% |
+
+The two numbers that were not known before: the **T=2 tile path is a quarter of decode**, and the
+**rotation is 13%**. The T=2 path is not duplication — the call multiplicities say exactly 16 of the
+model's 64 layers process two tokens per step and 48 process one (48x6.25 + 16x6.25 = 400 calls, and
+`lm_head` is the 401st), so no weight is read twice. Routing those layers to the tile kernel, which
+reads each weight once for both tokens, is the right call.
+
+**The rotation's 13% is real, and it is not bandwidth.** `NINFER_TERNARY_HADAMARD=0` (numerically
+wrong by construction, it skips the transform) measures **43.7 -> 47.7 t/s**, i.e. 2.1 ms of the
+22.9 ms step, which matches the trace. Each call is one warp per (1024-block, token) pair — 5 warps
+for k=5120 at T=1 — with 32 strided 2-byte loads and 32 four-byte sign loads per lane, so it is pure
+latency: `rotation.cu` records the author measuring 3.40 µs for the same launch standalone and 4.74 µs
+when the warps are packed 8 to a block. In situ it costs 8.1 µs, which is why it is worth 9% of the
+step while moving 4 KB. Forcing `NINFER_TERNARY_ROTATE_WPB=8` reproduces the author's loss in situ
+(43.3 against 43.7) and `=2` is neutral (43.6), so packing is not the fix. Cutting it means fewer calls
+(258 serve 401 linears today) or a rewrite that puts more warps and 16-byte loads behind each D1024.
+
 **Two hypotheses this document used to carry are now refuted by measurement.**
 
-*Widening the transactions* — the previous "main lever". A standalone read-pattern benchmark on this
-model's real PQ2 geometry (`tools/v100/ternary-probes/gemv_probe.cu`, 713 MB, warp-per-row as in the kernel) shows the existing
-one-byte-per-lane pattern is **not** the problem:
-
-| pattern | GB/s |
-|---|---:|
-| flat uint4 stream (ceiling) | 882.6 |
-| **row pattern, 1 byte per lane (today)** | **869.6** |
-| row pattern, 2 / 4 / 8 / 16 bytes per lane | 894 |
-
-1 byte per lane already reaches 98.5% of the flat-stream ceiling, and widening buys 3%. The loads are
-perfectly coalesced; "sixteen narrow loads" was a wrong diagnosis.
+*Widening the transactions* — the previous "main lever", and the refutation that this document used to
+carry was itself wrong. `gemv_probe.cu` measures pure-load **bandwidth** (869.6 GB/s for the row
+pattern against an 882.6 GB/s flat `uint4` ceiling), and a bandwidth measurement cannot refute a
+**latency** argument: fewer load instructions can pay even when the bytes are identical. The real
+reason the idea is dead is arithmetic. PQ2 packs a group into 32 contiguous code bytes, one per lane,
+so the warp's code read is already **one** `LDG` per group per warp — there is no instruction count
+left to remove — and the bytes cannot be reduced either, because 32 of the group's 34 bytes are codes.
+A 16-bit-per-lane load would have each lane fetch its neighbour's byte, which the decode does not want;
+making lane *l* fetch groups *4g..4g+3* at the same offset needs those bytes to be contiguous, and they
+are 32 bytes apart. Only a re-packed code plane would change that, i.e. a different artifact layout.
 
 *Several output rows per warp* — the activation window is shared by every row, so holding `kRows`
 rows per warp cuts instructions per weight and multiplies the independent code streams per warp. It
@@ -400,6 +478,43 @@ costs more resident warps than it saves in instructions.
 **Register pressure is the wall, and `kUnroll` is the only lever on it.** Measured register counts for
 the shipped kernel: unroll 2 -> 36, 4 -> 48, **8 -> 72**, 12 -> 95, 16 -> 116, 20 -> 134. Unroll 8 is
 the throughput peak (41.6) and everything above it trades warps for loads it cannot afford.
+
+**`kMinBlocks` buys some of that back — this one shipped.** `__launch_bounds__`'s second argument caps
+registers at `65536/(threads*kMinBlocks)`; at 256 threads that is 256/128/85/64/51/42/32 registers for
+kMinBlocks = 1/2/3/4/5/6/8, so only 4 and up constrain the 72-register kernel. ptxas lands inside the
+cap with **no spill** (STACK and LOCAL both 0 at every value):
+
+| kMinBlocks | 1 | 2 | 3 | **4** | 5 | 6 | 8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| register cap | 256 | 128 | 85 | **64** | 51 | 42 | 32 |
+| registers used | 72 | 72 | 72 | **62** | 48 | 40 | 32 |
+| warps/SM | 28 | 28 | 28 | **32** | 42 | 50 | 64 |
+| decode t/s | 41.6 | 41.6 | 41.5 | **43.6** | 42.5 | 38.5 | 33.5 |
+
+**4 is the default: 41.6 -> 43.6 t/s (+4.8%)**, identical across repetitions, with the greedy token
+ids unchanged at every value. Below 48 registers it falls off — the unroll-8 arm runs out of room for
+its eight in-flight loads — so the memory-level-parallelism hypothesis is confirmed but with a small
+payoff: +14% occupancy for +4.8% throughput.
+
+Re-sweeping `kUnroll` *inside* the 64-register cap does not unlock a higher unroll, which was the
+obvious follow-up: 4 -> 39.7, **8 -> 43.6**, 12 -> 41.1, 16 -> 39.6, 20 -> 42.4. Unroll 8 is still the
+peak.
+
+**Keeping the weights resident.** The loader opens the artifact with `O_DIRECT`
+(`src/artifact/reader.cpp:182`), deliberately, so the 7.16 GiB is read from disk on **every process
+start** and can never occupy the page cache — measured 6856 MiB of disk reads and 7.3 s per run at
+~940 MiB/s. `tmpfs` accepts `O_DIRECT` (reads are served from RAM), so a copy on `/dev/shm` needs no
+code change at all:
+
+| artifact at | load | rate | disk reads |
+|---|---:|---:|---:|
+| `/opt/models/ninfer` (nvme) | 7.3 s | 940 MiB/s | 6856 MiB |
+| `/dev/shm` (tmpfs, 7.8 GB of 62 GB RAM) | **1.5 s** | **4.3 GiB/s** | **0 MiB** |
+
+Throughput is untouched (prefill 1.20k, decode 43.6 from either copy) and the tmpfs copy reproduces
+the disk copy's token ids exactly. It is volatile and costs 7.8 GB of RAM, so it is a benchmarking
+convenience, not a deployment change — and the structural fix for the repeat cost is to load once per
+process (`ninfer_bench`, or `ninfer-serve`), which is what `docs/v100.md`'s own sweep does.
 
 **What is left.** The only removable pieces are the decode arithmetic (13%), the activation handling
 (9%) and the scale load (8%) — about 30% between them, and no one of them is large. The one concrete
@@ -423,7 +538,7 @@ The verify pass runs `ternary_pq2_gemv_tile_kernel`, which loads the code byte a
 group and reuses them for every token in the tile. Three defects were found and fixed:
 
 1. `launch_pq2_gemv_tile` **always instantiated `kT = 4`** whatever the token count, so a 2-token
-   verify ran a 4-token tile with two of them dead. Isolated (`tools/v100/ternary-probes/tile_probe.cu`): 1.283 ms at two live
+   verify ran a 4-token tile with two of them dead. Isolated (`tile_probe.cu`): 1.283 ms at two live
    tokens against 1.024 ms for a real `kT = 2`, i.e. a fifth of the pass thrown away. `kT` now follows
    the token count.
 2. A token's four activations are four contiguous bf16, loaded as two 4-byte reads; one 8-byte read
