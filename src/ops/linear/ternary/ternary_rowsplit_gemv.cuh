@@ -260,7 +260,14 @@ void ternary_pq2_gemv_w_kernel(const __nv_bfloat16* __restrict__ x,
 // qwen3_6::kMtpLookupMaximumDrafts = 15 proposal window, i.e. T = 16. The row-blocked kernel was
 // the only thing that could serve that width before, and it loses the whole T = 5..8 band to this
 // kernel in situ, so the wide tile is the one to reach for.
-template <int kT, int kUnroll = 4>
+// kShareActivation is a TIMING PROBE, not a code path: every token in the tile uses the first
+// token's activation values, so the result is numerically wrong by construction. It exists to price
+// the per-token side of this kernel, which the SASS says is the whole story: per (token, group) the
+// loop body is ~5 FFMA of real work against ~5 PRMT for the bf16->fp32 converts, ~1.25 LDG.64,
+// ~1.25 I2F, and ~11 instructions of address arithmetic and register moves. If removing the loads
+// and the converts for all but one token does not move the needle, the fp32-activation idea (have
+// the rotation emit fp32 so no GEMV has to convert) is not worth its plumbing.
+template <int kT, int kUnroll = 4, bool kShareActivation = false>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
 void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                                   const std::uint8_t* __restrict__ codes,
@@ -300,19 +307,38 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
         const float weight3 = static_cast<float>(static_cast<int>((raw >> 6) & 3u) - 1);
 
         const std::int32_t base = group * kGemvGroupK + lane * 4;
+        if constexpr (kShareActivation) {
+            const uint2 packed = *reinterpret_cast<const uint2*>(token_x[0] + base);
+            const float2 low =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.x));
+            const float2 high =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.y));
 #pragma unroll
-        for (int t = 0; t < kT; ++t) {
-            if (t < tokens) {
-                // A lane's four activations are four contiguous bf16, so one 8-byte load replaces the
-                // two 4-byte ones. base is 8*lane + 256*group elements, i.e. always 8-byte aligned.
-                const uint2 packed = *reinterpret_cast<const uint2*>(token_x[t] + base);
-                const float2 low =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.x));
-                const float2 high =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.y));
-                const float dot = fmaf(weight0, low.x,
-                                       fmaf(weight1, low.y, fmaf(weight2, high.x, weight3 * high.y)));
-                accumulator[t] = fmaf(scale, dot, accumulator[t]);
+            for (int t = 0; t < kT; ++t) {
+                if (t < tokens) {
+                    const float dot =
+                        fmaf(weight0, low.x,
+                             fmaf(weight1, low.y, fmaf(weight2, high.x, weight3 * high.y)));
+                    accumulator[t] = fmaf(scale, dot, accumulator[t]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int t = 0; t < kT; ++t) {
+                if (t < tokens) {
+                    // A lane's four activations are four contiguous bf16, so one 8-byte load replaces
+                    // the two 4-byte ones. base is 8*lane + 256*group elements, i.e. always 8-byte
+                    // aligned.
+                    const uint2 packed = *reinterpret_cast<const uint2*>(token_x[t] + base);
+                    const float2 low =
+                        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.x));
+                    const float2 high =
+                        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.y));
+                    const float dot =
+                        fmaf(weight0, low.x,
+                             fmaf(weight1, low.y, fmaf(weight2, high.x, weight3 * high.y)));
+                    accumulator[t] = fmaf(scale, dot, accumulator[t]);
+                }
             }
         }
     }

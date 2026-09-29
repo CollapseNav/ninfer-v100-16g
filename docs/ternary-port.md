@@ -1000,3 +1000,38 @@ At `--spec-draft-n-max 7` a 42-token request still completes (47.3 t/s, 93/219 d
 42.5%), but the 3,360-token request drops the connection and the server then refuses further ones.
 n-max 1, 3 and 5 all complete the same long-prompt request. So the widest window is not usable at
 this context on 16 GB, which is a memory limit rather than a throughput one.
+
+### The verify loop's real cost, and the one change that would pay
+
+SASS of the two kernels, counted by opcode (`cuobjdump -sass` on the ternary object):
+
+| kernel | instructions | per (token, group) | what they are |
+|---|---:|---:|---|
+| `gemv_w_kernel<8,unroll 8>` | 352 for 8 groups | ~31 (one token) | 4.5 I2F + 4.5 RMT + 4 LOP3 + 3.5 SHF + 4.5 LDG + 4.5 FFMA + 6 IADD3 |
+| `gemv_tile_kernel<4,unroll 4>` | 624 for 4 groups, 4 tokens | ~26 | 5 FFMA + 5 PRMT + 1.25 I2F + 1.25 LDG.64 + 2 FADD + ~11 moves/addressing |
+| `gemv_tile_kernel<16,unroll 4>` | 2304 for 4 groups, 16 tokens | ~26 | 320 FFMA / 320 PRMT / 297 MOV / 228 IMAD.MOV |
+
+Only five of the tile kernel's ~26 instructions per (token, group) are the multiply-accumulate.
+Five are `PRMT` -- the bf16 -> fp32 conversion of that token's four activations -- and ~11 are
+address arithmetic and register moves driven by the kT pointers and accumulators. That is why the
+marginal cost is 0.60 of a T=1 step rather than the ~0.25 the FMA count alone would suggest.
+
+`NINFER_TERNARY_TILE_SHARE_ACT=1` prices the activation side by making every token in the tile reuse
+the first token's values (numerically wrong by construction, never a default):
+
+| arm | K=1 (kT=2) | K=3 (kT=4) | K=7 (kT=8) | repeat prompt (kT=16) |
+|---|---:|---:|---:|---:|
+| real | 51.8 | 42.0 | 25.1 | 107.8 |
+| all-but-one token's loads+converts removed | **69.3** | **51.5** | **32.4** | 32.3 |
+
+**+23% to +34% at kT = 2, 4 and 8**, which is the size of the prize for removing the per-token
+`PRMT` conversion. (The kT=16 arm is not interpretable: sharing one activation across sixteen live
+accumulators regressed it 3x, which looks like spilling rather than a measurement.)
+
+A real version of that prize is to have the rotation emit **fp32** activations for the decode band,
+so no GEMV has to convert: the rotation already holds fp32 in registers and currently rounds to bf16
+only for the GEMV to convert straight back. The catch is dtype selection by token count -- prefill
+(the fused MMA and CUTLASS arms) reads bf16, so `folded_activation` would have to pick fp32 for
+T <= 16 and bf16 above it, the workspace reservation would double for that band, and both GEMV
+kernels would need fp32-input variants. It is a multi-file change and it is the largest single item
+left on the decode side.

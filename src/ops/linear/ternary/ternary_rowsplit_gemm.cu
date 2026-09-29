@@ -306,6 +306,36 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
             return (value != nullptr && std::string(value) == "0") ? 4 : 16;
         }();
         const std::int32_t kt = tokens < kMaxKt ? tokens : kMaxKt;
+        // PROBE: NINFER_TERNARY_TILE_SHARE_ACT=1 runs the tile kernel with every token reusing the
+        // first token's activation values, so the output is wrong by construction. It prices the
+        // per-token activation side of the loop -- the loads and the bf16->fp32 converts -- against
+        // the rest of the body. Never a default.
+        static const bool share_act = [] {
+            const char* env = std::getenv("NINFER_TERNARY_TILE_SHARE_ACT");
+            return env != nullptr && std::string(env) != "0";
+        }();
+        if (share_act) {
+            const auto launch_probe = [&](auto token_tag) {
+                constexpr int kKtProbe = decltype(token_tag)::value;
+                constexpr int kDepthProbe = kKtProbe == 2 ? 8 : 4;
+                ternary_pq2_gemv_tile_kernel<kKtProbe, kDepthProbe, true>
+                    <<<grid, block, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(x.data),
+                        static_cast<const std::uint8_t*>(w.qdata),
+                        static_cast<const std::uint8_t*>(w.scales),
+                        static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                        out_row_stride);
+            };
+            switch (kt) {
+            case 2: launch_probe(integral_constant<int, 2>{}); break;
+            case 4: launch_probe(integral_constant<int, 4>{}); break;
+            case 8: launch_probe(integral_constant<int, 8>{}); break;
+            case 16: launch_probe(integral_constant<int, 16>{}); break;
+            default: launch_probe(integral_constant<int, 4>{}); break;
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         switch (kt) {
         case 16:
             if (depth == 1) { launch_tile(integral_constant<int, 16>{}, integral_constant<int, 1>{}); }
