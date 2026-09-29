@@ -267,7 +267,12 @@ void ternary_pq2_gemv_w_kernel(const __nv_bfloat16* __restrict__ x,
 // ~1.25 I2F, and ~11 instructions of address arithmetic and register moves. If removing the loads
 // and the converts for all but one token does not move the needle, the fp32-activation idea (have
 // the rotation emit fp32 so no GEMV has to convert) is not worth its plumbing.
-template <int kT, int kUnroll = 4, bool kShareActivation = false>
+// kFpMode selects how the activation is consumed: 0 = bf16 container with the fp32 dot chain
+// (today's default), 1 = fp16 container with the group's four-term dot done in half2, 2 = fp16
+// container with the original fp32 chain. Modes 1 and 2 differ only in where the group sum is
+// rounded: mode 1 rounds it once to fp16 and is therefore not bit-exact, mode 2 is bit-exact with
+// mode 0 because both the container round trip and the half2 -> fp32 widening are exact.
+template <int kT, int kUnroll = 4, bool kShareActivation = false, int kFpMode = 0>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
 void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                                   const std::uint8_t* __restrict__ codes,
@@ -276,6 +281,8 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                                   std::int32_t groups_per_row, std::int32_t tokens,
                                   std::int32_t out_row_stride) {
     static_assert(kT >= 1 && kT <= 16, "tile size must stay small enough to keep accumulators in registers");
+    static_assert(!(kShareActivation && kFpMode != 0),
+                  "the activation-sharing probe reads bf16 only; it is not valid with an fp16 tile");
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp =
         static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + (static_cast<int>(threadIdx.x) >> 5);
@@ -305,6 +312,20 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
         const float weight1 = static_cast<float>(static_cast<int>((raw >> 2) & 3u) - 1);
         const float weight2 = static_cast<float>(static_cast<int>((raw >> 4) & 3u) - 1);
         const float weight3 = static_cast<float>(static_cast<int>((raw >> 6) & 3u) - 1);
+        // (code - 1) as fp16 through the same magic number the prefill kernel uses: the bit pattern
+        // 0x6400|n is exactly 1024+n as fp16, so one HADD2 against 1025.0 returns two exact
+        // (code-1) values at once and the four I2F conversions disappear.
+        __half2 w01;
+        __half2 w23;
+        if constexpr (kFpMode != 0) {
+            const std::uint32_t lo_bits = 0x64006400u | static_cast<std::uint32_t>(raw & 0x03u) |
+                                          (static_cast<std::uint32_t>(raw & 0x0Cu) << 14);
+            const std::uint32_t hi_bits =
+                0x64006400u | static_cast<std::uint32_t>((raw >> 4) & 0x03u) |
+                (static_cast<std::uint32_t>(raw & 0xC0u) << 10);
+            w01 = __hsub2(*reinterpret_cast<const __half2*>(&lo_bits), __float2half2_rn(1025.0F));
+            w23 = __hsub2(*reinterpret_cast<const __half2*>(&hi_bits), __float2half2_rn(1025.0F));
+        }
 
         const std::int32_t base = group * kGemvGroupK + lane * 4;
         if constexpr (kShareActivation) {
@@ -330,13 +351,31 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                     // the two 4-byte ones. base is 8*lane + 256*group elements, i.e. always 8-byte
                     // aligned.
                     const uint2 packed = *reinterpret_cast<const uint2*>(token_x[t] + base);
-                    const float2 low =
-                        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.x));
-                    const float2 high =
-                        __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.y));
-                    const float dot =
-                        fmaf(weight0, low.x,
-                             fmaf(weight1, low.y, fmaf(weight2, high.x, weight3 * high.y)));
+                    float dot;
+                    if constexpr (kFpMode == 1) {
+                        // One half2 FMA pair per token: (w0*a0 + w2*a2, w1*a1 + w3*a3) in fp16, then
+                        // the two lanes join in fp32, so the only rounding fp16 introduces is that
+                        // one add -- the products are exact (a weight is -1, 0 or +1).
+                        const __half2 a01 = *reinterpret_cast<const __half2*>(&packed.x);
+                        const __half2 a23 = *reinterpret_cast<const __half2*>(&packed.y);
+                        const float2 p    = __half22float2(__hfma2(w01, a01, __hmul2(w23, a23)));
+                        dot               = p.x + p.y;
+                    } else if constexpr (kFpMode == 2) {
+                        // Same fp16 container, original fp32 chain: bit-exact with mode 0.
+                        const float2 wf01 = __half22float2(w01);
+                        const float2 wf23 = __half22float2(w23);
+                        const float2 a01  = __half22float2(*reinterpret_cast<const __half2*>(&packed.x));
+                        const float2 a23  = __half22float2(*reinterpret_cast<const __half2*>(&packed.y));
+                        dot = fmaf(wf01.x, a01.x,
+                                   fmaf(wf01.y, a01.y, fmaf(wf23.x, a23.x, wf23.y * a23.y)));
+                    } else {
+                        const float2 low =
+                            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.x));
+                        const float2 high =
+                            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&packed.y));
+                        dot = fmaf(weight0, low.x,
+                                   fmaf(weight1, low.y, fmaf(weight2, high.x, weight3 * high.y)));
+                    }
                     accumulator[t] = fmaf(scale, dot, accumulator[t]);
                 }
             }

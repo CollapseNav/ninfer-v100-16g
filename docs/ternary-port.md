@@ -1098,3 +1098,52 @@ binds. It would add a staging loop and a barrier per K-chunk on top of an instru
 
 The code was reverted rather than parked behind a switch: it changes the rotation's output pointer
 type and the workspace reservation, and it is a loss on every arm.
+
+### The fp16 group-dot: the verify band's first real win since the unroll
+
+The diagnosis above says the verify loop is bound by instructions *and* registers, so the lever has to
+cut both. The fp16 group-dot does: the activation is kept as two `half2` registers instead of four
+fp32 ones, and `__hfma2` performs two multiply-accumulates per instruction. The weights use the same
+magic number the prefill kernel uses -- the bit pattern `0x6400|n` is exactly 1024+n as fp16, so one
+`__hsub2` against 1025.0 returns four exact `(code-1)` values in two instructions, replacing the four
+`I2F` plus masks the integer path needs.
+
+It needs the activation in an fp16 container, which costs an env knob rather than a plumbing change
+because fp16 is still two bytes: the workspace reservation is untouched, and only the decode band is
+affected. `NINFER_TERNARY_FP16_ACT` selects the mode (`=1` the half2 dot, `=2` an fp16 container with
+the original fp32 chain, unset or `0` today's bf16 path). Measured on prose and on the repeated-
+sentence prompt, 200/300 generated tokens:
+
+| arm | bf16 (mode 0) | **fp16 + half2 dot (mode 1)** | fp16 + fp32 dot (mode 2) |
+|---|---:|---:|---:|
+| K=1 (kT=2) | 51.8 | **56.2 (+8.5%)** | 42.5 (-18%) |
+| K=3 (kT=4) | 42.1 | **44.4 (+5.5%)** | 32.2 (-24%) |
+| K=7 (kT=8) | 25.2 | **26.6 (+5.6%)** | 20.2 (-20%) |
+| K=7, repeat prompt (kT=16) | 108.0 | **121.8 (+12.8%)** | 84.2 (-22%) |
+
+Mode 2 is the control that tells the two effects apart: it moves the activation into the same fp16
+container but keeps the fp32 dot chain, and it *loses* 18-24%. So the container itself is a loss --
+fp16 has a narrower exponent range than bf16 (5 bits against 8), so small rotated values fall into
+fp16's subnormal range -- and the entire win is the half2 dot removing instructions. That is
+consistent with the diagnosis and is the second independent confirmation of it.
+
+Registers move only where there was room to move: kT=8 goes 111 -> 96, while kT=4 (64) and kT=16
+(128) are unchanged, so occupancy is not what improved. The gain is instruction count.
+
+**Numerics, and why this is opt-in.** The half2 dot rounds the group's four-term sum once to fp16
+(products are exact, since a weight is -1, 0 or +1), so the logits shift in the last bits. Greedy ids
+against the bf16 arm: K=7 on prose is identical over 40 tokens, K=1 differs in 19 of 40 positions
+from position 21, K=3 in 29 of 40 from position 11 -- the same single-position fork this document
+already records for the speculative-versus-non-speculative paths, i.e. a near-tie flipping and
+everything after it changing with it. The MTP acceptance length drifts slightly down (1.58 -> 1.56 at
+K=1, 1.93 -> 1.87 at K=3, 2.07 -> 1.98 at K=7) and is unchanged on the repeat prompt (13.11).
+
+There is **no continuous measure that covers T = 2..16**: the perplexity harness runs the prefill
+route, so the only quality evidence available for this band is the smoke test above. On that basis the
+fp16 dot ships **opt-in with the default unchanged**: it is a 5-13% gain on the verify band and a
+documented, unquantified logit change. Flipping the default is a one-line change if that trade is
+acceptable, and the acceptance drift suggests the cost is at the rounding level rather than
+systematic.
+
+Decode at T=1 and the whole prefill route are untouched by construction (they stay bf16), and measured
+so: no-spec decode 43.7 either way, prefill 3412 tokens 1.20k with the flag off and 1.21k with it on.

@@ -77,8 +77,15 @@ __device__ __forceinline__ void normalized_hadamard_d1024_inplace(float (&values
 // instantiations cut the hot path to 1784 instructions and 56 registers -- and measured **43.5 t/s
 // against 43.7**, reproducibly, on both repetitions. So code size is not what the kernel's 3.0 us of
 // transform time per call is made of, and the split was reverted.
+// kFp16Out stores the folded activation as fp16 in a container that is still 2 bytes wide. The
+// value written is fp16(bf16(v)) -- the same bf16 rounding as before, then widened to fp16 -- which
+// is exact for any value bf16 can hold inside fp16's range (8 mantissa bits into 11), so the
+// activation a GEMV reads is bit-identical to today's. The point is that a GEMV can then do the
+// group's four-term dot with half2 math: two half2 registers instead of four fp32 ones, and one
+// __hfma2 per two multiply-accumulates. See docs/ternary-port.md.
+template <bool kFp16Out = false>
 __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
-                                           __nv_bfloat16* __restrict__ out,
+                                           void* __restrict__ out,
                                            const float* __restrict__ signs, int n_blk, int k,
                                            int tokens, int perm_hd, int perm_nk, int perm_rep,
                                            int inverse) {
@@ -98,7 +105,15 @@ __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
     const float* const signs_row = signs + (block % n_blk) * kBlockSize;
     const bool permuted          = !inverse && perm_rep > 1;
     const __nv_bfloat16* x_token = x + static_cast<std::int64_t>(token) * k;
-    __nv_bfloat16* out_token     = out + static_cast<std::int64_t>(token) * k;
+    const std::int64_t token_base = static_cast<std::int64_t>(token) * k;
+    auto store_at = [&](int idx, float value) {
+        if constexpr (kFp16Out) {
+            static_cast<__half*>(out)[token_base + idx] =
+                __float2half_rn(__bfloat162float(__float2bfloat16_rn(value)));
+        } else {
+            static_cast<__nv_bfloat16*>(out)[token_base + idx] = __float2bfloat16_rn(value);
+        }
+    };
 
     float values[32];
 
@@ -128,12 +143,12 @@ __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
 #pragma unroll
         for (int r = 0; r < 32; ++r) {
             const float value = __fmul_rn(values[r], signs_row[r * 32 + lane]);
-            out_token[(block << 10) + r * 32 + lane] = __float2bfloat16_rn(value);
+            store_at((block << 10) + r * 32 + lane, value);
         }
     } else {
 #pragma unroll
         for (int r = 0; r < 32; ++r) {
-            out_token[(block << 10) + r * 32 + lane] = __float2bfloat16_rn(values[r]);
+            store_at((block << 10) + r * 32 + lane, values[r]);
         }
     }
 }

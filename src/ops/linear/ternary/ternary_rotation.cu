@@ -89,8 +89,8 @@ bool rotation_copy_probe() {
 void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
                              cudaStream_t stream) {
     require_rotation_operands(x, weight, "ternary rotation");
-    if (out.dtype != DType::BF16 || out.data == nullptr) {
-        throw std::invalid_argument("ternary rotation: out must be BF16");
+    if ((out.dtype != DType::BF16 && out.dtype != DType::FP16) || out.data == nullptr) {
+        throw std::invalid_argument("ternary rotation: out must be BF16 or FP16");
     }
     if (out.ne[0] != weight.k || out.ne[1] != x.ne[1]) {
         throw std::invalid_argument("ternary rotation: expected [K,T] x and [K,T] out");
@@ -124,10 +124,15 @@ void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    ternary_rotate_bf16_kernel<<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data),
-        weight.hadamard_signs, weight.hadamard_n_blk, weight.k, x.ne[1], perm_hd, perm_nk,
-        perm_rep, /*inverse=*/0);
+    if (out.dtype == DType::FP16) {
+        ternary_rotate_bf16_kernel<true><<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), out.data, weight.hadamard_signs,
+            weight.hadamard_n_blk, weight.k, x.ne[1], perm_hd, perm_nk, perm_rep, /*inverse=*/0);
+    } else {
+        ternary_rotate_bf16_kernel<false><<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), out.data, weight.hadamard_signs,
+            weight.hadamard_n_blk, weight.k, x.ne[1], perm_hd, perm_nk, perm_rep, /*inverse=*/0);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

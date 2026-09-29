@@ -256,6 +256,16 @@ void launch_pq2_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t
     launch_gemv_t1(x, w, out, groups_per_row, stream);
 }
 
+// NINFER_TERNARY_FP16_ACT=2 selects the bit-exact fp16 variant (container only, fp32 dot chain);
+// =1 selects the half2 dot, which rounds the group sum once to fp16.
+bool fp16_mode2() {
+    static const bool value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_FP16_ACT");
+        return env != nullptr && std::string(env) == "2";
+    }();
+    return value;
+}
+
 // Small-token-tile GEMV: weights are read once for up to 4 tokens, which is what makes the
 // speculative verify pass (T = draft + 1) cheap. Falls back to the reference tiled kernel beyond
 // that, and for PTQ1_0 / padded-K weights.
@@ -290,12 +300,35 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
         // therefore the honest encoding of the sweep, and the env still overrides both.
         const int depth = unroll != 0 ? unroll : (tokens == 2 ? 8 : 4);
         const auto launch_tile = [&](auto token_tag, auto unroll_tag) {
-            ternary_pq2_gemv_tile_kernel<decltype(token_tag)::value,
-                                         decltype(unroll_tag)::value><<<grid, block, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const std::uint8_t*>(w.qdata),
-                static_cast<const std::uint8_t*>(w.scales),
-                static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens, out_row_stride);
+            using TokenTag  = decltype(token_tag);
+            using UnrollTag = decltype(unroll_tag);
+            if (x.dtype == DType::FP16) {
+                if (fp16_mode2()) {
+                    ternary_pq2_gemv_tile_kernel<TokenTag::value, UnrollTag::value, false, 2>
+                        <<<grid, block, 0, stream>>>(
+                            static_cast<const __nv_bfloat16*>(x.data),
+                            static_cast<const std::uint8_t*>(w.qdata),
+                            static_cast<const std::uint8_t*>(w.scales),
+                            static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                            out_row_stride);
+                } else {
+                    ternary_pq2_gemv_tile_kernel<TokenTag::value, UnrollTag::value, false, 1>
+                        <<<grid, block, 0, stream>>>(
+                            static_cast<const __nv_bfloat16*>(x.data),
+                            static_cast<const std::uint8_t*>(w.qdata),
+                            static_cast<const std::uint8_t*>(w.scales),
+                            static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                            out_row_stride);
+                }
+            } else {
+                ternary_pq2_gemv_tile_kernel<TokenTag::value, UnrollTag::value, false, 0>
+                    <<<grid, block, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(x.data),
+                        static_cast<const std::uint8_t*>(w.qdata),
+                        static_cast<const std::uint8_t*>(w.scales),
+                        static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                        out_row_stride);
+            }
         };
         using std::integral_constant;
         // kMaxKt is 16 -- the tile kernel serves the whole verify band, including the 15-token
@@ -489,6 +522,10 @@ void launch_ternary_gemm_t1(const Tensor& x, const Weight& w, Tensor& out,
         launch_pq2_gemv_tile(x, w, out, out_row_stride, x.ne[1], stream);
         return;
     }
+    if (x.dtype != DType::BF16) {
+        throw std::invalid_argument(
+            "ternary gemv: a non-bf16 activation reached the bf16 reference route");
+    }
     launch_by_qtype<1>(x, w, out, out_row_stride, stream);
 }
 
@@ -521,6 +558,11 @@ void launch_pq2_gemv_tile_block_shape(const Tensor& x, const Weight& w, Tensor& 
 // selectable precisely so the default can be re-measured rather than assumed.
 void launch_pq2_gemv_tile_block(const Tensor& x, const Weight& w, Tensor& out,
                                 std::int32_t out_row_stride, cudaStream_t stream) {
+    if (x.dtype != DType::BF16) {
+        throw std::invalid_argument(
+            "ternary gemv: the row-blocked kernel is bf16-only and received a non-bf16 activation "
+            "(NINFER_TERNARY_FP16_ACT with NINFER_TERNARY_TILE_WIDE=0)");
+    }
     const std::int32_t groups_per_row = w.k / 128;
     const std::int32_t tokens         = x.ne[1];
     static const int rows_block = [] {
