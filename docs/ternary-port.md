@@ -713,6 +713,49 @@ both numerically neutral (identical greedy ids across unroll depths 1/4/8), so n
 Until the claim is reconciled, no speculative window should be described as bit-exact with
 `--spec none`.
 
+
+### Where the T=1 decode could get to (the ceiling question)
+
+The T=1 step is **issue-bound, not bandwidth-bound**, and the probe arithmetic says so directly.
+Baseline 22.9 ms/token; `NINFER_TERNARY_GEMV_PROBE` arms on the real kernel:
+
+| arm | removes | decode | ms/token | delta |
+|---|---|---:|---:|---:|
+| baseline | -- | 41.6 | 24.0 | -- |
+| `nocode` | the code load **and** its 12-instruction decode | 63.6 | 15.7 | -8.3 |
+| `codealu` | the code load only, value from ALU | 50.1 | 20.0 | -4.0 |
+| `noact` | the two activation loads and their converts | 45.5 | 22.0 | -2.0 |
+| `noscale` | the group-scale load | 45.3 | 22.1 | -1.9 |
+
+The code stream is 6.4 GB of the 7.19 GB moved per token, and deleting its *load* buys only 4.0 ms --
+which would be 1.6 TB/s if it were a bandwidth effect, i.e. impossible on a 900 GB/s card. So the
+load's cost is its instruction, and the decode arithmetic behind it is another 4.3 ms. That is what
+"314 GB/s, a third of peak" means: the memory system is idle most of the step.
+
+The same kernel shape proves the machine can go much faster when there is something to amortise over.
+The `kT = 16` verify kernel processes sixteen tokens per weight pass at **7.4 ms per verified token**
+(measured: 104.7 t/s at an acceptance length of 12.44), against 22.9 ms for the T=1 kernel on the same
+weights. And `gemv_probe.cu`'s row-pattern read ceiling (869.6 GB/s) puts the pure weight stream at
+7.19/0.8696 = 8.3 ms/token = **120 t/s absolute floor**, while the non-GEMV half of the step
+(rotation 4.0 ms, norms, attention, GDN, launch) is a measured 7.7 ms that nothing in the GEMV can
+touch.
+
+Reachable estimates, all anchored on measurements rather than on the peak:
+
+| target | ms/token | t/s |
+|---|---:|---:|
+| today | 22.9 | 43.7 |
+| GEMV at the `nocode` bound (code stream gone -- not implementable, it is the weights) | 15.7 | 63.6 |
+| GEMV at its measured weight-read floor + today's 7.7 ms of other work | 16.0 | 62 |
+| the same, with the rotation's 4.0 ms fused away | 12.0 | 83 |
+| absolute weight-stream floor (no other kernel costs at all) | 8.3 | 120 |
+| demonstrated with amortisation (16-token verify) | 7.4 | 105-135 |
+
+**The honest ceiling for a non-speculative single-stream decode on this card is ~60-65 t/s**, and
+~83 t/s only if the folded-basis rotation is folded into its producer. Both are capped by the fact
+that a T=1 step has exactly one token to hide its latency behind; the 105 t/s the lookup path reaches
+is not a decode-kernel improvement at all, it is sixteen tokens sharing one weight pass.
+
 **A measurement that is not available on this host.** `nvprof --print-gpu-trace` works, but
 `nvprof --metrics` does not: any metric collection fails with "No events/metrics were profiled" /
 CUDA profiling error (exit 12). So there is no DRAM/L2 counter read for the decode step; the
