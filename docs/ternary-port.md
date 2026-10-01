@@ -16,6 +16,7 @@ Artifact: `bonsai2_27b_swift_pq2.ninfer` (8.31 GB, identity `qwen3.8-27b/groupwi
 | prefill, 3412-token prompt | **1190 t/s** (3 runs: 1190 / 1190 / 1190); re-measured on the current build at **1200-1210** (3662 tokens) and **1230** (4042 tokens, 4096 chunk) |
 | — as a fraction of the card | 59.5 TFLOP/s = **47.6%** of the 125 TFLOP/s fp16 peak |
 | decode | **51.1 t/s** with `NINFER_TERNARY_ROTATE_SPLIT=16`, **48.7** with no environment variables, 44.6 before `327f4b10` + `1df45be1`. The `41.6` used throughout the Decode section is the dedicated warp-per-row kernel, which is no longer the default route |
+| context-lookup K=7 (repeated text, T = 16 verify) | **234.8** t/s `lookup10`, **246.6** `lookup16` with the QPN wide-verify route (default); **123.7 / 126.7** with `NINFER_TERNARY_QPN=0`. Only the T >= 6 verify band changes -- the decode and MTP bands are md5-identical |
 | causal scoring (`ninfer-perplexity`) | 1091 tok/s, was 106.3 |
 | startup | 8.7 s (weights 6.70 GiB); 10.1-10.2 s re-measured as `engine ready` at `--max-context 8192` on this build |
 
@@ -1593,6 +1594,7 @@ next. "Remote snapshot" is the state this document was in before the session
 | context-lookup K=7 | 83.7 (repeated sentence), 81.2 (verbatim list) | **122.2-124.1** | **+46-53%** |
 | marginal verified token `r` | 0.60 of a step | **0.37 (4k) / 0.30 (16k)** | -38 to -50% |
 | wide (T=16) verify throughput | not measured | 13.0 TFLOP/s, issue-bound | new characterization |
+| context-lookup K=7, QPN wide verify (default on) | 83.7 / 81.2 | **234.8 / 246.6** | **+90-98%**, only the T = 16 verify pass changes |
 | realistic serving (thinking, K=1) | not measured | **59.3-61.7 t/s decode**, acceptance 58.5-73.9%, prefill 1.13-1.15k, TTFT 0.32-9.9 s | new |
 
 Attribution, from the commits and the measured unroll/rotation curves: 41.6 -> 44.6 is the fp16
@@ -1611,7 +1613,7 @@ uint4 stream and the fp16 CUTLASS probe is flat from M=8 to 128); norm+rotation 
 in both shapes, -2.6% and -2.0%); widening the draft window on short and medium real tasks (K=1 is
 optimal there because position 2 accepts only 46-55%); row-blocked verify routes, T2BLOCK, the
 device weight table, and occupancy/register tuning (the tile kernel already runs at 32 registers);
-KV dtype and CUDA graphs (about zero for decode).
+KV dtype and CUDA graphs (about zero for decode). The QPN resumption adds two more: a load-time code-plane permutation for the QPN kernel (the row-major plane is already contiguous per lane, worth ~4% of a 35% deficit, and adapting the three other readers to it is what parked the route), and routing the decode/MTP bands (T <= 5) through the tensor core (loses 47% at T = 2 and 21% at T = 3; the flat-cost win only starts at T = 6).
 
 **Directions still open**, ordered by expected value: (1) serving concurrency -- `--max-concurrency`
 is unset today, so every decode step streams the full 7.19 GB for one sequence, and the measured
@@ -1620,65 +1622,111 @@ large multiplier (aggregate throughput, not single-request latency). (2) the dra
 contexts above 10k, never measured: acceptance there is already 73.9% at K=1 and the prose16k
 fixture showed K=3 ahead of K=1 by 6.4%. (3) split-K for the T=1 group walk (+3-8%, uncertain, the
 kernel is at full occupancy). (4) cheapening the draft stack, which is W8 with a Q4 head against a
-2-bit target and costs 6.6% of a round. (5) model-side: recalibrating the draft head against the
+2-bit target and costs 6.6% of a round. (6) inside the QPN band itself, the T = 6..16 rounds are latency-bound at 47-52 ms against an ~8 ms traffic floor: a software-pipelined weight fetch (prefetch the next group's two uint4 while decoding the current one), more CTAs for the small-n layers (kColsPerCta is pinned at 32 by the mma N), and NACC above 1 at kTiles = 2 were not tried. It only moves the lookup-style wide verify, not `r`. (5) model-side: recalibrating the draft head against the
 quantized target is the only path to a large acceptance gain, and it is not an engine change.
 
-## PQ2 tensor-core (QPN) route: ported, measured, and parked (2026-10-01)
+## PQ2 tensor-core (QPN) route: resumed, bounded, and kept for the wide verify (2026-10-01)
 
-Ported the fifth sibling of q4/w8/fp8/nvfp4_volta_qpn_gemm for the 2-bit ternary format: a CTA owns
-32 output rows and an 8-token A tile (kTiles of them), SPLITK warps split K, and one barrier at the
-end serves the cross-warp reduce. PQ2's packing makes it simpler than NVFP4: one code byte holds
-four CONSECUTIVE k, i.e. exactly one mma k=4 slice in natural order, so no activation byte_perm
-(nvfp4_stage_pairs) is needed and both operands contract the matching k unchanged.
+**Verdict: kept, but only for `6 <= T <= 32`.** The route was ported to make a *verify token* cheap;
+it does not do that, and shipping it ungated would have cost 47% on every real MTP round. What it does
+have is a **cost curve that is nearly flat in T** (39.2 ms per round at T = 2, 46.8 ms at T = 16)
+against the SIMT tile kernel's 26.6 -> 98.1 ms over the same span. The two lines cross at
+**T ~ 4.3**, so the whole MTP band a real task uses (K = 1 and K = 2, i.e. T = 2 and T = 3) loses,
+while the wide verify wins big: the T = 16 context-lookup round goes 98.1 -> 46.8 ms, **123.7 ->
+234.8 t/s** on `lookup10` and **126.7 -> 246.6 t/s** on `lookup16` (same batch, identical acceptance
+12.11 / 12.70, byte-identical output text; 300-token runs 123.2 -> 235.0). The gate buys that and
+nothing else: the 96-token greedy md5 against `/root/wt/base.out` is **IDENTICAL** both with the
+route enabled by default and with `NINFER_TERNARY_QPN=0`.
 
-Correctness: with the row-major code plane the route produces **byte-identical output text** to the
-SIMT path on the prompts tried (base and K=1 arms), so fp16 weight decode plus tensor-core
-accumulation is a drop-in numerically.
+### What the parked version was actually doing wrong
 
-Speed, with a correct control (`NINFER_TERNARY_QPN=0` against `=1`, same prompt, same max-new):
-**45.9 -> 28.9 tok/s, -37%**. Cause found in the nvprof rollup: in QPN form a lane maps to an OUTPUT
-COLUMN, so a warp's 32 lanes read 32 different output rows' code bytes -- k/4 bytes apart -- using
-4 bytes of every 128-byte line. The SIMT tile kernel reads one coalesced 32-byte span per warp.
+Three faults, and the one the parking note blamed was the smallest of them.
 
-Upstream's answer, found in their own tree: they ship two kernels and production uses the
-load-time-prepacked one (`nvfp4_prepack_sm70` permutes code and scale planes in place into
-`[n/32][group][lane][32B]` and sets `VoltaQpnPrepacked`), which makes a warp's fetch contiguous.
-That is implemented here as `ternary_prepack_qpn` plus the prepacked read, also defaulted off.
+1. **The code read was narrow, and vectorising it was worth almost nothing.** The reader took the
+   plane four bytes at a time (`u * 4` into a 32-byte group). A lane here owns an output *row*, so a
+   warp's 32 lanes read 32 rows `k/4` bytes apart and every narrow load fans out to 32 sectors -- the
+   mechanism the parking note charged the whole 37% to. The artifact's row-major plane already puts a
+   lane's whole group in 32 contiguous bytes, so two `uint4` loads replace all eight and each lane
+   consumes exactly one sector. Measured against the SIMT arm in the same batch:
+   **28.9/45.9 = 0.63 before, 32.6/49.8 = 0.66 after** -- worth ~4%, not 37%. (Consistent with the
+   older "wider code reads" result: the row pattern is already 98.5% of a flat `uint4` stream.)
+2. **SPLITK = 4 was half of upstream's, and it is a parallelism knob rather than a K-split one.** One
+   CTA covers 32 output rows, so the grid is `n/32` -- 160 CTAs at n = 5120 -- and at SPLITK = 4 that
+   is 8 warps per SM, nowhere near enough to hide a weight stream's latency. The NVFP4 sibling's own
+   launcher calls SPLITK = 8 "the production floor across every kTiles bucket"; this kernel now
+   matches it (every width in the model has a group count divisible by 8: 40, 48, 80, 136). NACC
+   stays 1 above one 8-token tile: four accumulators per 16-k unit is 32 registers per live tile, and
+   above one tile the tiles are already independent.
+3. **Just over half the ternary weights could not reach the route at all.** A temporary shape probe
+   (`n/k/t` printed once per distinct tuple, at both entry points) shows the linears split into two
+   disjoint sets: `n = 5120/34816/5120/248320` at `k = 6144/5120/17408/5120` through
+   `ternary_dispatch`, and `n = 4096/6144/1024` at `k = 5120` through
+   `ternary_dispatch_basis_strided` -- the attention input projections, the GDN input projection and
+   the SwiGLU pair, which had no QPN gate in it at all. The gate is now on both entries, because the
+   route is a property of the format and the shape and not of the caller that got there. This is what
+   turned "+61% on the lookup, half the work covered" into "+90%".
 
-It cannot be enabled yet, and the reason is structural rather than textual: after an in-place
-prepack the row-major plane is gone, but prefill necessarily runs at t = chunk >= 128, and every
-prefill reader (fused MMA dequant, CUTLASS dequant, block GEMV for t = 5..31) streams rows. Upstream
-can adopt the layout globally because -- their words -- "wide prefill recognizes them and
-reconstructs FP16 for its tensor-core GEMM", i.e. their prefill read is a gather anyway. Ours would
-have to be adapted (~2-300 lines across three kernels). Flipping the plane per phase instead is ruled
-out by CUDA-graph replay: the decode path replays a captured graph and never calls the dispatcher, so
-the flip back has no reliable trigger.
+**The prepack is not needed, and that dissolves the structural conflict that parked the route.** The
+load-time permutation existed to make a warp's fetch contiguous; the row-major plane is already
+contiguous *per lane*, so two `uint4` loads buy the same coalescing for free, and the three other
+readers (fused MMA at T = 32..255, CUTLASS dequant at T >= 256, block GEMV at T = 5..31) never have
+to learn a permuted index -- which the parking note listed as a ~2-300 line change across three
+kernels, with prefill carrying it. `ternary_prepack_qpn` and the dispatcher's prepacked guard stay in
+the tree, uncalled, as the record. The T = 5..31 block GEMV band is served by the QPN kernel instead
+of by learning the permuted index, exactly as that note's table proposed as the cheaper branch.
 
-Parked with the dispatcher's prepacked guard active, so a prepacked weight reaching a non-QPN route
-throws instead of computing on permuted bytes. Resume criterion: once the readers are adapted, the
-QPN band (t = 2..16) has to beat the SIMT tile clearly, or the 441-637 GB/s upstream reports for this
-kernel is not reachable here and the route should be deleted.
+### The measured band
 
-A measurement error worth recording: an earlier A/B reported the two routes as identical because the
-"off" arm was passed `NINFER_TERNARY_QPN=off`, and the check only treats `0` as disabled -- so both
-arms ran QPN. The corrected control is the `0`-versus-`1` pair above.
+Same-batch A/B, `real_task`, 128 generated tokens, `NINFER_TERNARY_QPN=0` against `=1`. The MTP arms
+run one verify pass of width T = K+1 per round; the lookup arms are the context-lookup replay. Round
+time is `acceptance length / decode speed`, which is the fair comparison once the two arms'
+acceptance has diverged.
 
-**Resuming this route: the plan of record.** Three readers touch the ternary code plane above t = 16
-and have to learn the prepacked index; the fourth case is better handled by widening the QPN kernel
-instead of adapting a streaming reader:
+| verify width T | 2 | 3 | 4 | 5 | 6 | 8 | 16 (lookup) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SIMT tile round, ms | 26.6 | 33.9 | 41.2 | 48.6 | 58.0 | 74.1 | 98.1 |
+| QPN round, ms | **39.2** | **41.1** | **43.0** | **44.9** | 47.5 | 52.0 | **46.8** |
+| QPN / SIMT | 1.47 | 1.21 | 1.04 | 0.92 | 0.82 | 0.70 | 0.48 |
 
-| reader | t range | change |
-|---|---|---|
-| `ternary_volta_mma_gemm.cuh` (fused MMA) | 32..255 | it already gathers codes into shared memory before decoding, so only the fetch index changes |
-| `ternary_cutlass_sm70.cu` (dequant pass) | >= 256 | also a gather-and-convert kernel, order-insensitive; same change |
-| `ternary_rowsplit_gemv.cuh` (block GEMV) | 5..31 | do **not** adapt: it streams one row at a time and would lose coalescing. Widen the QPN kernel to kTiles = 4 (t <= 32) and route this band there instead |
-| `ternary_rowsplit_gemm_simt.cuh` | opt-in only | same reasoning as the block GEMV; it is not the default route |
+The gate is 6 rather than 5 for margin: T = 5 is an 8% win and this workload's MTP batch drift is
++/-4%, while T = 6 is 18%. At T = 1 -- outside the gate in the shipped build -- the parked
+configuration measured 30.7 ms against the block GEMV's 19.5 ms; the current configuration was never
+run at T = 1 and does not need to be. The gate and this table both live in
+`ternary_volta_qpn_supported`.
 
-Acceptance, decided before the work starts: with those in place, `NINFER_TERNARY_QPN=0` against `=1`
-on identical prompts and seed must put the QPN band (t = 2..16, i.e. MTP K=1/K=2 and the T = 16 lookup
-verify) clearly ahead of the SIMT tile, with output unchanged. If it does not win, delete the route:
-the 441-637 GB/s upstream reports for this kernel would then not be reachable on this card and
-artifact, and that negative belongs in this section rather than in another experiment.
+### Numerics of the band
+
+Two checks, because greedy ids alone are a discrete test.
+
+* **Output text.** Byte-identical between arms on both lookup fixtures (110 and 128 tokens), on
+  `real_code` at K = 4 and K = 7 (4.4k-token prompt, identical acceptance 3.23 / 3.50), and on
+  `real_task` at K = 1, K = 2, K = 4 and no-spec. One arm does flip: `real_task` K = 7 (T = 8),
+  acceptance 2.74 -> 2.59 at 128 tokens and 2.18 -> 3.04 at 300 -- a last-bit difference that a
+  marginal draft then resolves either way, not a systematic one. The decode and MTP bands are
+  untouched, which is exactly what the md5 identity above shows.
+* **Perplexity in the band.** `ninfer-perplexity --text` scores every window at `t = context`, so
+  `--context 32` (stride 16, 542 windows) *is* the band, and the scoring rate is the proof each arm
+  ran the route it claims: **49.0 tok/s against 147.3 (3.0x)**. Over the same 8,675 scored tokens:
+  mean_nll 3.621945 (SIMT) against 3.622088 (QPN), i.e. **+0.0143% PPL** -- the same order as, and
+  smaller than, the +0.0245% the fp16 prefill routes measured against the FP32 SIMT route.
+  `--context 64` (outside the band; rate 203.5 against 201.6) moves +0.0018%, which bounds any
+  leakage into it. Recorded because it wastes a cycle: `--context 16` aborts with "causal scoring
+  returned a non-finite logprob" on the *shipping* route (QPN off), so a 16-token window is too short
+  for this scorer independently of this work.
+
+### Where the MTP money still is
+
+The route does not lower `r`, which was the entire reason to port it; the honest statement is that
+the MTP band is exactly where it was -- `r` = 0.37 at 4k / 0.30 at 16k against upstream's 0.135. What
+this work does change is who owns that band's ceiling: the QPN sweep is a flat 47.5 ms at T = 6
+against a 7.19 GB/~900 GB/s traffic floor of ~8 ms, so it is latency- and parallelism-bound rather
+than bandwidth-bound either, and no configuration tried here (SPLITK 4 against 8, NACC 1 against 4,
+one entry covered against two) beats the SIMT tile below T = 5. The "441-637 GB/s" the port was
+chasing does not reproduce on this card and artifact as a bandwidth figure in the per-token bands;
+what does reproduce is a flat cost curve, and that is worth the 2.1x it is worth on the lookup
+verify. For `r` itself the lever is the one already recorded above: the per-verify-token body of the
+SIMT tile kernel -- the `TILE_SHARE_ACT` probe prices its activation side at +23-34%, and the fp32
+activation container is the multi-file change that collects it -- not the tensor cores.
 
 ## What was deliberately not ported
 
