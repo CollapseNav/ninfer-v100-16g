@@ -15,8 +15,8 @@ namespace ninfer::ops::detail {
 // count qualify.
 [[nodiscard]] bool ternary_qpn_enabled() noexcept;
 
-// n = output rows, k = reduction width, t = live tokens. True for 2 <= t <= 32 at this commit; the
-// T = 1..5 decode and MTP windows stay on the SIMT tile kernel, where the route loses.
+// n = output rows, k = reduction width, t = live tokens. True for 6 <= t <= 32 (the wide-verify
+// band; the T = 1..5 decode and MTP windows stay on the SIMT tile kernel, where the route loses).
 [[nodiscard]] bool ternary_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                                std::int32_t t) noexcept;
 

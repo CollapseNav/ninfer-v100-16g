@@ -134,12 +134,21 @@ bool ternary_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t)
     if ((k % TernaryVoltaQpnSchedule::kGroupK) != 0) { return false; }
     // SPLITK warps split K by whole groups, and every warp must get at least one.
     if ((k / TernaryVoltaQpnSchedule::kGroupK) % kTernaryQpnSplitk != 0) { return false; }
-    // T = 1 is deliberately not on this route: the kernel's A tile is eight tokens tall whatever T
-    // is, so one token runs the whole mma schedule with seven eighths of M dead and one CTA per 32
-    // output rows. Measured 32.6 t/s against the block GEMV's 49.8 on the parked configuration.
-    // The verify band above it is still a LOSS at this commit (T = 2 by 47%, T = 3 by 21%); the
-    // band gate and the measured crossover table land in the next commit.
-    if (t < 2) { return false; }
+    // The band. The kernel reads the whole weight once per forward whatever T is, and the tensor
+    // cores then absorb the extra tokens almost free -- so its cost is flat in T, while the SIMT
+    // tile kernel's grows by ~a third of a T=1 step per verified token. Measured round times on
+    // real_task (ms, NINFER_TERNARY_QPN=0 against =1, same batch, 128 tokens each):
+    //
+    //   T = 1    2     3     4     5     6     8     16 (lookup)
+    //   19.5   26.6  33.9  41.2  48.6  58.0  74.1   98.1   SIMT tile
+    //   19.4   39.2  41.1  43.0  44.9  47.5  52.0   46.8   QPN
+    //
+    // i.e. the two lines cross at T ~ 4.3. Below 6 the route loses (T = 2 by 47%, T = 3 by 21%),
+    // which is the whole MTP band a real task uses -- K = 1 and K = 2 -- and 6 is the first width
+    // where the win clears the +/-4% batch drift of this workload (18% at T = 6, 30% at T = 8, and
+    // 2.1x at the T = 16 lookup verify). T = 1 is far worse than all of them: the A tile is eight
+    // tokens tall whatever T is, so one token runs the schedule with seven eighths of M dead.
+    if (t < 6) { return false; }
     return t <= 4 * TernaryVoltaQpnSchedule::kRowsPerTile;
 #else
     (void)n;
