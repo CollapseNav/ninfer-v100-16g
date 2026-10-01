@@ -1663,6 +1663,23 @@ A measurement error worth recording: an earlier A/B reported the two routes as i
 "off" arm was passed `NINFER_TERNARY_QPN=off`, and the check only treats `0` as disabled -- so both
 arms ran QPN. The corrected control is the `0`-versus-`1` pair above.
 
+**Resuming this route: the plan of record.** Three readers touch the ternary code plane above t = 16
+and have to learn the prepacked index; the fourth case is better handled by widening the QPN kernel
+instead of adapting a streaming reader:
+
+| reader | t range | change |
+|---|---|---|
+| `ternary_volta_mma_gemm.cuh` (fused MMA) | 32..255 | it already gathers codes into shared memory before decoding, so only the fetch index changes |
+| `ternary_cutlass_sm70.cu` (dequant pass) | >= 256 | also a gather-and-convert kernel, order-insensitive; same change |
+| `ternary_rowsplit_gemv.cuh` (block GEMV) | 5..31 | do **not** adapt: it streams one row at a time and would lose coalescing. Widen the QPN kernel to kTiles = 4 (t <= 32) and route this band there instead |
+| `ternary_rowsplit_gemm_simt.cuh` | opt-in only | same reasoning as the block GEMV; it is not the default route |
+
+Acceptance, decided before the work starts: with those in place, `NINFER_TERNARY_QPN=0` against `=1`
+on identical prompts and seed must put the QPN band (t = 2..16, i.e. MTP K=1/K=2 and the T = 16 lookup
+verify) clearly ahead of the SIMT tile, with output unchanged. If it does not win, delete the route:
+the 441-637 GB/s upstream reports for this kernel would then not be reachable on this card and
+artifact, and that negative belongs in this section rather than in another experiment.
+
 ## What was deliberately not ported
 
 * The four author tensor-core schedules (`ternary_rowsplit_mma`, `_mma_small_t`, `_mma_wide_t`,
