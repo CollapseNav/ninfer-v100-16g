@@ -45,6 +45,16 @@ void ternary_dispatch_basis_strided(const Tensor& x_folded, const Weight& w, Ten
                                     std::int32_t out_row_stride, LinearPolicy policy,
                                     WorkspaceArena* workspace, cudaStream_t stream) {
     const TernaryLaunch launch = select_ternary_launch(w.n, w.k, x_folded.ne[1], policy);
+    // The QPN route is a property of the format and the shape, not of the entry point that got here.
+    // This entry is the folded-basis path used by the attention input projections, the GDN input
+    // projection and the SwiGLU pair, and those weights are just over half of the ternary bytes in a
+    // forward pass -- measured with a shape probe: n = 4096/6144/1024 at k = 5120, against
+    // n = 5120/34816/5120/248320 at k = 6144/5120/17408/5120 on the other entry. Without this the
+    // tensor-core route could only ever reach half the work it is meant to accelerate.
+    if (ternary_qpn_enabled() && ternary_volta_qpn_supported(w.n, w.k, x_folded.ne[1])) {
+        launch_ternary_volta_qpn(x_folded, w, out, out_row_stride, stream);
+        return;
+    }
     // The CUTLASS arm needs a scratch buffer it cannot take from TernaryLaunch, which carries none,
     // so it is selected here and only when the CALLER was able to hand an arena in. The parents that
     // feed several folded weights from one activation do carry one (they had to, for the rotation),
