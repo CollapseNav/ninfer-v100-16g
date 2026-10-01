@@ -6,6 +6,40 @@ NInfer is a from-scratch C++/CUDA inference engine optimized for selected Qwen c
 
 It supports text, image, and video input through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime is intentionally narrow: one GPU, one resident model, 1–8 active requests.
 
+## V100-16GB ternary port (branch `v100-16g`)
+
+This branch adds the **PQ2_0_G128** (2-bit ternary) path used by community requantized artifacts --
+the reference one here is `bonsai2_27b_swift_pq2.ninfer` (artifact identity `qwen3.8-27b` /
+`groupwise-int`, 7.45 GiB of weights), sized so the model plus KV fits a single **V100-SXM2-16GB**.
+
+The upstream tables below are NVFP4 and groupwise-int results on 32GB cards and do **not** apply to
+this artifact: Volta has no NVFP4 route (that kernel is inside `#ifndef NINFER_VOLTA_BUILD`), the
+weights are 2-bit ternary rather than 4-bit, and this decode is issue/latency-bound rather than
+HBM-bound. Measured on the 16GB SXM2, greedy, INT8 KV, one resident model:
+
+| scenario | prefill | decode | speculation |
+|---|---:|---:|---|
+| natural prose, no speculation | 1.21-1.23k tok/s @4k | **51.1 tok/s** with `NINFER_TERNARY_ROTATE_SPLIT=16`, 48.7 with no environment variables | -- |
+| ordinary engineering task, thinking on | 1.13-1.15k tok/s | 49.8-51.4 tok/s | **K=1: 59.3-61.7 tok/s**, draft acceptance 58.5-73.9% |
+| context reproduction (repetitive text) | -- | -- | K=7: **122-124 tok/s**, acceptance 97.1% |
+
+Against the pre-port snapshot recorded in `docs/ternary-port.md`: decode **44.6 -> 51.1 tok/s
+(+14.6%)** on the same route, prose MTP K=1 **51.8 -> 64.1**, context lookup **83.7 -> 122-124**, and
+the marginal cost of one verified token **0.60 -> 0.30-0.37** of a decode step. What was measured,
+what was refuted, and what is still open lives in `docs/ternary-port.md`; the remote build/run
+recipe is in `docs/e5-ssh-workflow.md`.
+
+```bash
+cmake -S . -B build-sm70 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70
+cmake --build build-sm70 --parallel 8
+./build-sm70/apps/ninfer-serve models/bonsai2_27b_swift_pq2.ninfer \
+    --host 0.0.0.0 --port 8080 --cors --max-context 131072 --kv-capacity auto \
+    --kv-dtype int8 --prefill-chunk 4096 --spec mtp --draft-tokens 1 --lm-head-draft
+```
+
+The binaries link `libavformat.so.60`, which the host here does not provide, so they are run through
+the `ninfer-v100-buildenv:cu128` image as `docs/e5-ssh-workflow.md` describes.
+
 ## Models
 
 | Model | Weights | Artifact | Download and model card |
