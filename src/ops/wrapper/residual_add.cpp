@@ -6,8 +6,10 @@
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops {
 namespace {
@@ -46,6 +48,16 @@ void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
         throw std::invalid_argument("residual_add: y/x data must be non-null");
     }
 
+
+    // PROBE (NINFER_TERNARY_PROBE_SKIP_RESIDUAL): do not launch this kernel at all. Sizes and every
+    // downstream address are unchanged -- the consumer reads whatever the buffer already holds --
+    // so the wall-clock delta against a control run prices launch + loads + stores + ALU of this
+    // one kernel. Numerically wrong by construction; never a default.
+    static const bool probe_skip = [] {
+        const char* env = std::getenv("NINFER_TERNARY_PROBE_SKIP_RESIDUAL");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    if (probe_skip) { return; }
     detail::residual_add_launch(y, x, stream); // single variant -> direct dispatch
 }
 

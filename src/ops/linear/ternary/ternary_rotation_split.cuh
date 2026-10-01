@@ -157,5 +157,36 @@ __global__ void ternary_rotate_bf16_split_kernel(const __nv_bfloat16* __restrict
     }
 }
 
+// PROBE: the split-shaped twin of the one-warp copy probe -- same grid, same uint4 read, same
+// store path as the real kernel, no sign load and no transform. The default decode path now runs
+// four warps per D1024, so the original copy probe prices a shape decode no longer launches; with
+// both knobs on, this arm is what "everything except the transform" means. Numerically wrong by
+// construction; never a default.
+__global__ void ternary_rotate_bf16_split_copy_kernel(const __nv_bfloat16* __restrict__ x,
+                                                      void* __restrict__ out, bool fp16_out,
+                                                      int k, int tokens) {
+    const int lane   = static_cast<int>(threadIdx.x) & (kThreadsPerWarp - 1);
+    const int unit   = static_cast<int>(threadIdx.x) >> 5;
+    const int blocks = k >> 10;
+    const int token  = static_cast<int>(blockIdx.x) / blocks;
+    const int block  = static_cast<int>(blockIdx.x) % blocks;
+
+    const std::int64_t token_base = static_cast<std::int64_t>(token) * k;
+    const int element             = (block << 10) + (unit << 8) + (lane << 3);
+
+    const uint4 raw     = *reinterpret_cast<const uint4*>(x + token_base + element);
+    const unsigned halves[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+    for (int j = 0; j < kSplitElems; ++j) {
+        const unsigned short bits = static_cast<unsigned short>(halves[j >> 1] >> (16 * (j & 1)));
+        const float value         = __uint_as_float(static_cast<unsigned>(bits) << 16);
+        if (fp16_out) {
+            static_cast<__half*>(out)[token_base + element + j] = __float2half_rn(value);
+        } else {
+            static_cast<__nv_bfloat16*>(out)[token_base + element + j] = __float2bfloat16_rn(value);
+        }
+    }
+}
+
 } // namespace
 } // namespace ninfer::ops::detail

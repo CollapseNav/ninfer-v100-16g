@@ -18,8 +18,17 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdio>
 
 #include <cstdint>
+
+// HISTOGRAM PROBE: six magnitude bins the forward rotation counts its STORED values into, on
+// prefill-sized calls only (tokens >= 128). Bin layout follows what the CUTLASS arm does with the
+// buffer -- it copies this bf16 output into an fp16 panel -- so bin 1 (0 < |v| < 2^-14) is exactly
+// what becomes an fp16 SUBNORMAL there: 0 = exact zero, 1 = subnormal-after-copy, 2 = < 2^-10,
+// 3 = < 2^-6, 4 = < 1, 5 = >= 1. Armed by NINFER_TERNARY_ROTATE_HIST; a compile-time template
+// argument, so the shipped path carries no code for it.
+__device__ unsigned int kRotationHist[6];
 
 namespace ninfer::ops::detail {
 namespace {
@@ -83,7 +92,7 @@ __device__ __forceinline__ void normalized_hadamard_d1024_inplace(float (&values
 // activation a GEMV reads is bit-identical to today's. The point is that a GEMV can then do the
 // group's four-term dot with half2 math: two half2 registers instead of four fp32 ones, and one
 // __hfma2 per two multiply-accumulates. See docs/ternary-port.md.
-template <bool kFp16Out = false>
+template <bool kFp16Out = false, bool kHist = false>
 __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
                                            void* __restrict__ out,
                                            const float* __restrict__ signs, int n_blk, int k,
@@ -146,9 +155,34 @@ __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
             store_at((block << 10) + r * 32 + lane, value);
         }
     } else {
+        unsigned hist_local[6] = {0, 0, 0, 0, 0, 0};
+        const bool hist_count = kHist && tokens >= 128;
 #pragma unroll
         for (int r = 0; r < 32; ++r) {
-            store_at((block << 10) + r * 32 + lane, values[r]);
+            const float v = values[r];
+            store_at((block << 10) + r * 32 + lane, v);
+            if (hist_count) {
+                const float a = fabsf(v);
+                unsigned bin  = 5;
+                if (a < 1.0f) { bin = 4; }
+                if (a < 0x1p-6f) { bin = 3; }
+                if (a < 0x1p-10f) { bin = 2; }
+                if (a < 0x1p-14f) { bin = 1; }
+                if (v == 0.0f) { bin = 0; }
+                hist_local[bin] += 1;
+            }
+        }
+        if (hist_count) {
+#pragma unroll
+            for (int b = 0; b < 6; ++b) { atomicAdd(&kRotationHist[b], hist_local[b]); }
+            // One report per prefill call, from the last block by index. Blocks finish out of
+            // order, so the bin sum can undercount -- which is why the sum is printed: coverage =
+            // sum / (tokens * k). Decode never reaches tokens >= 128 and prints nothing.
+            if (blockIdx.x == gridDim.x - 1 && threadIdx.x == 0) {
+                printf("NINFER_ROT_HIST tokens=%d k=%d blocks=%u bins=%u,%u,%u,%u,%u,%u\n",
+                       tokens, k, gridDim.x, kRotationHist[0], kRotationHist[1], kRotationHist[2],
+                       kRotationHist[3], kRotationHist[4], kRotationHist[5]);
+            }
         }
     }
 }

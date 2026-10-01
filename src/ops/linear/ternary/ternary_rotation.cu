@@ -101,6 +101,16 @@ int rotation_split_max_tokens() {
     return value;
 }
 
+// NINFER_TERNARY_ROTATE_HIST=1 arms the forward rotation's magnitude histogram (prefill
+// calls only; the fp16 container never reaches 128 tokens, so only the bf16 launch is wired).
+bool rotation_hist_enabled() {
+    static const bool value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_ROTATE_HIST");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    return value;
+}
+
 } // namespace
 
 void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
@@ -134,7 +144,7 @@ void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
     const int warp_block     = rotation_warps_per_block(warps);
     const unsigned grid      = static_cast<unsigned>((warps + warp_block - 1) / warp_block);
     const dim3 block(warp_block * kThreadsPerWarp);
-    if (rotation_copy_probe()) {
+    if (rotation_copy_probe() && rotation_split_max_tokens() == 0) {
         ternary_rotate_copy_probe_kernel<<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data),
             weight.k, x.ne[1]);
@@ -149,6 +159,16 @@ void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
     if (split_max_tokens > 0 && x.ne[1] <= split_max_tokens && !permuted) {
         const unsigned split_grid   = static_cast<unsigned>(rotation_warps(weight.k, x.ne[1]));
         const dim3 split_block(kSplitThreads);
+        // PROBE: with both knobs on, price "everything except the transform" in the shape the
+        // default path actually launches -- the one-warp copy probe above would price a shape the
+        // decode path no longer makes.
+        if (rotation_copy_probe()) {
+            ternary_rotate_bf16_split_copy_kernel<<<split_grid, split_block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data), out.data, out.dtype == DType::FP16,
+                weight.k, x.ne[1]);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         if (out.dtype == DType::FP16) {
             ternary_rotate_bf16_split_kernel<true><<<split_grid, split_block, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data), out.data, weight.hadamard_signs,
@@ -158,6 +178,16 @@ void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
                 static_cast<const __nv_bfloat16*>(x.data), out.data, weight.hadamard_signs,
                 weight.hadamard_n_blk, weight.k, x.ne[1]);
         }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    // HISTOGRAM PROBE (NINFER_TERNARY_ROTATE_HIST): prefill container only -- the
+    // kernel gates on tokens >= 128 and the fp16 container never gets that large.
+    if (rotation_hist_enabled() && out.dtype != DType::FP16) {
+        ternary_rotate_bf16_kernel<false, true><<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), out.data, weight.hadamard_signs,
+            weight.hadamard_n_blk, weight.k, x.ne[1], perm_hd, perm_nk, perm_rep,
+            /*inverse=*/0);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

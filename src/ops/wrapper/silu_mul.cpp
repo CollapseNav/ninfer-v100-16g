@@ -5,7 +5,9 @@
 
 #include "ops/launcher/silu_and_mul.h" // detail::silu_and_mul_launch
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops {
 
@@ -24,6 +26,16 @@ void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t st
         throw std::invalid_argument("silu_mul: gate/up/out data must be non-null");
     }
 
+
+    // PROBE (NINFER_TERNARY_PROBE_SKIP_SILU): do not launch this kernel at all. Sizes and every
+    // downstream address are unchanged -- the consumer reads whatever the buffer already holds --
+    // so the wall-clock delta against a control run prices launch + loads + stores + ALU of this
+    // one kernel. Numerically wrong by construction; never a default.
+    static const bool probe_skip = [] {
+        const char* env = std::getenv("NINFER_TERNARY_PROBE_SKIP_SILU");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    if (probe_skip) { return; }
     detail::silu_and_mul_launch(gate, up, out, stream); // single variant -> direct dispatch
 }
 

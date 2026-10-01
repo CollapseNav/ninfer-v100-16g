@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -83,6 +84,16 @@ void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_of
         throw std::invalid_argument("rmsnorm: x/weight/z/out data must be non-null");
     }
 
+
+    // PROBE (NINFER_TERNARY_PROBE_SKIP_RMSNORM): do not launch this kernel at all. Sizes and every
+    // downstream address are unchanged -- the consumer reads whatever the buffer already holds --
+    // so the wall-clock delta against a control run prices launch + loads + stores + ALU of this
+    // one kernel. Numerically wrong by construction; never a default.
+    static const bool probe_skip = [] {
+        const char* env = std::getenv("NINFER_TERNARY_PROBE_SKIP_RMSNORM");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    if (probe_skip) { return; }
     detail::rmsnorm_launch(x, weight, eps, unit_offset, z, out, stream);
 }
 
