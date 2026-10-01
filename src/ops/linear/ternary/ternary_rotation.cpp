@@ -94,7 +94,13 @@ Tensor folded_activation(const Tensor& x, const Weight& weight, WorkspaceArena& 
         const char* env = std::getenv("NINFER_TERNARY_FP16_ACT");
         return env == nullptr || std::string(env) != "0";
     }();
-    const bool want_fp16 = fp16_act && wide_tile && x.ne[1] >= 1 && x.ne[1] <= 16;
+    // The fp16 container is only correct when the layer is PQ2_0: the fp16 tile kernel above is
+    // the only consumer of it, and PTQ1_0 has no fp16 route at all -- its decode falls through
+    // to the bf16-only reference/SIMT kernels, which reject an fp16 activation outright
+    // ("a non-bf16 activation reached the bf16 reference route"). Gating on qtype, not on a
+    // global default, is what keeps a PTQ1_0 or mixed artifact loadable.
+    const bool want_fp16 = fp16_act && wide_tile && weight.qtype == QType::PQ2_0_G128 &&
+                           x.ne[1] >= 1 && x.ne[1] <= 16;
     const DeviceSpan span =
         workspace.alloc_bytes(ternary_rotation_workspace_bytes(weight.k, x.ne[1]));
     Tensor rotated(span.data, want_fp16 ? DType::FP16 : DType::BF16, {weight.k, x.ne[1]});
