@@ -5,6 +5,7 @@
 
 #include "core/device.h"
 #include "ops/linear/ternary/ternary_rotation_kernels.cuh"
+#include "ops/linear/ternary/ternary_rotation_split.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -84,6 +85,22 @@ bool rotation_copy_probe() {
     return value;
 }
 
+// Four warps per D1024 instead of one; see ternary_rotation_split.cuh. Read once, like every other
+// knob in this file: the value must not change between graph construction and graph replay,
+// because it decides which kernel is captured at all.
+// The value is the largest token count the split kernel serves (0 or unset = never). Measured on
+// this model: T <= 16 gains 44.6 -> 46.5 t/s of decode, while a 3662-token prefill loses 1.21k ->
+// 1.18k tok/s -- at large T the one-warp kernel's 5-warps-per-launch is hidden by the grid anyway
+// and the split's __syncthreads() is pure overhead. So the threshold defaults to the decode band
+// and the caller decides, not the kernel.
+int rotation_split_max_tokens() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_ROTATE_SPLIT");
+        return env == nullptr ? 0 : std::atoi(env);
+    }();
+    return value;
+}
+
 } // namespace
 
 void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
@@ -121,6 +138,26 @@ void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
         ternary_rotate_copy_probe_kernel<<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data),
             weight.k, x.ne[1]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // The grid stays one CTA per (1024-block, token) pair: the four units that have to be joined
+    // through shared memory live in the same CTA, so nothing about the launch geometry changes
+    // except the block going from one warp to four.
+    const int split_max_tokens = rotation_split_max_tokens();
+    if (split_max_tokens > 0 && x.ne[1] <= split_max_tokens && !permuted) {
+        const unsigned split_grid   = static_cast<unsigned>(rotation_warps(weight.k, x.ne[1]));
+        const dim3 split_block(kSplitThreads);
+        if (out.dtype == DType::FP16) {
+            ternary_rotate_bf16_split_kernel<true><<<split_grid, split_block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data), out.data, weight.hadamard_signs,
+                weight.hadamard_n_blk, weight.k, x.ne[1]);
+        } else {
+            ternary_rotate_bf16_split_kernel<false><<<split_grid, split_block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data), out.data, weight.hadamard_signs,
+                weight.hadamard_n_blk, weight.k, x.ne[1]);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
