@@ -147,7 +147,7 @@ int gemv_probe() {
 bool tile_weight_table_enabled() {
     static const bool value = [] {
         const char* env = std::getenv("NINFER_TERNARY_TILE_WTABLE");
-        return env != nullptr && std::string(env) != "0";
+        return env != nullptr && std::string(env) == "1";
     }();
     if (value) {
         static const bool ready = [] {
@@ -166,6 +166,78 @@ bool tile_weight_table_enabled() {
         (void)ready;
     }
     return value;
+}
+
+// NINFER_TERNARY_TILE_WTABLE: "1" = the global 2 KB table above (refuted, -28%), "2" = the same
+// table in SHARED memory, built by each block once at entry. MEASURED: the shared table cuts the
+// decode shape's SASS body from 29 instructions per group to 22 (LOP3 76 -> 12) and the decode step
+// from 51.4 to 39.8 t/s (-23%), i.e. replacing the magic-number construction with an LDS.64 makes it
+// SLOWER even though it removes 25% of the instructions. The decode shape is latency-bound on the
+// code-load chain, not issue-bound, so a dependent load in that chain costs more than the arithmetic
+// it saves. Keep it as the record; do not re-open without a scheme that removes the load as well.
+int tile_weight_table_mode() {
+    static const int mode = [] {
+        const char* env = std::getenv("NINFER_TERNARY_TILE_WTABLE");
+        if (env == nullptr) { return 0; }
+        const std::string text(env);
+        if (text == "2") { return 2; }
+        if (text == "1") { return 1; }
+        return 0;
+    }();
+    return mode;
+}
+
+// NINFER_TERNARY_TILE_MINBLOCKS caps the tile kernel's registers through __launch_bounds__'s second
+// argument. The kernel had no cap, so ptxas spends 60 registers on the fp16 decode shape and the SM
+// hosts 32 of its 64 warps. MEASURED on the decode step: 4 -> 51.6 (unchanged, the cap is above the
+// 60 it already uses), 6 -> 41.3, 8 -> 35.8 t/s. The dedicated T = 1 GEMV gained +4.8% from the same
+// lever, this one loses, which is further evidence that the decode shape is not warp-limited.
+int tile_minblocks() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_TILE_MINBLOCKS");
+        const int parsed = env == nullptr ? 0 : std::atoi(env);
+        return (parsed == 1 || parsed == 4 || parsed == 5 || parsed == 6 || parsed == 8) ? parsed : 1;
+    }();
+    return value;
+}
+
+// NINFER_TERNARY_TILE_WIDE1=1 selects the wide-lane T = 1 decode GEMV (two code bytes and sixteen
+// activation bytes per lane per iteration) instead of the tile kernel at kT = 1. See the kernel for
+// why: the shipped decode shape is latency-bound, and doubling the bytes per load instruction is the
+// one lever left that raises the weight bytes in flight. MEASURED: 42.7 (unroll 1), 46.1 (2), 50.9
+// (4), 48.3 (8) t/s against 51.5 for the shipped tile kernel -- a 1-2% loss at its best, so it stays
+// off. Reading with it also reassociates the two four-weight dots inside a lane, which moves the
+// greedy output text (the same last-bit class the fp16 container already carries).
+// NINFER_TERNARY_WIDE1_UNROLL picks its group-pair unroll (default 4).
+bool tile_wide1_enabled() {
+    static const bool value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_TILE_WIDE1");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    return value;
+}
+
+int tile_wide1_unroll() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_WIDE1_UNROLL");
+        const int parsed = env == nullptr ? 0 : std::atoi(env);
+        return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8) ? parsed : 4;
+    }();
+    return value;
+}
+
+// The experimental decode-shape arms: kT = 1, depth 8, fp16 container, no probe. Defaults
+// (mode 0, minBlocks 1) are the shipped kernel to the register.
+template <int kMode, int kMinBlocks>
+void launch_tile_decode_arm(const Tensor& x, const Weight& w, Tensor& out,
+                            std::int32_t groups_per_row, std::int32_t tokens,
+                            std::int32_t out_row_stride, unsigned grid, dim3 block,
+                            cudaStream_t stream) {
+    ternary_pq2_gemv_tile_kernel<1, 8, false, 1, kGemvProbeOff, kMode, kMinBlocks>
+        <<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+            w.n, groups_per_row, tokens, out_row_stride);
 }
 
 // NINFER_TERNARY_GEMV_NOBIAS=1 selects the instruction-count probe described at the kernel. Its
@@ -312,6 +384,28 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
     const std::int32_t groups_per_row = w.k / 128;
     const unsigned grid               = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
     const dim3 block(kGemvWarpsPerBlock * 32, 1u, 1u);
+    // Wide-lane T = 1 decode: only the fp16 container, only one token, and only an even group count
+    // (every width in this model is even: 40/48/80/136). Experiment, so it stays behind the switch
+    // until it is measured.
+    if (tokens == 1 && x.dtype == DType::FP16 && (groups_per_row % 2) == 0 && tile_wide1_enabled()) {
+        const auto fire = [&](auto unroll_tag) {
+            constexpr int kU = decltype(unroll_tag)::value;
+            ternary_pq2_gemv_wide1_kernel<kU>
+                <<<grid, block, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const std::uint8_t*>(w.qdata),
+                    static_cast<const std::uint8_t*>(w.scales),
+                    static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, out_row_stride);
+        };
+        switch (tile_wide1_unroll()) {
+        case 1: fire(std::integral_constant<int, 1>{}); break;
+        case 2: fire(std::integral_constant<int, 2>{}); break;
+        case 8: fire(std::integral_constant<int, 8>{}); break;
+        default: fire(std::integral_constant<int, 4>{}); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (tokens <= 1 && x.dtype != DType::FP16) {
         // The dedicated T = 1 kernel is bf16-only; an fp16 activation falls through to the tile kernel
         // at kT = 1, which has the half2 dot.
@@ -374,6 +468,35 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
                             static_cast<const std::uint8_t*>(w.scales),
                             static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
                             out_row_stride);
+                } else if constexpr (TokenTag::value == 1 && UnrollTag::value == 8) {
+                    // Decode-shape experiments (defaults reproduce the shipped kernel).
+                    const int smem_mode = tile_weight_table_mode() == 2 ? 2 : 0;
+                    const int minb      = tile_minblocks();
+                    if (smem_mode == 2 && minb == 6) {
+                        launch_tile_decode_arm<2, 6>(x, w, out, groups_per_row, tokens,
+                                                     out_row_stride, grid, block, stream);
+                    } else if (smem_mode == 2 && minb == 4) {
+                        launch_tile_decode_arm<2, 4>(x, w, out, groups_per_row, tokens,
+                                                     out_row_stride, grid, block, stream);
+                    } else if (smem_mode == 2 && minb == 8) {
+                        launch_tile_decode_arm<2, 8>(x, w, out, groups_per_row, tokens,
+                                                     out_row_stride, grid, block, stream);
+                    } else if (smem_mode == 2) {
+                        launch_tile_decode_arm<2, 1>(x, w, out, groups_per_row, tokens,
+                                                     out_row_stride, grid, block, stream);
+                    } else if (minb == 6) {
+                        launch_tile_decode_arm<0, 6>(x, w, out, groups_per_row, tokens,
+                                                     out_row_stride, grid, block, stream);
+                    } else if (minb == 4) {
+                        launch_tile_decode_arm<0, 4>(x, w, out, groups_per_row, tokens,
+                                                     out_row_stride, grid, block, stream);
+                    } else if (minb == 8) {
+                        launch_tile_decode_arm<0, 8>(x, w, out, groups_per_row, tokens,
+                                                     out_row_stride, grid, block, stream);
+                    } else {
+                        launch_tile_decode_arm<0, 1>(x, w, out, groups_per_row, tokens,
+                                                     out_row_stride, grid, block, stream);
+                    }
                 } else {
                     ternary_pq2_gemv_tile_kernel<TokenTag::value, UnrollTag::value, false, 1>
                         <<<grid, block, 0, stream>>>(

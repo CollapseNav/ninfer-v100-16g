@@ -376,6 +376,11 @@ inside that structure means feeding B to the MMA from registers, which is a rewr
     0xc000 max)`; the message names the mangled kernel, not the template arguments.
 
 ## Decode
+> The 2026-10-01 rounds -- the PQ2 tensor-core (QPN) wide-verify route and the T = 1 decode
+> step priced component by component, with the five decode levers that were tried and
+> refuted -- are consolidated in `docs/decode-round-2026-10-01.md`. The decode material below
+> predates it and is kept because it records this port's earlier budget measurements.
+
 
 T=1 warp-per-row GEMV, **41.6 t/s** (3 runs identical), against llama.cpp's 33.7 on the same prompt.
 Unaffected by every prefill change; verified again at chunk 4096.

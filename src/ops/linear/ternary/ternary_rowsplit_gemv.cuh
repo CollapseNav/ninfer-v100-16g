@@ -277,9 +277,19 @@ void ternary_pq2_gemv_w_kernel(const __nv_bfloat16* __restrict__ x,
 // container with the original fp32 chain. Modes 1 and 2 differ only in where the group sum is
 // rounded: mode 1 rounds it once to fp16 and is therefore not bit-exact, mode 2 is bit-exact with
 // mode 0 because both the container round trip and the half2 -> fp32 widening are exact.
+// kTableWeights: 0 = build the four (code-1) fp16 values from the byte with the magic-number
+// identity (the shipped path), 1 = read them from a 2 KB __device__ table (measured -28%, see the
+// launcher), 2 = read them from a 2 KB SHARED-memory table built by the block once at entry. The
+// decode construction is ~12.3 SASS instructions of a ~26.5-instruction group body, and the probes
+// price it at ~23% of the T = 1 step, so replacing it with one LDS.64 is the largest single
+// instruction-count lever left on the decode shape. Shared rather than global because the gather is
+// 8 bytes per lane out of a 2 KB window: L1 tags cannot serve that (the == 1 arm), LDS can.
+// kMinBlocks is __launch_bounds__'s second argument; the tile kernel had none, so ptxas picks 60
+// registers for the fp16 decode shape (32 of 64 warps per SM). The dedicated T = 1 kernel gained
+// +4.8% from exactly this cap, so it is worth a sweep here too.
 template <int kT, int kUnroll = 4, bool kShareActivation = false, int kFpMode = 0,
-          int kProbe = kGemvProbeOff, bool kTableWeights = false>
-__global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
+          int kProbe = kGemvProbeOff, int kTableWeights = 0, int kMinBlocks = 1>
+__global__ __launch_bounds__(kGemvWarpsPerBlock * 32, kMinBlocks)
 void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                                   const std::uint8_t* __restrict__ codes,
                                   const std::uint8_t* __restrict__ scales,
@@ -289,6 +299,25 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
     static_assert(kT >= 1 && kT <= 16, "tile size must stay small enough to keep accumulators in registers");
     static_assert(!(kShareActivation && kFpMode != 0),
                   "the activation-sharing probe reads bf16 only; it is not valid with an fp16 tile");
+    // Built before the early return below, which is per-warp: a __syncthreads() after it would hang
+    // the warps that retire.
+    __shared__ uint2 smem_weights[256];
+    if constexpr (kTableWeights == 2) {
+        if (static_cast<int>(threadIdx.x) < 256) {
+            const std::uint32_t raw = static_cast<std::uint32_t>(threadIdx.x);
+            const std::uint32_t lo  = 0x64006400u | (raw & 0x03u) | ((raw & 0x0Cu) << 14);
+            const std::uint32_t hi  = 0x64006400u | ((raw >> 4) & 0x03u) | ((raw & 0xC0u) << 10);
+            const __half2 w01 = __hsub2(*reinterpret_cast<const __half2*>(&lo),
+                                        __float2half2_rn(1025.0F));
+            const __half2 w23 = __hsub2(*reinterpret_cast<const __half2*>(&hi),
+                                        __float2half2_rn(1025.0F));
+            uint2 entry;
+            entry.x = *reinterpret_cast<const std::uint32_t*>(&w01);
+            entry.y = *reinterpret_cast<const std::uint32_t*>(&w23);
+            smem_weights[threadIdx.x] = entry;
+        }
+        __syncthreads();
+    }
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp =
         static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + (static_cast<int>(threadIdx.x) >> 5);
@@ -336,7 +365,12 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
         // (code-1) values at once and the four I2F conversions disappear.
         __half2 w01;
         __half2 w23;
-        if constexpr (kTableWeights && kFpMode != 0) {
+        if constexpr (kTableWeights == 2 && kFpMode != 0) {
+            // One LDS.64 replaces the whole construction below.
+            const uint2 from_smem = smem_weights[raw];
+            w01 = *reinterpret_cast<const __half2*>(&from_smem.x);
+            w23 = *reinterpret_cast<const __half2*>(&from_smem.y);
+        } else if constexpr (kTableWeights == 1 && kFpMode != 0) {
             // WEIGHT TABLE arm: the same four (code-1) fp16 values in one LDG.64 instead of the
             // magic-number construction below. SASS puts that construction at ~12.3 instructions
             // per group inside a loop of ~26.5, and the nocode/codealu probe arms price the decode
@@ -428,6 +462,78 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
             out[static_cast<std::int64_t>(t) * out_row_stride + warp] =
                 __float2bfloat16_rn(value);
         }
+    }
+}
+
+// Wide-lane T = 1 decode GEMV: two code bytes and sixteen activation bytes per lane per iteration,
+// covering TWO groups. It exists because the shipped T = 1 path (the tile kernel at kT = 1, depth 8)
+// is latency-bound rather than issue-bound, and the two levers that address issue count both failed:
+// a shared-memory decode table cuts the per-group body from 29 SASS instructions to 22 and measured
+// -23%, and every register cap that buys resident warps measured flat or worse. What this variant
+// changes is BYTES PER LOAD INSTRUCTION -- the code read becomes one LDG.16 per lane (64 B per warp
+// per instruction instead of 32) and the activation one LDG.128 (512 B instead of 256) -- so the
+// same number of loads in flight carries twice the weight bytes, at ~25% fewer instructions per
+// byte because the non-decode part of the body amortises over two groups.
+//
+// The mapping stays uniform. Lane l covers k in [8l, 8l+8) of the 256-k pair window for every l:
+// for l < 16 that is offset 8l inside group 2p, for l >= 16 offset 8(l-16) inside group 2p+1, i.e.
+// 8l in both cases, so the activation address is pair*256 + 8l and the code address pair*64 + 2l --
+// the same expression for every lane, and lane l's scale is the one of group 2p + (l >> 4).
+//
+// Numerics: each four-weight dot is still built as one HMUL2/HFMA2 pair and summed in fp32, the
+// same shape as the tile kernel's mode 1; only the association of the two four-dots inside one lane
+// differs, so this is the same class of last-bit difference the fp16 container already carries.
+// groups_per_row must be even (40/48/80/136 in this model); the launcher falls back otherwise.
+template <int kUnroll = 4, int kMinBlocks = 1>
+__global__ __launch_bounds__(kGemvWarpsPerBlock * 32, kMinBlocks)
+void ternary_pq2_gemv_wide1_kernel(const __nv_bfloat16* __restrict__ x,
+                                   const std::uint8_t* __restrict__ codes,
+                                   const std::uint8_t* __restrict__ scales,
+                                   __nv_bfloat16* __restrict__ out, std::int32_t rows,
+                                   std::int32_t groups_per_row, std::int32_t out_row_stride) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp =
+        static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + (static_cast<int>(threadIdx.x) >> 5);
+    if (warp >= rows) { return; }
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(warp) * groups_per_row * kGemvCodeBytesPerGroup;
+    const std::uint8_t* scale_row =
+        scales + static_cast<std::int64_t>(warp) * groups_per_row * kGemvScaleBytesPerGroup;
+    const __nv_bfloat16* x_lane = x + lane * 8;
+
+    const int pairs = groups_per_row >> 1;
+    float accumulator = 0.0F;
+#pragma unroll(kUnroll)
+    for (int pair = 0; pair < pairs; ++pair) {
+        const uint4 act = *reinterpret_cast<const uint4*>(x_lane + pair * 256);
+        const std::uint16_t raw16 =
+            *reinterpret_cast<const std::uint16_t*>(code_row + pair * 64 + lane * 2);
+        const float scale = gemv_scale(scale_row + pair * 4 + (lane >> 4) * 2);
+        const std::uint32_t b0 = raw16 & 0xFFu;
+        const std::uint32_t b1 = (raw16 >> 8) & 0xFFu;
+        const std::uint32_t lo0 = 0x64006400u | (b0 & 0x03u) | ((b0 & 0x0Cu) << 14);
+        const std::uint32_t hi0 = 0x64006400u | ((b0 >> 4) & 0x03u) | ((b0 & 0xC0u) << 10);
+        const std::uint32_t lo1 = 0x64006400u | (b1 & 0x03u) | ((b1 & 0x0Cu) << 14);
+        const std::uint32_t hi1 = 0x64006400u | ((b1 >> 4) & 0x03u) | ((b1 & 0xC0u) << 10);
+        const half2 k1025 = __float2half2_rn(1025.0F);
+        const __half2 w01 = __hsub2(*reinterpret_cast<const half2*>(&lo0), k1025);
+        const __half2 w23 = __hsub2(*reinterpret_cast<const half2*>(&hi0), k1025);
+        const __half2 w45 = __hsub2(*reinterpret_cast<const half2*>(&lo1), k1025);
+        const __half2 w67 = __hsub2(*reinterpret_cast<const half2*>(&hi1), k1025);
+        const __half2 a01 = *reinterpret_cast<const __half2*>(&act.x);
+        const __half2 a23 = *reinterpret_cast<const __half2*>(&act.y);
+        const __half2 a45 = *reinterpret_cast<const __half2*>(&act.z);
+        const __half2 a67 = *reinterpret_cast<const __half2*>(&act.w);
+        const float2 p0 = __half22float2(__hfma2(w01, a01, __hmul2(w23, a23)));
+        const float2 p1 = __half22float2(__hfma2(w45, a45, __hmul2(w67, a67)));
+        accumulator = fmaf(scale, (p0.x + p0.y) + (p1.x + p1.y), accumulator);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        accumulator += __shfl_down_sync(0xffffffffu, accumulator, offset);
+    }
+    if (lane == 0) {
+        out[static_cast<std::int64_t>(0) * out_row_stride + warp] = __float2bfloat16_rn(accumulator);
     }
 }
 
