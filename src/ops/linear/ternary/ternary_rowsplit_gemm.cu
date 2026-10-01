@@ -372,6 +372,57 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
             CUDA_CHECK(cudaGetLastError());
             return;
         }
+        // PROBE: NINFER_TERNARY_GEMV_PROBE used to reach only the dedicated T=1 kernel, which the
+        // fp16 tile path (the default since the half2 group-dot landed) never calls -- all four
+        // arms measured the same 44.6 t/s and said nothing. This instantiates the same arms on the
+        // tile kernel for the decode shape only (kT == 1, the graph plain decode replays) at the
+        // default depth 4. Output is wrong by construction; never a default.
+        if (gemv_probe() != kGemvProbeOff && kt == 1) {
+            auto launch_tile_probe = [&](auto probe_tag, auto token_tag) {
+                constexpr int kProbeTile = decltype(probe_tag)::value;
+                constexpr int kKtTile    = decltype(token_tag)::value;
+                constexpr int kDepthTile = kKtTile == 2 ? 8 : 4;
+                const auto fire = [&](auto mode_tag) {
+                    constexpr int kModeTile = decltype(mode_tag)::value;
+                    ternary_pq2_gemv_tile_kernel<kKtTile, kDepthTile, false, kModeTile, kProbeTile>
+                        <<<grid, block, 0, stream>>>(
+                            static_cast<const __nv_bfloat16*>(x.data),
+                            static_cast<const std::uint8_t*>(w.qdata),
+                            static_cast<const std::uint8_t*>(w.scales),
+                            static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                            out_row_stride);
+                };
+                if (x.dtype != DType::FP16) {
+                    fire(integral_constant<int, 0>{});
+                } else if (fp16_mode2()) {
+                    fire(integral_constant<int, 2>{});
+                } else {
+                    fire(integral_constant<int, 1>{});
+                }
+            };
+            switch (gemv_probe()) {
+            case kGemvNoActivation:
+                launch_tile_probe(integral_constant<int, kGemvNoActivation>{},
+                                  integral_constant<int, 1>{});
+                break;
+            case kGemvNoCode:
+                launch_tile_probe(integral_constant<int, kGemvNoCode>{},
+                                  integral_constant<int, 1>{});
+                break;
+            case kGemvNoScale:
+                launch_tile_probe(integral_constant<int, kGemvNoScale>{},
+                                  integral_constant<int, 1>{});
+                break;
+            case kGemvCodeFromAlu:
+                launch_tile_probe(integral_constant<int, kGemvCodeFromAlu>{},
+                                  integral_constant<int, 1>{});
+                break;
+            default:
+                break;
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         switch (kt) {
         case 1:
             launch_tile(integral_constant<int, 1>{}, integral_constant<int, 4>{});

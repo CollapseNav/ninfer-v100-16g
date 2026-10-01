@@ -272,7 +272,8 @@ void ternary_pq2_gemv_w_kernel(const __nv_bfloat16* __restrict__ x,
 // container with the original fp32 chain. Modes 1 and 2 differ only in where the group sum is
 // rounded: mode 1 rounds it once to fp16 and is therefore not bit-exact, mode 2 is bit-exact with
 // mode 0 because both the container round trip and the half2 -> fp32 widening are exact.
-template <int kT, int kUnroll = 4, bool kShareActivation = false, int kFpMode = 0>
+template <int kT, int kUnroll = 4, bool kShareActivation = false, int kFpMode = 0,
+          int kProbe = kGemvProbeOff>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
 void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                                   const std::uint8_t* __restrict__ codes,
@@ -306,8 +307,21 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
 #pragma unroll(kUnroll)
     for (int group = 0; group < groups_per_row; ++group) {
         // Weights: one byte of codes + one 16-bit scale, reused across every token in the tile.
-        const std::uint8_t raw = code_row[group * kGemvCodeBytesPerGroup + lane];
-        const float scale = gemv_scale(scale_row + group * kGemvScaleBytesPerGroup);
+        // PROBE arms, the same four the dedicated T=1 kernel carries (kProbe, compile-time, so
+        // the shipped path is untouched when it is kGemvProbeOff). kGemvNoCode folds BOTH the byte
+        // and its decode to constants -- 0xFF keeps the weights non-zero so the activation loads
+        // stay live -- while kGemvCodeFromAlu keeps the decode and removes only the load; the
+        // difference between those two arms is the decode arithmetic, which is the split the port
+        // doc could never measure on the tile path because the arms never reached it.
+        const std::uint8_t raw =
+            kProbe == kGemvNoCode
+                ? static_cast<std::uint8_t>(0xFFu)
+                : (kProbe == kGemvCodeFromAlu
+                       ? static_cast<std::uint8_t>(group * 7 + lane)
+                       : code_row[group * kGemvCodeBytesPerGroup + lane]);
+        const float scale = kProbe == kGemvNoScale
+                                ? 1.0F
+                                : gemv_scale(scale_row + group * kGemvScaleBytesPerGroup);
         const float weight0 = static_cast<float>(static_cast<int>(raw & 3u) - 1);
         const float weight1 = static_cast<float>(static_cast<int>((raw >> 2) & 3u) - 1);
         const float weight2 = static_cast<float>(static_cast<int>((raw >> 4) & 3u) - 1);
@@ -350,8 +364,14 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                     // A lane's four activations are four contiguous bf16, so one 8-byte load replaces
                     // the two 4-byte ones. base is 8*lane + 256*group elements, i.e. always 8-byte
                     // aligned.
-                    const uint2 packed = *reinterpret_cast<const uint2*>(token_x[t] + base);
                     float dot;
+                    // PROBE (kGemvNoActivation): constant activation VALUES, no LDG and no
+                    // convert, with the group walk, the code side, the scale and the dot chain
+                    // still live -- so this arm prices the activation side only.
+                    const uint2 packed =
+                        kProbe == kGemvNoActivation
+                            ? make_uint2(0x3C003C00u, 0x3C003C00u)
+                            : *reinterpret_cast<const uint2*>(token_x[t] + base);
                     if constexpr (kFpMode == 1) {
                         // One half2 FMA pair per token: (w0*a0 + w2*a2, w1*a1 + w3*a3) in fp16, then
                         // the two lanes join in fp32, so the only rounding fp16 introduces is that
