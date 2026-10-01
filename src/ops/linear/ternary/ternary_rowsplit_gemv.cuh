@@ -128,6 +128,11 @@ enum TernaryGemvProbe {
     kGemvCodeFromAlu = 4
 };
 
+// table[byte] = the four (code-1) fp16 values of that code byte, packed as two half2 (low half =
+// codes 0,1, high half = codes 2,3). 256 * 8 B = 2 KB, L1-resident, filled once by the launcher.
+// Its only user is the tile kernel's kTableWeights arm; see the construction it replaces there.
+extern __device__ uint2 kPq2TileWeights[256];
+
 // kRows output rows per warp. The activation window (4 bf16 per lane per group) is identical for
 // every output row, so the one-row-per-warp form loads and converts it once per row; holding kRows
 // rows in one warp loads it once for all of them and gives each warp kRows independent code streams.
@@ -273,7 +278,7 @@ void ternary_pq2_gemv_w_kernel(const __nv_bfloat16* __restrict__ x,
 // rounded: mode 1 rounds it once to fp16 and is therefore not bit-exact, mode 2 is bit-exact with
 // mode 0 because both the container round trip and the half2 -> fp32 widening are exact.
 template <int kT, int kUnroll = 4, bool kShareActivation = false, int kFpMode = 0,
-          int kProbe = kGemvProbeOff>
+          int kProbe = kGemvProbeOff, bool kTableWeights = false>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
 void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                                   const std::uint8_t* __restrict__ codes,
@@ -331,7 +336,16 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
         // (code-1) values at once and the four I2F conversions disappear.
         __half2 w01;
         __half2 w23;
-        if constexpr (kFpMode != 0) {
+        if constexpr (kTableWeights && kFpMode != 0) {
+            // WEIGHT TABLE arm: the same four (code-1) fp16 values in one LDG.64 instead of the
+            // magic-number construction below. SASS puts that construction at ~12.3 instructions
+            // per group inside a loop of ~26.5, and the nocode/codealu probe arms price the decode
+            // at up to 24% of the whole decode step. Bit-identical: 0x6400|n minus 1025 in fp16 is
+            // exactly n-1, and the table holds the fp16 bits of those same four values.
+            const uint2 table_bits = kPq2TileWeights[raw];
+            w01                    = *reinterpret_cast<const __half2*>(&table_bits.x);
+            w23                    = *reinterpret_cast<const __half2*>(&table_bits.y);
+        } else if constexpr (kFpMode != 0) {
             const std::uint32_t lo_bits = 0x64006400u | static_cast<std::uint32_t>(raw & 0x03u) |
                                           (static_cast<std::uint32_t>(raw & 0x0Cu) << 14);
             const std::uint32_t hi_bits =

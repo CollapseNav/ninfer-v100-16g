@@ -44,6 +44,11 @@
 #include <type_traits>
 
 namespace ninfer::ops::detail {
+
+// Defined here, declared in ternary_rowsplit_gemv.cuh. Not in the anonymous namespace below: the
+// extern declaration the kernel template binds to has external linkage.
+__device__ uint2 kPq2TileWeights[256];
+
 namespace {
 
 // Which kernel serves prefill (T >= 5).
@@ -133,6 +138,34 @@ int gemv_probe() {
         return kGemvProbeOff;
     }();
     return probe;
+}
+
+// NINFER_TERNARY_TILE_WTABLE=1 reads the tile kernel's (code-1) weights out of a 2 KB device table
+// instead of rebuilding them from the byte. The table is filled here, once, before the first
+// capture that selects this arm -- a __device__ array cannot carry a non-trivial initializer, and
+// the launch itself happens inside a captured graph.
+bool tile_weight_table_enabled() {
+    static const bool value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_TILE_WTABLE");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    if (value) {
+        static const bool ready = [] {
+            // fp16 bits of code-1 for code 0..3: -1, 0, +1, +2
+            const std::uint16_t level[4] = {0xBC00u, 0x0000u, 0x3C00u, 0x4000u};
+            uint2 table[256];
+            for (int b = 0; b < 256; ++b) {
+                table[b].x = static_cast<std::uint32_t>(level[b & 3]) |
+                             (static_cast<std::uint32_t>(level[(b >> 2) & 3]) << 16);
+                table[b].y = static_cast<std::uint32_t>(level[(b >> 4) & 3]) |
+                             (static_cast<std::uint32_t>(level[(b >> 6) & 3]) << 16);
+            }
+            CUDA_CHECK(cudaMemcpyToSymbol(kPq2TileWeights, table, sizeof(table)));
+            return true;
+        }();
+        (void)ready;
+    }
+    return value;
 }
 
 // NINFER_TERNARY_GEMV_NOBIAS=1 selects the instruction-count probe described at the kernel. Its
@@ -301,13 +334,40 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
         // Measured on prose with MTP K=1..3: the two-token tile wants depth 8 (51.8 t/s against
         // 50.5 at 4), the four-token tile wants 4 (42.0 against 38.8 at 8). One default per kT is
         // therefore the honest encoding of the sweep, and the env still overrides both.
-        const int depth = unroll != 0 ? unroll : (tokens == 2 ? 8 : 4);
+        // Default depth per token count. T = 2 already wanted 8 (the verify band measured 51.8
+        // against 50.5 at 4); T = 1 did not have a number at all, because the kT == 1 case below
+        // hardcoded 4 and bypassed this variable entirely -- so the "unroll is flat at T = 1"
+        // line was a measurement of nothing. Swept on the decode shape with that fixed:
+        // 1 -> 32.8, 4 -> 46.5, 8 -> 51.1, 16 -> 35.2 t/s, so 8 is the default and
+        // NINFER_TERNARY_GEMV_TILE_UNROLL still overrides it. T >= 3 keeps 4.
+        const int depth = unroll != 0 ? unroll : ((tokens == 1 || tokens == 2) ? 8 : 4);
         const auto launch_tile = [&](auto token_tag, auto unroll_tag) {
             using TokenTag  = decltype(token_tag);
             using UnrollTag = decltype(unroll_tag);
+            const bool wtable = tile_weight_table_enabled();
             if (x.dtype == DType::FP16) {
                 if (fp16_mode2()) {
-                    ternary_pq2_gemv_tile_kernel<TokenTag::value, UnrollTag::value, false, 2>
+                    if (wtable) {
+                        ternary_pq2_gemv_tile_kernel<TokenTag::value, UnrollTag::value, false, 2,
+                                                     kGemvProbeOff, true>
+                            <<<grid, block, 0, stream>>>(
+                                static_cast<const __nv_bfloat16*>(x.data),
+                                static_cast<const std::uint8_t*>(w.qdata),
+                                static_cast<const std::uint8_t*>(w.scales),
+                                static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                                out_row_stride);
+                    } else {
+                        ternary_pq2_gemv_tile_kernel<TokenTag::value, UnrollTag::value, false, 2>
+                            <<<grid, block, 0, stream>>>(
+                                static_cast<const __nv_bfloat16*>(x.data),
+                                static_cast<const std::uint8_t*>(w.qdata),
+                                static_cast<const std::uint8_t*>(w.scales),
+                                static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                                out_row_stride);
+                    }
+                } else if (wtable) {
+                    ternary_pq2_gemv_tile_kernel<TokenTag::value, UnrollTag::value, false, 1,
+                                                 kGemvProbeOff, true>
                         <<<grid, block, 0, stream>>>(
                             static_cast<const __nv_bfloat16*>(x.data),
                             static_cast<const std::uint8_t*>(w.qdata),
@@ -425,7 +485,14 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
         }
         switch (kt) {
         case 1:
-            launch_tile(integral_constant<int, 1>{}, integral_constant<int, 4>{});
+            // The decode shape used to hardcode depth 4 here, which silently ignored
+            // NINFER_TERNARY_GEMV_TILE_UNROLL -- the "unroll is flat at T=1" reading of the sweep
+            // was this line, not a property of the kernel. Default is unchanged (tokens != 2 -> 4).
+            if (depth == 1) { launch_tile(integral_constant<int, 1>{}, integral_constant<int, 1>{}); }
+            else if (depth == 2) { launch_tile(integral_constant<int, 1>{}, integral_constant<int, 2>{}); }
+            else if (depth == 8) { launch_tile(integral_constant<int, 1>{}, integral_constant<int, 8>{}); }
+            else if (depth == 16) { launch_tile(integral_constant<int, 1>{}, integral_constant<int, 16>{}); }
+            else { launch_tile(integral_constant<int, 1>{}, integral_constant<int, 4>{}); }
             break;
         case 16:
             if (depth == 1) { launch_tile(integral_constant<int, 16>{}, integral_constant<int, 1>{}); }
