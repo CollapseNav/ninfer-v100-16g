@@ -4,6 +4,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include <algorithm>
@@ -233,8 +234,21 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, const ::ninfer::ops::SparseMoeHints& hints,
-                         WorkspaceArena& workspace, cudaStream_t stream) {
-    run_sparse_moe(hidden, weights.op, residual, hints, workspace, stream);
+                         WorkspaceArena& workspace, cudaStream_t stream, const Tensor* in_norm,
+                         float norm_eps) {
+    // The shared graph hands the input norm down to this op (the dense target folds it into
+    // rmsnorm_rotate on decode shapes). This MoE variant has no fold to fuse with, so it runs
+    // the same rmsnorm first: same op, same stream position relative to the mixer as before,
+    // and no scope here -- the buffer must live exactly as long as the old graph-level normed
+    // input did (until the caller's mlp scope ends).
+    const Tensor* use = &hidden;
+    Tensor norm_buf;
+    if (in_norm != nullptr) {
+        norm_buf = workspace.alloc(DType::BF16, {hidden.ne[0], hidden.ne[1]});
+        ::ninfer::ops::rmsnorm(hidden, *in_norm, norm_eps, true, norm_buf, stream);
+        use = &norm_buf;
+    }
+    run_sparse_moe(*use, weights.op, residual, hints, workspace, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,

@@ -84,6 +84,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/prepare_masked_block.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
+  ops/launcher/rmsnorm_rotate.cu
   ops/launcher/rmsnorm_pack_tail.cu
   ops/launcher/rope.cu
   ops/launcher/sampling.cu

@@ -321,11 +321,12 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, const ::ninfer::ops::SparseMoeHints&,
-                         WorkspaceArena& workspace, cudaStream_t stream) {
+                         WorkspaceArena& workspace, cudaStream_t stream, const Tensor* in_norm,
+                         float norm_eps) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
-                       stream);
+                       stream, in_norm, norm_eps);
     ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
                     stream);
 }

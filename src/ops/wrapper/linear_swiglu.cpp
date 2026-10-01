@@ -5,6 +5,8 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/ternary/ternary_dispatch.h"
 #include "ops/linear/ternary/ternary_rotation.h"
+#include "ops/launcher/rmsnorm_rotate.h"
+#include "ninfer/ops/rmsnorm.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
@@ -80,7 +82,8 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
 }
 
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
-                   WorkspaceArena& ws, cudaStream_t stream) {
+                   WorkspaceArena& ws, cudaStream_t stream, const Tensor* in_norm,
+                   float norm_eps) {
     validate_policy(policy);
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
@@ -126,6 +129,44 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
 
+    // Fused norm+rotate entry. When the graph hands us the raw residual (in_norm set), the input
+    // rmsnorm and the activation fold happen in ONE launch on the decode-shaped case (t <= 16),
+    // bit-identical to rmsnorm() followed by folded_activation() -- see kernel/ternary_normrotate.cuh
+    // -- and the GEMM runs against that buffer through ternary_dispatch_basis (the folded entry,
+    // which is exactly what ternary_dispatch() does after folding; CUTLASS never admits t <= 16 and
+    // sm_70 never allocates the s8 scratch, so the two are the same call here). NINFER_TERNARY_
+    // NORMROT=1 enables the fusion -- OFF by default because it measures -2.6% (see docs); anything else
+    // falls through to the plain-norm branch, so prefill (t > 16), every
+    // other weight format, and a null in_norm all use that same plain branch, so behaviour without
+    // the fusion is exactly the shipped path (the norm just runs inside this op instead of in the
+    // graph, in the same stream position relative to the GEMM).
+    static const bool normrot_env = [] {
+        const char* env = std::getenv("NINFER_TERNARY_NORMROT");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    if (in_norm != nullptr && normrot_env && ternary_weight && t <= 16 && x.ne[0] == 5120 &&
+        detail::ternary_rotation_enabled() && gate_up_weight.hadamard_signs != nullptr) {
+        auto scope      = ws.scope();
+        Tensor normed_h = ws.alloc(DType::BF16, {5120, t});
+        Tensor folded   = ws.alloc(DType::FP16, {gate_up_weight.k, t});
+        detail::rmsnorm_rotate_launch(x, *in_norm, norm_eps, normed_h, folded,
+                                      gate_up_weight.hadamard_signs, gate_up_weight.hadamard_n_blk,
+                                      gate_up_weight.k, stream);
+        Tensor gate_up = ws.alloc(DType::BF16, {gate_up_weight.n, t});
+        detail::ternary_dispatch_basis(folded, gate_up_weight, gate_up, policy, &ws, stream);
+        const std::int32_t rows = gate_up_weight.n / 2;
+        silu_mul(gate_up.slice(0, 0, rows), gate_up.slice(0, rows, rows), out, stream);
+        return;
+    }
+    Tensor norm_buf;
+    const Tensor* use = &x;
+    if (in_norm != nullptr) {
+        norm_buf = ws.alloc(DType::BF16, {x.ne[0], t});
+        rmsnorm(x, *in_norm, norm_eps, true, norm_buf, stream);
+        use = &norm_buf;
+    }
+
+
     if (ternary_weight) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("ternary linear_swiglu admits only A16");
@@ -136,7 +177,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         // MTP path already does for its W8 gate/up parent.
         auto scope     = ws.scope();
         Tensor gate_up = ws.alloc(DType::BF16, {gate_up_weight.n, t});
-        detail::ternary_dispatch(x, gate_up_weight, gate_up, policy, &ws, stream);
+        detail::ternary_dispatch(*use, gate_up_weight, gate_up, policy, &ws, stream);
         const std::int32_t rows = gate_up_weight.n / 2;
         silu_mul(gate_up.slice(0, 0, rows), gate_up.slice(0, rows, rows), out, stream);
         return;
@@ -144,13 +185,13 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 
     if (fp8_weight) {
         (void)detail::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
-        detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        detail::fp8_linear_swiglu_dispatch(*use, gate_up_weight, out, policy, ws, stream);
         return;
     }
 
     if (nvfp4_weight) {
         (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
-        detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        detail::nvfp4_linear_swiglu_dispatch(*use, gate_up_weight, out, policy, ws, stream);
         return;
     }
 
@@ -163,9 +204,9 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (w8_weight) {
-        detail::w8_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream);
+        detail::w8_linear_swiglu_dispatch(*use, gate_up_weight, out, ws, stream);
     } else {
-        detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream);
+        detail::q4_linear_swiglu_dispatch(*use, gate_up_weight, out, ws, stream);
     }
 }
 

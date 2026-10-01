@@ -95,6 +95,17 @@ void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_of
     }();
     if (probe_skip) { return; }
     detail::rmsnorm_launch(x, weight, eps, unit_offset, z, out, stream);
+    // PROBE (NINFER_TERNARY_PROBE_RMSNORM_ZERO): run the real norm, then overwrite its output
+    // with zeros. Cost is >= control (norm + memset) while the content downstream consumers read
+    // is zeros -- the same class of content the skip arm leaves behind by never writing. This is
+    // the discriminator for the prefill anomaly: fast means content is what makes the skip arms
+    // prefill faster; back at control speed means the content is not the cause. Numerically wrong
+    // by construction; never a default.
+    static const bool probe_zero = [] {
+        const char* env = std::getenv("NINFER_TERNARY_PROBE_RMSNORM_ZERO");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    if (probe_zero) { cudaMemsetAsync(out.data, 0, out.bytes(), stream); }
 }
 
 } // namespace

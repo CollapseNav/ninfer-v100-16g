@@ -28,7 +28,11 @@
 // what becomes an fp16 SUBNORMAL there: 0 = exact zero, 1 = subnormal-after-copy, 2 = < 2^-10,
 // 3 = < 2^-6, 4 = < 1, 5 = >= 1. Armed by NINFER_TERNARY_ROTATE_HIST; a compile-time template
 // argument, so the shipped path carries no code for it.
-__device__ unsigned int kRotationHist[6];
+// static: ternary_rotation_kernels.cuh is reached from more than one translation unit (the
+// split header includes it, and the fused norm+rotate launcher includes that), and a device
+// definition without internal linkage collides at link time. The histogram is only ever
+// written by the launch in ternary_rotation.cu, which binds to this TU's copy.
+static __device__ unsigned int kRotationHist[6];
 
 namespace ninfer::ops::detail {
 namespace {
@@ -97,7 +101,8 @@ __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
                                            void* __restrict__ out,
                                            const float* __restrict__ signs, int n_blk, int k,
                                            int tokens, int perm_hd, int perm_nk, int perm_rep,
-                                           int inverse) {
+                                           int inverse,
+                                           int store_probe = 0) {
     // blockDim, not the kWarpsPerBlock constant: this kernel is one warp per (1024-block, token)
     // pair, so the grid is tiny and fixed by the data -- k=5120 at T=3 is 15 warps total. Packing
     // them 8 to a block puts the whole launch on two SMs out of 66 and exposes the full latency of
@@ -153,6 +158,39 @@ __global__ void ternary_rotate_bf16_kernel(const __nv_bfloat16* __restrict__ x,
         for (int r = 0; r < 32; ++r) {
             const float value = __fmul_rn(values[r], signs_row[r * 32 + lane]);
             store_at((block << 10) + r * 32 + lane, value);
+        }
+    } else if (store_probe != 0) {
+        // PROBE (NINFER_TERNARY_ROTATE_STORE=zero|one): the transform still runs, so
+        // this arm costs the same as shipped -- only the CONTENT every consumer reads
+        // changes. Uniform branch outside the loop, so the shipped path is untouched.
+        if (store_probe == 4) {
+            // flush: keep real variation and every normal value, but snap the 0.23% that
+            // would land below fp16 normal range (|v| < 2^-14) to exactly zero. Fast here
+            // means a one-line fix (flush tiny values at the panel copy) reclaims the
+            // prefill time; slow means the slow feature is broader smallness, which no
+            // harmless change can remove.
+#pragma unroll
+            for (int r = 0; r < 32; ++r) {
+                const float v = values[r];
+                const float a = fabsf(v);
+                store_at((block << 10) + r * 32 + lane,
+                         a < 6.103515625e-05f ? 0.0f : v);
+            }
+        } else if (store_probe == 3) {
+            // scale: keep the real VARIATION but shift every magnitude 10 bits up, so the
+            // fp16 panel is far from the subnormal range. Fast would mean the slow feature
+            // of real data is magnitude (and dropping tiny values would reclaim the time);
+            // slow would mean variation itself, which no real input can avoid.
+#pragma unroll
+            for (int r = 0; r < 32; ++r) {
+                store_at((block << 10) + r * 32 + lane, values[r] * 1024.0f);
+            }
+        } else {
+            const float subv = store_probe == 1 ? 0.0f : 1.0f;
+#pragma unroll
+            for (int r = 0; r < 32; ++r) {
+                store_at((block << 10) + r * 32 + lane, subv);
+            }
         }
     } else {
         unsigned hist_local[6] = {0, 0, 0, 0, 0, 0};

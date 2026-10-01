@@ -1003,11 +1003,12 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph,
                            const ops::SparseMoeHints& hints) {
     cudaStream_t s = ctx_.stream;
-    const int T    = x.ne[1];
-    Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
-    ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
+    // The input norm moved down into post_mixer -> linear_swiglu: on decode shapes with the
+    // ternary gate/up weight it folds as rmsnorm_rotate (one launch instead of norm + fold,
+    // bit-identical); every other case runs the same rmsnorm from inside the op, in the same
+    // stream position relative to the GEMM as before.
 
-    Variant::post_mixer(h, *m.payload, x, ph, hints, work_, s);
+    Variant::post_mixer(x, *m.payload, x, ph, hints, work_, s, post_norm, kCfg.rms_eps);
 }
 
 template <class Tap>

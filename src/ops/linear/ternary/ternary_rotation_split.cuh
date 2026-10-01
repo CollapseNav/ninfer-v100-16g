@@ -56,34 +56,24 @@ __device__ __forceinline__ void split_store(void* out, std::int64_t index, float
     }
 }
 
-template <bool kFp16Out = false>
-__global__ void ternary_rotate_bf16_split_kernel(const __nv_bfloat16* __restrict__ x,
-                                                 void* __restrict__ out,
-                                                 const float* __restrict__ signs, int n_blk, int k,
-                                                 int tokens) {
+// The split transform itself, factored out so the fused norm+rotate kernel runs EXACTLY this
+// code on exactly the same values: same uint4/x and float4/signs loads, same ten stages in
+// global bit order 0..9, same __fadd_rn/__fsub_rn rounding, same 2^-5 normalizer -- so both
+// callers are bit-identical to each other and to the one-warp kernel. `exchange` is the
+// caller's shared staging for the two stages that leave the warp (global bits 8-9); `role` is
+// the calling warp's position 0..3 within the four-warp group that owns one D1024.
+template <bool kFp16Out>
+__device__ __forceinline__ void split_transform_unit(
+    const __nv_bfloat16* x_ptr, void* out, const float* signs_ptr,
+    float (&exchange)[kSplitWarps][32][kSplitElems], int lane, int role,
+    std::int64_t out_base) {
     constexpr unsigned FullMask = 0xffffffffu;
-
-    const int lane   = static_cast<int>(threadIdx.x) & (kThreadsPerWarp - 1);
-    const int unit   = static_cast<int>(threadIdx.x) >> 5; // 0..3 -> global bits 8..9
-    const int blocks = k >> 10;                            // D1024 blocks per token
-    const int token  = static_cast<int>(blockIdx.x) / blocks;
-    const int block  = static_cast<int>(blockIdx.x) % blocks;
-
-    const std::int64_t token_base = static_cast<std::int64_t>(token) * k;
-    const int unit_base           = (block << 10) + (unit << 8);
-    const int element             = unit_base + (lane << 3);
-
-    // x is [k, tokens] TOKEN-major (ne[0] = k is the contiguous axis), so the row is token*k; the
-    // signs are per D1024 block and carry no token dimension.
-    const __nv_bfloat16* const x_row = x + token_base + element;
-    const float* const signs_row =
-        signs + static_cast<std::int64_t>(block % n_blk) * kBlockSize + (unit << 8) + (lane << 3);
-
+    const int unit = role;
     // 8 bf16 in 16 B, 8 fp32 signs in 32 B: three vector loads where the one-warp kernel needs 64
     // scalar ones. Both addresses are 16 B aligned by construction (unit*256 and lane*8).
-    const uint4 raw_x   = *reinterpret_cast<const uint4*>(x_row);
-    const float4 raw_s0 = *reinterpret_cast<const float4*>(signs_row);
-    const float4 raw_s1 = *reinterpret_cast<const float4*>(signs_row + 4);
+    const uint4 raw_x   = *reinterpret_cast<const uint4*>(x_ptr);
+    const float4 raw_s0 = *reinterpret_cast<const float4*>(signs_ptr);
+    const float4 raw_s1 = *reinterpret_cast<const float4*>(signs_ptr + 4);
 
     const unsigned halves[4] = {raw_x.x, raw_x.y, raw_x.z, raw_x.w};
     const float sgn[8]       = {raw_s0.x, raw_s0.y, raw_s0.z, raw_s0.w,
@@ -131,8 +121,7 @@ __global__ void ternary_rotate_bf16_split_kernel(const __nv_bfloat16* __restrict
     // its 8 values, then rounds stage bit8 (pair unit^1) and stage bit9 (pair unit^2) in that
     // order, reading all four raw values so both intermediates are computed here and rounded the
     // same way the sequential kernel would round them.
-    __shared__ float exchange[kSplitWarps][32][kSplitElems];
-#pragma unroll
+    #pragma unroll
     for (int j = 0; j < kSplitElems; ++j) { exchange[unit][lane][j] = values[j]; }
     __syncthreads();
 
@@ -153,8 +142,36 @@ __global__ void ternary_rotate_bf16_split_kernel(const __nv_bfloat16* __restrict
     // 2^-5 = 1/sqrt(1024), the same normalizer as the one-warp kernel.
 #pragma unroll
     for (int j = 0; j < kSplitElems; ++j) {
-        split_store<kFp16Out>(out, token_base + element + j, __fmul_rn(values[j], 0x1p-5f));
+        split_store<kFp16Out>(out, out_base + j, __fmul_rn(values[j], 0x1p-5f));
     }
+}
+
+template <bool kFp16Out = false>
+__global__ void ternary_rotate_bf16_split_kernel(const __nv_bfloat16* __restrict__ x,
+                                                 void* __restrict__ out,
+                                                 const float* __restrict__ signs, int n_blk, int k,
+                                                 int tokens) {
+    constexpr unsigned FullMask = 0xffffffffu;
+
+    const int lane   = static_cast<int>(threadIdx.x) & (kThreadsPerWarp - 1);
+    const int unit   = static_cast<int>(threadIdx.x) >> 5; // 0..3 -> global bits 8..9
+    const int blocks = k >> 10;                            // D1024 blocks per token
+    const int token  = static_cast<int>(blockIdx.x) / blocks;
+    const int block  = static_cast<int>(blockIdx.x) % blocks;
+
+    const std::int64_t token_base = static_cast<std::int64_t>(token) * k;
+    const int unit_base           = (block << 10) + (unit << 8);
+    const int element             = unit_base + (lane << 3);
+
+    // x is [k, tokens] TOKEN-major (ne[0] = k is the contiguous axis), so the row is token*k; the
+    // signs are per D1024 block and carry no token dimension.
+    const __nv_bfloat16* const x_row = x + token_base + element;
+    const float* const signs_row =
+        signs + static_cast<std::int64_t>(block % n_blk) * kBlockSize + (unit << 8) + (lane << 3);
+
+    __shared__ float exchange[kSplitWarps][32][kSplitElems];
+    split_transform_unit<kFp16Out>(x_row, out, signs_row, exchange, lane, unit,
+                                   token_base + element);
 }
 
 // PROBE: the split-shaped twin of the one-warp copy probe -- same grid, same uint4 read, same

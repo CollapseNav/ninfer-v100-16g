@@ -71,7 +71,8 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   state side effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
-                   WorkspaceArena& ws, cudaStream_t stream);
+                   WorkspaceArena& ws, cudaStream_t stream,
+                   const Tensor* in_norm = nullptr, float norm_eps = 0.0f);
 
 /**
  * A16-only convenience form. Q4/W8 and row-scaled FP8 retain their complete positive-T domain.

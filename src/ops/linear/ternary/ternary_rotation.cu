@@ -111,6 +111,24 @@ bool rotation_hist_enabled() {
     return value;
 }
 
+// NINFER_TERNARY_ROTATE_STORE=zero|one replaces what the forward rotation stores (the
+// transform still executes, so cost is unchanged; every consumer -- the CUTLASS arm
+// above all -- then reads the constant instead of the real activation). Prefill-only in
+// practice: only the plain bf16 launch passes it.
+int rotation_store_probe() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_ROTATE_STORE");
+        if (env == nullptr) { return 0; }
+        const std::string text(env);
+        if (text == "zero") { return 1; }
+        if (text == "one") { return 2; }
+        if (text == "scale") { return 3; }
+        if (text == "flush") { return 4; }
+        return 0;
+    }();
+    return value;
+}
+
 } // namespace
 
 void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
@@ -198,7 +216,7 @@ void launch_ternary_rotation(const Tensor& x, Tensor& out, const Weight& weight,
     } else {
         ternary_rotate_bf16_kernel<false><<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), out.data, weight.hadamard_signs,
-            weight.hadamard_n_blk, weight.k, x.ne[1], perm_hd, perm_nk, perm_rep, /*inverse=*/0);
+            weight.hadamard_n_blk, weight.k, x.ne[1], perm_hd, perm_nk, perm_rep, /*inverse=*/0, rotation_store_probe());
     }
     CUDA_CHECK(cudaGetLastError());
 }

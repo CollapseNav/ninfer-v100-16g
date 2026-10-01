@@ -98,7 +98,8 @@ struct Variant {
                                             DeviceExecutionView execution);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, const ::ninfer::ops::SparseMoeHints& hints,
-                           WorkspaceArena& workspace, cudaStream_t stream);
+                           WorkspaceArena& workspace, cudaStream_t stream,
+                           const Tensor* in_norm = nullptr, float norm_eps = 0.0f);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 
