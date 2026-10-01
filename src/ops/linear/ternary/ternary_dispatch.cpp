@@ -95,12 +95,14 @@ void ternary_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolic
     const Tensor activation = folded_activation(x, w, *workspace, stream);
 
     // A QPN-prepacked weight may only be consumed by the QPN kernel; the SIMT and CUTLASS routes
-    // read the row-major plane. Fail loudly instead of computing on permuted bytes.
+    // read the row-major plane. Fail loudly instead of computing on permuted bytes. (Nothing
+    // prepacks PQ2 any more -- see the note in the load bindings -- so this is a guard against a
+    // future revival of `ternary_prepack_qpn`, not an active path.)
     if (ternary_qpn_is_prepacked(w.qdata) &&
         !(ternary_qpn_enabled() && ternary_volta_qpn_supported(w.n, w.k, activation.ne[1]))) {
         throw std::invalid_argument(
             "ternary linear: QPN-prepacked weights reached a non-QPN route (token count outside "
-            "1..16 or the route disabled); rerun with NINFER_TERNARY_QPN=0 or a shorter prompt");
+            "the QPN band or the route disabled); rerun with NINFER_TERNARY_QPN=0");
     }
 
     // The CUTLASS arm sits ahead of the token-tile schedules because it is a whole-GEMM entry point
@@ -114,10 +116,12 @@ void ternary_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolic
         return;
     }
 
-    // QPN tensor-core decode (experiment, NINFER_TERNARY_QPN=0 disables it). PQ2 packs four
-    // CONSECUTIVE k into one code byte -- exactly one mma k=4 slice in natural order -- so this
-    // route needs no activation permutation at all, unlike the NVFP4 sibling. It covers the
-    // decode/verify band (t <= 16) and falls through to the SIMT tile route everywhere else.
+    // QPN tensor-core verify (NINFER_TERNARY_QPN=0 disables it). PQ2 packs four CONSECUTIVE k into
+    // one code byte -- exactly one mma k=4 slice in natural order -- so this route needs no
+    // activation permutation at all, unlike the NVFP4 sibling. It owns the wide-verify band
+    // (6 <= t <= 32, where the tensor-core sweep's flat cost beats the SIMT tile's per-token slope)
+    // and falls through to the SIMT tile everywhere else; `ternary_volta_qpn_supported` carries the
+    // measured crossover table.
     if (ternary_qpn_enabled() && ternary_volta_qpn_supported(w.n, w.k, activation.ne[1])) {
         launch_ternary_volta_qpn(activation, w, out, w.n, stream);
         return;

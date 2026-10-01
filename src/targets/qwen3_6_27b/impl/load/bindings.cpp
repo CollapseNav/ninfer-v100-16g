@@ -240,10 +240,13 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
         if (prepack_for_qpn && out.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
             ::ninfer::ops::detail::fp8_prepack_qpn_sm70(out);
         }
-        if (prepack_for_qpn && out.qtype == QType::PQ2_0_G128 &&
-            ::ninfer::ops::detail::ternary_qpn_enabled()) {
-            ::ninfer::ops::detail::ternary_prepack_qpn(out);
-        }
+        // PQ2 is deliberately NOT prepacked. The ternary QPN kernel reads the artifact's own
+        // row-major plane: its lane owns an output row, and that row's whole 32-byte code group is
+        // contiguous, so two uint4 loads per lane already fetch one fully-used sector each -- the
+        // permutation would buy nothing and would make the fused MMA (T = 32..255) and the CUTLASS
+        // dequant pass (T >= 256) read permuted bytes, i.e. it would have to be taught to three
+        // more readers to unblock a route that does not need it. `ternary_prepack_qpn` and the
+        // dispatcher's guard stay in the tree, unused, as the record of the parked alternative.
 #else
         (void)prepack_for_qpn;
 #endif

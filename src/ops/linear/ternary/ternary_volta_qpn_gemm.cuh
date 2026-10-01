@@ -107,11 +107,21 @@ void ternary_volta_qpn_gemm_kernel(const std::uint8_t* __restrict__ codes,
     const int g0     = warp * gq;
     const int gend   = (warp == SPLITK - 1) ? groups : g0 + gq;
 
-    // Row-major code plane: k/4 bytes per output row. Row-major scale plane: one fp16 per group.
-    // QPN-prepacked plane (ternary_prepack_qpn): entry (tile, group, lane) holds the whole
-    // 32-byte code group of that output row followed by its 2-byte scale, so a warp fetches one
-    // contiguous 1 KB block per group instead of 32 scattered rows. Production layout upstream.
-    const std::int64_t tile_base = static_cast<std::int64_t>(blockIdx.x) * groups * 32 + lane;
+    // Row-major code plane: k/4 code bytes per output row, one 32-byte group per (row, group), and
+    // that group is contiguous. Row-major scale plane: one fp16 per group.
+    //
+    // The whole fetch is therefore two 16-byte loads per lane -- one 32-byte sector, fully used.
+    // That is the point of this reader and the reason the load-time prepack is not used: a lane here
+    // owns an output ROW, so a warp's 32 lanes read 32 different rows k/4 bytes apart, and a NARROW
+    // load of the same bytes fans out to 32 sectors per instruction. The first version of this
+    // kernel read the group four bytes at a time and lost 37% end to end for exactly that reason.
+    // Vectorised, the row pattern is worth 98.5% of a flat uint4 stream (measured, "wider code
+    // reads" above), so permuting the plane into tile order -- which would force three more readers
+    // to learn a new index -- buys nothing that two uint4 loads do not already buy. See the note on
+    // the parked prepack in ternary_volta_qpn_gemm.h.
+    const std::int64_t row_off = static_cast<std::int64_t>(use_col) * groups * S::kCodeBytesPerGroup;
+    const std::uint16_t* const scale_row =
+        reinterpret_cast<const std::uint16_t*>(scales) + static_cast<std::int64_t>(use_col) * groups;
 
     float c[kTiles][NACC][8];
 #pragma unroll
@@ -124,14 +134,16 @@ void ternary_volta_qpn_gemm_kernel(const std::uint8_t* __restrict__ codes,
     }
 
     for (int st = g0; st < gend; ++st) {
-        const std::int64_t packed_index = tile_base + static_cast<std::int64_t>(st) * 32;
-        const half2 sc2 = __half2half2(
-            __ushort_as_half(reinterpret_cast<const std::uint16_t*>(scales)[packed_index]));
-        const std::uint8_t* cp = codes + packed_index * S::kCodeBytesPerGroup;
+        const half2 sc2 = __half2half2(__ushort_as_half(scale_row[st]));
+        const std::uint8_t* cp =
+            codes + row_off + static_cast<std::int64_t>(st) * S::kCodeBytesPerGroup;
+        const uint4 lo = *reinterpret_cast<const uint4*>(cp);
+        const uint4 hi = *reinterpret_cast<const uint4*>(cp + 16);
+        const std::uint32_t words[S::kUnitsPerGroup] = {lo.x, lo.y, lo.z, lo.w,
+                                                        hi.x, hi.y, hi.z, hi.w};
 #pragma unroll
         for (int u = 0; u < S::kUnitsPerGroup; ++u) {
-            const std::uint32_t word = *reinterpret_cast<const std::uint32_t*>(
-                cp + static_cast<std::int64_t>(u) * S::kBytesPerUnit);
+            const std::uint32_t word = words[u];
             half2 b[8];
             pq2_decode_byte(static_cast<std::uint8_t>(word & 0xFFu), sc2, &b[0]);
             pq2_decode_byte(static_cast<std::uint8_t>((word >> 8) & 0xFFu), sc2, &b[2]);

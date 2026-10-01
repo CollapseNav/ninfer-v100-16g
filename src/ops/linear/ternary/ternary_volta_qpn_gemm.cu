@@ -20,6 +20,12 @@ namespace ninfer::ops::detail {
 
 namespace {
 
+// SPLITK. The sibling NVFP4 kernel calls 8 the production floor, and the reason is parallelism
+// rather than the K-split itself: one CTA covers only 32 output rows, so the grid is n/32 (160 CTAs
+// for n = 5120) and at SPLITK = 4 that is 8 warps per SM -- nowhere near enough to hide a weight
+// stream's latency. Every width in this model has a group count divisible by 8 (40, 48, 80, 136).
+constexpr int kTernaryQpnSplitk = 8;
+
 // [n, t] with n contiguous per token, bf16, honouring the caller's row stride.
 struct TernaryBf16Output {
     __nv_bfloat16* data;
@@ -32,10 +38,13 @@ struct TernaryBf16Output {
 
 template <int kTiles, class Activation>
 void launch_shape(const Tensor& x, const Weight& w, Tensor& out, std::int32_t out_row_stride,
-                  cudaStream_t stream) {
+                   cudaStream_t stream) {
     using S = TernaryVoltaQpnSchedule;
-    constexpr int kSplitk = 4;
-    constexpr int kNacc   = 1;
+    constexpr int kSplitk = kTernaryQpnSplitk;
+    // One accumulator per k-slice of a 16-k unit would break the mma RAW chain (the sibling kernels'
+    // NACC knob), but four accumulators per tile is 32 registers per live tile and kTiles goes to 4;
+    // with more than one tile the tiles are already independent, which is the same ILP for free.
+    constexpr int kNacc   = kTiles == 1 ? 4 : 1;
     const int n = w.n;
     const unsigned grid = static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta);
     ternary_volta_qpn_gemm_kernel<kTiles, kSplitk, kNacc, TernaryBf16Output, Activation>
@@ -123,10 +132,15 @@ bool ternary_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t)
 #ifdef NINFER_VOLTA_BUILD
     if (n <= 0 || k <= 0 || t <= 0) { return false; }
     if ((k % TernaryVoltaQpnSchedule::kGroupK) != 0) { return false; }
-    // SPLITK = 4 warps split K by whole groups, and every warp must get at least one.
-    if ((k / TernaryVoltaQpnSchedule::kGroupK) % 4 != 0) { return false; }
-    // Two 8-token tiles is the whole verify/lookup band this route targets.
-    return t <= 2 * TernaryVoltaQpnSchedule::kRowsPerTile;
+    // SPLITK warps split K by whole groups, and every warp must get at least one.
+    if ((k / TernaryVoltaQpnSchedule::kGroupK) % kTernaryQpnSplitk != 0) { return false; }
+    // T = 1 is deliberately not on this route: the kernel's A tile is eight tokens tall whatever T
+    // is, so one token runs the whole mma schedule with seven eighths of M dead and one CTA per 32
+    // output rows. Measured 32.6 t/s against the block GEMV's 49.8 on the parked configuration.
+    // The verify band above it is still a LOSS at this commit (T = 2 by 47%, T = 3 by 21%); the
+    // band gate and the measured crossover table land in the next commit.
+    if (t < 2) { return false; }
+    return t <= 4 * TernaryVoltaQpnSchedule::kRowsPerTile;
 #else
     (void)n;
     (void)k;
@@ -141,11 +155,15 @@ void launch_ternary_volta_qpn(const Tensor& x, const Weight& w, Tensor& out,
     const int tiles = (x.ne[1] + TernaryVoltaQpnSchedule::kRowsPerTile - 1) /
                       TernaryVoltaQpnSchedule::kRowsPerTile;
     if (x.dtype == DType::FP16) {
-        if (tiles <= 1) { launch_shape<1, half>(x, w, out, out_row_stride, stream); }
-        else            { launch_shape<2, half>(x, w, out, out_row_stride, stream); }
+        if (tiles <= 1)      { launch_shape<1, half>(x, w, out, out_row_stride, stream); }
+        else if (tiles == 2) { launch_shape<2, half>(x, w, out, out_row_stride, stream); }
+        else if (tiles == 3) { launch_shape<3, half>(x, w, out, out_row_stride, stream); }
+        else                 { launch_shape<4, half>(x, w, out, out_row_stride, stream); }
     } else {
-        if (tiles <= 1) { launch_shape<1, __nv_bfloat16>(x, w, out, out_row_stride, stream); }
-        else            { launch_shape<2, __nv_bfloat16>(x, w, out, out_row_stride, stream); }
+        if (tiles <= 1)      { launch_shape<1, __nv_bfloat16>(x, w, out, out_row_stride, stream); }
+        else if (tiles == 2) { launch_shape<2, __nv_bfloat16>(x, w, out, out_row_stride, stream); }
+        else if (tiles == 3) { launch_shape<3, __nv_bfloat16>(x, w, out, out_row_stride, stream); }
+        else                 { launch_shape<4, __nv_bfloat16>(x, w, out, out_row_stride, stream); }
     }
 #else
     (void)x;
