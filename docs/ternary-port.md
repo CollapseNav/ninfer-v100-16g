@@ -1623,6 +1623,46 @@ kernel is at full occupancy). (4) cheapening the draft stack, which is W8 with a
 2-bit target and costs 6.6% of a round. (5) model-side: recalibrating the draft head against the
 quantized target is the only path to a large acceptance gain, and it is not an engine change.
 
+## PQ2 tensor-core (QPN) route: ported, measured, and parked (2026-10-01)
+
+Ported the fifth sibling of q4/w8/fp8/nvfp4_volta_qpn_gemm for the 2-bit ternary format: a CTA owns
+32 output rows and an 8-token A tile (kTiles of them), SPLITK warps split K, and one barrier at the
+end serves the cross-warp reduce. PQ2's packing makes it simpler than NVFP4: one code byte holds
+four CONSECUTIVE k, i.e. exactly one mma k=4 slice in natural order, so no activation byte_perm
+(nvfp4_stage_pairs) is needed and both operands contract the matching k unchanged.
+
+Correctness: with the row-major code plane the route produces **byte-identical output text** to the
+SIMT path on the prompts tried (base and K=1 arms), so fp16 weight decode plus tensor-core
+accumulation is a drop-in numerically.
+
+Speed, with a correct control (`NINFER_TERNARY_QPN=0` against `=1`, same prompt, same max-new):
+**45.9 -> 28.9 tok/s, -37%**. Cause found in the nvprof rollup: in QPN form a lane maps to an OUTPUT
+COLUMN, so a warp's 32 lanes read 32 different output rows' code bytes -- k/4 bytes apart -- using
+4 bytes of every 128-byte line. The SIMT tile kernel reads one coalesced 32-byte span per warp.
+
+Upstream's answer, found in their own tree: they ship two kernels and production uses the
+load-time-prepacked one (`nvfp4_prepack_sm70` permutes code and scale planes in place into
+`[n/32][group][lane][32B]` and sets `VoltaQpnPrepacked`), which makes a warp's fetch contiguous.
+That is implemented here as `ternary_prepack_qpn` plus the prepacked read, also defaulted off.
+
+It cannot be enabled yet, and the reason is structural rather than textual: after an in-place
+prepack the row-major plane is gone, but prefill necessarily runs at t = chunk >= 128, and every
+prefill reader (fused MMA dequant, CUTLASS dequant, block GEMV for t = 5..31) streams rows. Upstream
+can adopt the layout globally because -- their words -- "wide prefill recognizes them and
+reconstructs FP16 for its tensor-core GEMM", i.e. their prefill read is a gather anyway. Ours would
+have to be adapted (~2-300 lines across three kernels). Flipping the plane per phase instead is ruled
+out by CUDA-graph replay: the decode path replays a captured graph and never calls the dispatcher, so
+the flip back has no reliable trigger.
+
+Parked with the dispatcher's prepacked guard active, so a prepacked weight reaching a non-QPN route
+throws instead of computing on permuted bytes. Resume criterion: once the readers are adapted, the
+QPN band (t = 2..16) has to beat the SIMT tile clearly, or the 441-637 GB/s upstream reports for this
+kernel is not reachable here and the route should be deleted.
+
+A measurement error worth recording: an earlier A/B reported the two routes as identical because the
+"off" arm was passed `NINFER_TERNARY_QPN=off`, and the check only treats `0` as disabled -- so both
+arms ran QPN. The corrected control is the `0`-versus-`1` pair above.
+
 ## What was deliberately not ported
 
 * The four author tensor-core schedules (`ternary_rowsplit_mma`, `_mma_small_t`, `_mma_wide_t`,

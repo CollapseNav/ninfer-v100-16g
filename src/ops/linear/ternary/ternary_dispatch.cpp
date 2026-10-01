@@ -12,6 +12,7 @@
 #include "ops/linear/ternary/ternary_cutlass_sm70.h"
 #include "ops/linear/ternary/ternary_rotation.h"
 #include "ops/linear/ternary/ternary_rowsplit_storage.cuh"
+#include "ops/linear/ternary/ternary_volta_qpn_gemm.h"
 
 #include <stdexcept>
 #include <string>
@@ -93,6 +94,15 @@ void ternary_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolic
     auto scope              = workspace->scope();
     const Tensor activation = folded_activation(x, w, *workspace, stream);
 
+    // A QPN-prepacked weight may only be consumed by the QPN kernel; the SIMT and CUTLASS routes
+    // read the row-major plane. Fail loudly instead of computing on permuted bytes.
+    if (ternary_qpn_is_prepacked(w.qdata) &&
+        !(ternary_qpn_enabled() && ternary_volta_qpn_supported(w.n, w.k, activation.ne[1]))) {
+        throw std::invalid_argument(
+            "ternary linear: QPN-prepacked weights reached a non-QPN route (token count outside "
+            "1..16 or the route disabled); rerun with NINFER_TERNARY_QPN=0 or a shorter prompt");
+    }
+
     // The CUTLASS arm sits ahead of the token-tile schedules because it is a whole-GEMM entry point
     // rather than one of them: it dequantises the weight chunk to fp16 once and then runs the
     // CUTLASS sm70 tensor-op GEMM, which measures 94-100 TFLOP/s on this model's shapes against the
@@ -101,6 +111,15 @@ void ternary_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolic
     // to `launch` below. It takes its own fp16 copy of the activation; see the header.
     if (ternary_cutlass_sm70_admits(w, activation.ne[1])) {
         ternary_cutlass_sm70_launch(activation, w, out, w.n, *workspace, stream);
+        return;
+    }
+
+    // QPN tensor-core decode (experiment, NINFER_TERNARY_QPN=0 disables it). PQ2 packs four
+    // CONSECUTIVE k into one code byte -- exactly one mma k=4 slice in natural order -- so this
+    // route needs no activation permutation at all, unlike the NVFP4 sibling. It covers the
+    // decode/verify band (t <= 16) and falls through to the SIMT tile route everywhere else.
+    if (ternary_qpn_enabled() && ternary_volta_qpn_supported(w.n, w.k, activation.ne[1])) {
+        launch_ternary_volta_qpn(activation, w, out, w.n, stream);
         return;
     }
 

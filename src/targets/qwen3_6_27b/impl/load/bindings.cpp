@@ -4,6 +4,7 @@
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#include "ops/linear/ternary/ternary_volta_qpn_gemm.h"
 #endif
 
 #include <algorithm>
@@ -238,6 +239,10 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
         // keep its checkpoint layout.
         if (prepack_for_qpn && out.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
             ::ninfer::ops::detail::fp8_prepack_qpn_sm70(out);
+        }
+        if (prepack_for_qpn && out.qtype == QType::PQ2_0_G128 &&
+            ::ninfer::ops::detail::ternary_qpn_enabled()) {
+            ::ninfer::ops::detail::ternary_prepack_qpn(out);
         }
 #else
         (void)prepack_for_qpn;
