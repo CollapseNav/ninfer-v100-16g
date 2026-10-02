@@ -199,3 +199,60 @@ python3 /root/sass_dump.py <obj.o> tile_kernelILi1ELi8ELb0ELi1ELi0ELi0ELi1E 40
 
 Raw data on the host: `/root/ninfer_ab/qpn3/{v,f,x,head}` (round 1), `/root/ninfer_ab/dec{1,2,3,4,5}`
 and `/root/nvp_t1/t1.txt` (round 2), `/root/ppl_qpn/` (the perplexity band check).
+
+---
+
+## Round 3 — the tail: ~1300 kernel launches per token, and it is ~all fixed cost
+
+Per-token launch counts in the decode window (85448 kernels in the capture, ~1300/token):
+
+| family | launches/token | kernels |
+|---|---:|---|
+| ternary GEMV (T = 1) | 413 | `ternary_pq2_gemv_tile_kernel` |
+| ternary rotation | 261 | `ternary_rotation` (one warp per D1024 block) |
+| elementwise | 234 | `residual_add_bf16x8` 130, `silu_and_mul` 65, `sigmoid_gate_mul` 16, `rope_fixed` 16 |
+| norm | 180 | `rmsnorm_cta_bf16x2` 131, `rmsnorm_warp_bf16x2` 49 |
+| GDN | ~195 | `recurrent_batch_update` 49, `gdn_gating_proj` 49, `gdn_projected_conv` 49, `recurrent_bf16_direct` 1.5 |
+| attention | 12 | `causal_attention_small_t_tc_volta_partial_i8` + reduce |
+
+**The proof that the tail is launch cost and not data cost**: the same capture holds one prefill
+(85 tokens of data) and 64 decode steps (1 token), so every kernel appears at both sizes.
+
+| kernel | decode | decode µs | prefill | prefill µs | data ratio |
+|---|---|---:|---|---:|---:|
+| `rmsnorm_cta_bf16x2` | grid(1), 256 thr | 6.04 | grid(83), 256 thr | 5.27 | **83x** |
+| `residual_add_bf16x8` | grid(3), 256 thr | 3.42 | grid(208), 256 thr | 6.44 | 70x |
+| `residual_add_bf16x8` | -- | -- | grid(5), 256 thr | 2.78 | floor |
+| `rmsnorm_warp_bf16x2` | grid(6), 128 thr | 3.71 | grid(498), 128 thr | 4.84 | **83x** |
+| `rmsnorm_warp_bf16x2` | grid(1), 128 thr | 2.24 | grid(83), 128 thr | 2.39 | floor |
+| `ternary_rotation` | grid(5), 128 thr | 4.89 | grid(63), 256 thr | 12.37 | ~13x |
+| `rope_fixed` | grid(1), 896 thr | 3.95 | grid(83), 256 thr | 4.79 | 83x |
+
+83x the data costs 0.87x the time, and 498 CTAs cost the same as 83: **these kernels' marginal
+data cost is ~zero and their whole duration is the launch ramp plus one memory round trip plus the
+block reduction.** The floor measured at the smallest geometries is 1.9-2.8 µs (nvprof; the
+documented nvprof inflation for this class is ~2x, so ~1-1.4 µs real). Tuning what a tail kernel
+computes can therefore not buy anything: at `grid(1)` it is already doing a single round trip.
+
+What this implies for decode speed:
+
+* **The only lever on the tail is the number of launches.** ~890 of the 1300 launches per token are
+  tail kernels at a ~1-1.4 µs floor, i.e. ~0.9-1.2 ms/token that cannot be removed without removing
+  the launches, on top of ~1.4 ms of above-floor cost that a good fusion could also reach. The
+  addressable prize is therefore **~1-1.5 ms of the 19.4 ms step, 5-8%**, and it is collected by
+  epilogue fusion: `residual_add` (130/token) and `silu_and_mul` (65/token) are elementwise
+  consumers of a tensor the preceding GEMV just produced, so each can in principle be folded into
+  that producer's epilogue. Cost: a real refactor across the model impl, every linear op growing an
+  optional epilogue.
+* **A naive fusion loses.** This tree has tried exactly one (norm+rotation, bit-identical) and it
+  measured -2.0/-2.6%: the fused kernel serialised two phases behind a barrier and paid more than
+  it saved. A fusion only pays if it deletes a launch without adding a synchronisation point.
+* **Overlapping the tail with the GEMV is not available.** The decode is a strict chain
+  (norm -> rotate -> projections -> attention -> MLP -> residual), and the only siblings are the
+  attention input projections, which this engine already fuses into one op. The GEMV also runs at
+  82% of its own issue ceiling, so there are few issue slots to lend.
+
+So round 3 closes item 1 with a negative: the tail is not a kernel-tuning target. It is a launch
+count target, worth 5-8%, and it needs an engine refactor rather than a kernel rewrite — which puts
+it behind the other open item in value-per-risk, the block-cooperative code-plane stage for the
+GEMV itself (worth up to ~15% of the step, one kernel, no engine change).
