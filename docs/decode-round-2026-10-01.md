@@ -256,3 +256,48 @@ So round 3 closes item 1 with a negative: the tail is not a kernel-tuning target
 count target, worth 5-8%, and it needs an engine refactor rather than a kernel rewrite — which puts
 it behind the other open item in value-per-risk, the block-cooperative code-plane stage for the
 GEMV itself (worth up to ~15% of the step, one kernel, no engine change).
+
+---
+
+## Round 4 — staging the T = 1 code plane per warp: **+3.9% decode, bit-identical**
+
+The shipped T = 1 GEMV reads one code byte per lane per group, so eight groups cost the warp eight
+32-byte loads (one sector each), each a separate DRAM latency sitting on the decode's dependency
+chain, plus eight 16-bit scale loads. This round stages eight groups at a time instead:
+
+* one 64-bit load per lane covers the block's whole 256-byte code span (eight sectors in a single
+  instruction) into a **private per-warp shared buffer**;
+* the block's eight scales come from one broadcast 128-bit load instead of eight 16-bit ones;
+* the **next** block's span is issued before the current block's inner loop, so its DRAM latency
+  overlaps eight groups of decode and dot (software pipeline).
+
+Only `__syncwarp()` is involved: the eight warps of a block keep private buffers, so no block barrier
+is added -- which matters, because the one fusion this tree has tried (norm+rotation, bit-identical)
+lost 2.0-2.6% to exactly that.
+
+| arm | real_task, 96 tokens | 4.4k real_code | lookup10 K = 7 |
+|---|---:|---:|---:|
+| shipped (no staging) | 51.5 / 51.6 / 51.5 | 49.7 | 123.6 |
+| staged load, no pipeline | 52.6 / 52.7 | -- | -- |
+| **staged + software pipeline** | **53.5 / 53.5** | **51.7** | 123.4 |
+
+**+3.9%** on the decode step, and the output is byte-identical on all three workloads; the 96-token
+greedy md5 against `/root/wt/base.out` is IDENTICAL with staging on by default (three independent
+runs) and with `NINFER_TERNARY_TILE_STAGE=0`. That is expected, because the staging changes only how
+the bytes arrive: same bytes, same lane->k mapping, same accumulation order.
+
+Why this worked where the round-2 levers did not: it *removes* load instructions and replaces eight
+small ones with one big one, while the shared-memory decode table *added* a dependent load to the
+same chain. Same shared memory, opposite direction.
+
+The bit-identity gate earned its keep. The first pipeline draft baked a fixed offset into the
+prefetch (it re-read block 1 every iteration), which corrupted the output *and* made those loads
+L1-resident -- it measured +7.2% on wrong data. The text comparison caught it; the speed number
+alone would have shipped a broken kernel. A second false alarm was this document's own harness: a
+`docker run` called with an empty argument failed with "invalid reference format" and left a 0-byte
+output, which read as an md5 mismatch until the file size was checked.
+
+Still untried in this direction: staging 16 groups per block (half the `__syncwarp()` pairs, 4 KB of
+shared memory per block) and double-buffering to drop the second `__syncwarp()` of each iteration.
+Both are small edits to this kernel, and the +2.2% -> +3.9% step from adding the pipeline says the
+remaining latency is still worth something.

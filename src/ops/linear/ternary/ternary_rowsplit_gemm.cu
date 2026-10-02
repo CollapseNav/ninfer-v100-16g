@@ -201,6 +201,19 @@ int tile_minblocks() {
     return value;
 }
 
+// NINFER_TERNARY_TILE_STAGE=0 disables the warp-staged T = 1 decode GEMV; unset means enabled
+// wherever it qualifies (one token, fp16 container, group count divisible by 8). MEASURED on the
+// decode step, same batch: 51.5 t/s without staging, 52.6 with the plain staged load, 53.5 with the
+// software pipeline in front of it -- +3.9% -- and the output is bit-identical, because the staging
+// changes how the bytes arrive and nothing else.
+bool tile_stage_enabled() {
+    static const bool value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_TILE_STAGE");
+        return env == nullptr || std::string(env) != "0";
+    }();
+    return value;
+}
+
 // NINFER_TERNARY_TILE_WIDE1=1 selects the wide-lane T = 1 decode GEMV (two code bytes and sixteen
 // activation bytes per lane per iteration) instead of the tile kernel at kT = 1. See the kernel for
 // why: the shipped decode shape is latency-bound, and doubling the bytes per load instruction is the
@@ -384,6 +397,15 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
     const std::int32_t groups_per_row = w.k / 128;
     const unsigned grid               = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
     const dim3 block(kGemvWarpsPerBlock * 32, 1u, 1u);
+    // Warp-staged T = 1 decode: fp16 container, one token, group count divisible by 8.
+    if (tokens == 1 && x.dtype == DType::FP16 && (groups_per_row % 8) == 0 && tile_stage_enabled()) {
+        ternary_pq2_gemv_stage_kernel<<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+            w.n, groups_per_row, out_row_stride);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     // Wide-lane T = 1 decode: only the fp16 container, only one token, and only an even group count
     // (every width in this model is even: 40/48/80/136). Experiment, so it stays behind the switch
     // until it is measured.

@@ -537,6 +537,85 @@ void ternary_pq2_gemv_wide1_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+// Warp-staged T = 1 decode GEMV. The shipped kernel reads one code byte per lane per group, so eight
+// groups cost the warp eight 32-byte loads, each a separate DRAM latency sitting on the decode's
+// dependency chain, plus one 16-bit scale load each. This variant stages eight groups at a time: one
+// 64-bit load per lane (256 contiguous bytes per warp, eight sectors in a single instruction) into a
+// private per-warp shared buffer, then eight shared-memory byte reads, and the block's eight scales
+// come from one broadcast 128-bit load instead of eight 16-bit ones.
+//
+// Same bytes, same lane->k mapping, same decode, same accumulation order as the shipped kernel, so
+// the output is bit-identical -- which is why this one can be judged on a plain text comparison
+// where the wide-lane variant needed a PPL run.
+//
+// The eight warps of a block keep private 256-byte buffers, so no __syncthreads() is involved: a
+// __syncwarp() after the store is enough. That matters, because the one fusion this tree has tried
+// (norm+rotation, bit-identical) lost 2.0-2.6% to a block barrier.
+//
+// Requires groups_per_row % 8 == 0; every width in this model qualifies (40/48/80/136).
+template <int kMinBlocks = 1>
+__global__ __launch_bounds__(kGemvWarpsPerBlock * 32, kMinBlocks)
+void ternary_pq2_gemv_stage_kernel(const __nv_bfloat16* __restrict__ x,
+                                   const std::uint8_t* __restrict__ codes,
+                                   const std::uint8_t* __restrict__ scales,
+                                   __nv_bfloat16* __restrict__ out, std::int32_t rows,
+                                   std::int32_t groups_per_row, std::int32_t out_row_stride) {
+    __shared__ std::uint8_t stage[kGemvWarpsPerBlock][8 * kGemvCodeBytesPerGroup];
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int warp_local = static_cast<int>(threadIdx.x) >> 5;
+    const int warp = static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + warp_local;
+    if (warp >= rows) { return; }
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(warp) * groups_per_row * kGemvCodeBytesPerGroup;
+    const std::uint8_t* scale_row =
+        scales + static_cast<std::int64_t>(warp) * groups_per_row * kGemvScaleBytesPerGroup;
+
+    const int steps = groups_per_row >> 3;
+    float accumulator = 0.0F;
+    // Software pipeline: the next block's 256-byte code span is issued BEFORE this block's inner
+    // loop, so its DRAM latency overlaps eight groups of decode and dot instead of stalling at the
+    // top of the next iteration.
+    const std::uint8_t* blk_ptr = code_row;
+    uint2 cw = *reinterpret_cast<const uint2*>(blk_ptr + lane * 8);
+    for (int blk = 0; blk < steps; ++blk) {
+        *reinterpret_cast<uint2*>(&stage[warp_local][lane * 8]) = cw;
+        const uint4 sc = *reinterpret_cast<const uint4*>(scale_row + blk * 16);
+        blk_ptr += 256;
+        const uint2 cw_next = (blk + 1 < steps)
+                                  ? *reinterpret_cast<const uint2*>(blk_ptr + lane * 8)
+                                  : cw;
+        __syncwarp();
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const std::uint32_t raw = stage[warp_local][i * kGemvCodeBytesPerGroup + lane];
+            const float scale = __half2float(
+                __ushort_as_half(reinterpret_cast<const std::uint16_t*>(&sc)[i]));
+            const std::uint32_t lo_bits =
+                0x64006400u | (raw & 0x03u) | ((raw & 0x0Cu) << 14);
+            const std::uint32_t hi_bits =
+                0x64006400u | ((raw >> 4) & 0x03u) | ((raw & 0xC0u) << 10);
+            const half2 k1025 = __float2half2_rn(1025.0F);
+            const __half2 w01 = __hsub2(*reinterpret_cast<const half2*>(&lo_bits), k1025);
+            const __half2 w23 = __hsub2(*reinterpret_cast<const half2*>(&hi_bits), k1025);
+            const uint2 packed = *reinterpret_cast<const uint2*>(
+                x + static_cast<std::int64_t>(blk * 8 + i) * kGemvGroupK + lane * 4);
+            const __half2 a01 = *reinterpret_cast<const __half2*>(&packed.x);
+            const __half2 a23 = *reinterpret_cast<const __half2*>(&packed.y);
+            const float2 p = __half22float2(__hfma2(w01, a01, __hmul2(w23, a23)));
+            accumulator = fmaf(scale, p.x + p.y, accumulator);
+        }
+        cw = cw_next;
+        __syncwarp();
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        accumulator += __shfl_down_sync(0xffffffffu, accumulator, offset);
+    }
+    if (lane == 0) {
+        out[static_cast<std::int64_t>(0) * out_row_stride + warp] = __float2bfloat16_rn(accumulator);
+    }
+}
+
 // Token-blocked variant, for PREFILL: the prefill chunk.
 //
 // The verify kernel above takes the whole T at once and is capped at kT <= 8 by register
