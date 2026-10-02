@@ -397,12 +397,30 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
     const std::int32_t groups_per_row = w.k / 128;
     const unsigned grid               = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
     const dim3 block(kGemvWarpsPerBlock * 32, 1u, 1u);
-    // Warp-staged T = 1 decode: fp16 container, one token, group count divisible by 8.
-    if (tokens == 1 && x.dtype == DType::FP16 && (groups_per_row % 8) == 0 && tile_stage_enabled()) {
-        ternary_pq2_gemv_stage_kernel<<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-            w.n, groups_per_row, out_row_stride);
+    // Warp-staged decode: fp16 container, one or two tokens, group count divisible by 8. MEASURED
+    // over the band the tile kernel still serves (QPN owns T = 6..32), same batch, two repetitions,
+    // NINFER_TERNARY_TILE_STAGE=0 against unset:
+    //   T = 1  51.4/51.5 -> 54.2/54.2   (+5.3%)   <- the no-spec decode step
+    //   T = 2  61.9/61.9 -> 64.0/63.8   (+3.3%)   <- the MTP K = 1 verify
+    //   T = 3  54.6/54.6 -> 52.9/52.9   (-3.1%)   <- the MTP K = 2 verify
+    //   T = 4  49.2/49.2 -> 48.1/48.0   (-2.4%)   <- the MTP K = 3 verify
+    // So the band stops at 2. The reason is in the kernel's own accounting: staging removes the code
+    // load from the critical path, and at kT = 1 the code load is the whole weight stream, while
+    // above kT = 2 the per-token activation work (which staging does not touch) dominates and the
+    // extra shared-memory hop and registers cost more than the code load saves.
+    if (tokens >= 1 && tokens <= 2 && x.dtype == DType::FP16 && (groups_per_row % 8) == 0 &&
+        tile_stage_enabled()) {
+        if (tokens == 1) {
+            ternary_pq2_gemv_stage_kernel<1><<<grid, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+                w.n, groups_per_row, tokens, out_row_stride);
+        } else {
+            ternary_pq2_gemv_stage_kernel<2><<<grid, block, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+                w.n, groups_per_row, tokens, out_row_stride);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

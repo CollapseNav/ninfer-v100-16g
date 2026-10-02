@@ -313,3 +313,41 @@ remaining latency is still worth something.
 unchanged by construction rather than by measurement: the staged kernel is selected only for
 `tokens == 1`, and a K = 1 verify round runs every target-model linear at T = 2, so it stays on the
 tile kernel at kT = 2 (61.9-62.0 t/s, as recorded in round 1).
+
+---
+
+## Round 5 — the staged decode extended to the T = 2 verify, and bounded there
+
+The staged kernel is now templated on kT and serves **T = 1..2**. Measured over the whole band the
+tile kernel still owns (QPN took T = 6..32, so that band is T = 1..5), same batch, two repetitions
+each, `NINFER_TERNARY_TILE_STAGE=0` against unset:
+
+| arm | T | no staging | staged | delta |
+|---|---:|---:|---:|---:|
+| no-spec decode, real_task | 1 | 51.4 / 51.5 | **54.2 / 54.2** | **+5.3%** |
+| MTP K = 1 (the verify) | 2 | 61.9 / 61.9 | **64.0 / 63.8** | **+3.3%** |
+| MTP K = 2 | 3 | 54.6 / 54.6 | 52.9 / 52.9 | -3.1% |
+| MTP K = 3 | 4 | 49.2 / 49.2 | 48.1 / 48.0 | -2.4% |
+
+Both repetitions agree to 0.1 t/s, and the no-staging arms reproduce the historical baselines
+(51.4-51.6 / 61.9-62.0), which is the harness cross-check. **The band stops at T = 2**: staging
+removes the code load from the critical path, and at kT = 1 that load is the entire weight stream,
+while above kT = 2 the per-token activation work (which staging does not touch) dominates and the
+extra shared-memory hop plus the registers cost more than the code load saves.
+
+Final verification of the shipped configuration (staging at T = 1 and 2 only, same batch):
+
+| arm | no staging | staged |
+|---|---:|---:|
+| no-spec decode, real_task 128 tokens | 51.5 | **54.3 (+5.4%)** |
+| MTP K = 1 | 61.9 | **63.9 (+3.2%)** |
+| MTP K = 1, 4.4k real_code prompt | 66.4 | **68.5 (+3.2%)** |
+| MTP K = 2 (not staged) | 54.6 | 54.6 |
+
+Acceptance length is identical in every pair (1.65 / 1.85 / 1.94), and the output text is
+byte-identical in all four comparisons. The 96-token greedy md5 against `/root/wt/base.out` is
+IDENTICAL with staging on by default and with `NINFER_TERNARY_TILE_STAGE=0`.
+
+Against the numbers this session started from, the decode step is **51.1 -> 54.3 t/s** and the MTP
+K = 1 arm -- the window a real task actually uses -- is **61.9 -> 63.9 t/s**, both bit-identical to
+the path that produced the recorded baseline.
