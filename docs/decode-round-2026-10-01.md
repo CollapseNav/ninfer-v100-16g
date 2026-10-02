@@ -301,3 +301,15 @@ Still untried in this direction: staging 16 groups per block (half the `__syncwa
 shared memory per block) and double-buffering to drop the second `__syncwarp()` of each iteration.
 Both are small edits to this kernel, and the +2.2% -> +3.9% step from adding the pipeline says the
 remaining latency is still worth something.
+
+### Final figures (five runs, same batch ordering)
+
+| arm | no-spec decode, real_task 128 tokens |
+|---|---:|
+| shipped default (staged) | 53.4 / 53.4 / 53.5 |
+| `NINFER_TERNARY_TILE_STAGE=0` | 51.5 / 51.5 |
+
++3.7-3.9%, reproducible across three batches, with byte-identical output. The MTP K = 1 arm is
+unchanged by construction rather than by measurement: the staged kernel is selected only for
+`tokens == 1`, and a K = 1 verify round runs every target-model linear at T = 2, so it stays on the
+tile kernel at kT = 2 (61.9-62.0 t/s, as recorded in round 1).

@@ -15,7 +15,7 @@ Artifact: `bonsai2_27b_swift_pq2.ninfer` (8.31 GB, identity `qwen3.8-27b/groupwi
 |---|---|
 | prefill, 3412-token prompt | **1190 t/s** (3 runs: 1190 / 1190 / 1190); re-measured on the current build at **1200-1210** (3662 tokens) and **1230** (4042 tokens, 4096 chunk) |
 | — as a fraction of the card | 59.5 TFLOP/s = **47.6%** of the 125 TFLOP/s fp16 peak |
-| decode | **51.1 t/s** with `NINFER_TERNARY_ROTATE_SPLIT=16`, **48.7** with no environment variables, 44.6 before `327f4b10` + `1df45be1`. The `41.6` used throughout the Decode section is the dedicated warp-per-row kernel, which is no longer the default route |
+| decode | **51.1 t/s** with `NINFER_TERNARY_ROTATE_SPLIT=16`, **48.7** with no environment variables, 44.6 before `327f4b10` + `1df45be1`. The `41.6` used throughout the Decode section is the dedicated warp-per-row kernel, which is no longer the default route. **53.4-53.5** after the warp-staged T = 1 code plane (`e0dd854d`; round 4 of `docs/decode-round-2026-10-01.md`) |
 | context-lookup K=7 (repeated text, T = 16 verify) | **234.8** t/s `lookup10`, **246.6** `lookup16` with the QPN wide-verify route (default); **123.7 / 126.7** with `NINFER_TERNARY_QPN=0`. Only the T >= 6 verify band changes -- the decode and MTP bands are md5-identical |
 | causal scoring (`ninfer-perplexity`) | 1091 tok/s, was 106.3 |
 | startup | 8.7 s (weights 6.70 GiB); 10.1-10.2 s re-measured as `engine ready` at `--max-context 8192` on this build |
