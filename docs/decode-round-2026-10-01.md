@@ -1107,6 +1107,111 @@ bash /root/ctx_long.sh         # 39k and 81k
 bash /root/ctx_nospec.sh       # the no-spec baseline that localises the loss
 ```
 
+---
+
+## Round 15 — what the MTP path actually does, and why K = 5 wins on code
+
+Round 14 left two things open: an unexplained 3% (K = 5 beating K = 4 at the same band edge and the
+same acceptance) and the question of whether the edge's holes at T = 4 and T = 5 were worth closing.
+This round read the MTP code against the upstream trees and closed both questions.
+
+### The MTP code, read properly
+
+* **The "early stop" is a budget clamp, not a quality test.** `src/ops/kernel/mtp_round.cuh`:
+  `next_extents = clamp(min(remaining_budget - 1, max_context - frontier - 1), 0, proposal_k)`. With
+  budget and context to spare -- every measurement here -- that is `proposal_k`, so `extent = K` and
+  **all K draft positions are verified**. An earlier guess in this round that the head trims its own
+  tail was wrong.
+* **`verify_k = proposal_k = draft_window`.** The round's verify width and the drafter's proposal count
+  are the same number, so the window is doing two jobs at once.
+* **Upstream does not decouple them either, except for ngram drafts.** `/root/ninfer-all`'s copy of the
+  same kernel is annotated "K=1..31 verification (up to 63 at B=1) and P=1..15 next proposals", and its
+  copy of the draft logic *does* accept a wider verify than proposal -- but the guard is explicit:
+  `(!state.ngram && proposal_k != k)` throws. A neural round verifies at the drafter's own width. So
+  the V100 port's coupling matches upstream's neural semantics and there is no structural difference to
+  import.
+* **The acceptance rate is not a quality metric.** It is `accepted / (K * rounds)`, so it falls
+  mechanically as K grows: at K = 1 it averages only position 0 (77.2% on code), at K = 5 it averages in
+  position 4's 18% and position 5's 3% and reads 44.4%. The number that decides anything is the
+  acceptance *length*.
+
+### The wall is per-position survival, and it is at position 4
+
+`accepted by pos` divided by rounds is the joint probability that every draft up to that position
+survived:
+
+| | pos 0 | pos 1 | pos 2 | pos 3 | pos 4 | pos 5 | pos 6 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `real_code`, K = 5 | 72% | 62% | 33% | 18% | 18% | 3% | -- |
+| `real_task`, K = 7 | 63% | 39% | 22% | 14% | 10% | 6% | 4% |
+| ctx32k, K = 5 | 66% | 48% | 34% | 23% | 16% | **0%** | -- |
+
+On `real_code` **K = 4 and K = 5 accept exactly the same number of drafts -- 87 over 39 rounds --
+so the fifth position contributes nothing**, and the two arms' acceptance lengths are identical
+(3.23). That is the whole explanation for the user-facing oddity that a wider window does not raise
+the acceptance rate: it cannot, because the drafter is done by position 4.
+
+### Where K = 5's win actually comes from
+
+Because K = 4 and K = 5 accept the same, the only thing separating them is **which token width the
+verify lands on**:
+
+| `real_code`, same batch, two reps | t/s | round ms |
+|---|---:|---:|
+| edge 6, K = 4 (T = 5 -> SIMT) | 64.20 | 50.31 |
+| edge 5, K = 4 (T = 5 -> QPN) | 74.70 | 43.24 |
+| edge 5, K = 5 (T = 6 -> QPN) | 77.10 | 41.89 |
+
+So the window in this model is **a route selector, not a quality knob**: T = 5 and T = 6 are both
+`tiles = 1` on the same QPN kernel, and the 16% between the first two rows is purely the band edge.
+
+### The edge's holes are worth nothing, so the edge stays at 6
+
+Round 12 refused an edge change on the T = 4 window alone. Same batch, both windows, 8,675 scored
+tokens each, `--text /root/ppl_qpn/text.txt` (perplexity scores at a forward width of `context - 1`):
+
+| window | SIMT arm | QPN arm | delta PPL | score rate |
+|---|---:|---:|---:|---:|
+| T = 4 (`--context 5 --stride 4`) | 319.4361 | 319.7467 | **+0.097%** | 108.6 -> 119.8 |
+| T = 5 (`--context 6 --stride 5`) | 275.9156 | 276.0385 | **+0.0446%** | 115.5 -> 140.1 |
+
+Closing them does lift the configurations that sit in them -- K = 4 by 16.4%, K = 3 by 8.9% -- but
+**K = 5 remains the optimum either way**, because its acceptance length (3.23) is at least as high as
+K = 4's (3.23, equal) and higher than K = 3's (3.00). The edge at 6 is therefore not costing anything
+in achievable performance: every window it disables (T = 3, 4, 5) is a *dominated* configuration on
+every workload measured. Paying +0.0446% (1.8x the fp16 prefill margin this tree accepted) and
++0.097% for "make a losing setting less losing" is the same trade round 12 already refused, and it is
+still not worth it. The edge stays at 6 and the item is closed with both windows measured.
+
+Where each workload's optimum actually sits, and whether the edge is involved:
+
+| workload | best window | its verify T | on QPN? |
+|---|---|---|---|
+| `prose4k` | K = 1 | T = 2 | no -- deliberately, QPN at T = 2 measured +18.7% slower |
+| `real_task` | K = 1 / K = 5 | T = 2 / T = 6 | T = 6 only |
+| `real_code` | **K = 5** | T = 6 | yes |
+| `lookup10` | **K = 7** | T = 8 | yes |
+
+### The one thing this round could not attribute, and why
+
+K = 5 beats K = 4 **by 3% even at the same edge, with identical acceptance (3.23) and identical round
+counts**, while doing one more draft step and verifying one more token (87.8 against 85.5 t/s on the
+`--max-new 64` trace, 77.10 against 74.70 on the 128-token run -- reproducible). Attention cannot
+explain it: K = 5's dominant `causal_attention_small_t_tc` call is 153 us against K = 4's 92 us.
+
+**It is not attributed, because the profiler harness cannot separate the phases for this app.** The
+nvprof log for a `--prefill-chunk 4096` run of a 4,381-token prompt holds only 11,538-16,421 ms --
+4.88 s for a 0.75 s decode -- and contains **4,192 ternary CUTLASS prefill calls inside the window the
+phase logic calls decode** (the prefill chunks at ~128 tokens, so it issues ~32 chunks x 65 layers x 2
+projections). Every per-round column is therefore diluted by an unknown mixture of prefill and decode,
+and two attempts to place the cut (first decode GEMV; `mtp_prepare_next_round`) both placed it wrong --
+the staged GEMV is used by the prefill's tail chunk, and `mtp_prepare_next_round` runs during the
+staged MTP prefill. **Attributing this needs the profiler started after the prefill
+(`cudaProfilerStart`, or a decode-dominated capture), not a better cut on the same capture.** Recorded
+rather than guessed; it is worth 3%, and the two rounds spent on it were spent because the harness
+kept producing plausible-looking columns.
+
+
 
 
 
