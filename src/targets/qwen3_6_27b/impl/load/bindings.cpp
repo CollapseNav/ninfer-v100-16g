@@ -46,6 +46,11 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
+    case WeightsProfile::Qwen38GgufMixed:
+        // There is no profile-wide endpoint format here: the artifact's embedding is gguf_iq1_m
+        // while its output head is gguf_iq4_xs. The GGUF binder resolves each role's DECLARED
+        // format instead of asking this function, so reaching here is a bug rather than a case.
+        throw std::invalid_argument("qwen3_6_27b: the GGUF profile has no single endpoint format");
     }
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
 }

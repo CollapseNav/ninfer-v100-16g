@@ -95,6 +95,12 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
     }
+    // The GGUF block-quant family. One weights_id covers the published variants because their
+    // parameter inventory, names and fusion are identical and only the per-role format assignment
+    // differs, which this profile resolves from the artifact rather than fixing per role.
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "gguf-mixed") {
+        return WeightsProfile::Qwen38GgufMixed;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }

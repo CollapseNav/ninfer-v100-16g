@@ -33,6 +33,12 @@ enum class WeightsProfile : std::uint8_t {
     Qwen38GroupwiseInt,
     Qwen36Nvfp4,
     Qwen38Nvfp4,
+    // GGUF block-quantized Qwen3.8-27B (the ModelScope Swift-1.5 family: iq2_s, iq2_xs, iq3_s,
+    // iq3_xxs). Unlike the other profiles this one carries no single profile-wide format -- the
+    // embedding is iq1_m while the output head is iq4_xs -- and it stores every projection as its
+    // own object rather than as one fused tensor, so its binder resolves each role's DECLARED
+    // format and its projections are assembled from parts.
+    Qwen38GgufMixed,
 };
 
 using Frontend        = qwen3_6::Frontend;
