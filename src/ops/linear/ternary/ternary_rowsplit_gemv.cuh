@@ -556,7 +556,7 @@ void ternary_pq2_gemv_wide1_kernel(const __nv_bfloat16* __restrict__ x,
 // (norm+rotation, bit-identical) lost 2.0-2.6% to a block barrier.
 //
 // Requires groups_per_row % 8 == 0; every width in this model qualifies (40/48/80/136).
-template <int kT, int kMinBlocks = 1>
+template <int kT, int kMinBlocks = 1, int kDepth = 1>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32, kMinBlocks)
 void ternary_pq2_gemv_stage_kernel(const __nv_bfloat16* __restrict__ x,
                                    const std::uint8_t* __restrict__ codes,
@@ -591,13 +591,24 @@ void ternary_pq2_gemv_stage_kernel(const __nv_bfloat16* __restrict__ x,
     // top of the next iteration.
     const std::uint8_t* blk_ptr = code_row;
     uint2 cw = *reinterpret_cast<const uint2*>(blk_ptr + lane * 8);
+    // kDepth = 2 keeps one more block's span in flight: the load for block b+2 is issued at the top
+    // of block b, so a DRAM latency that overruns one block's worth of decode (about 160 issue
+    // slots, ~800 ns at eight warps per scheduler) still has a second block of slack.
+    uint2 cw2 = cw;
+    if constexpr (kDepth >= 2) {
+        if (steps > 1) { cw2 = *reinterpret_cast<const uint2*>(blk_ptr + 256 + lane * 8); }
+    }
     for (int blk = 0; blk < steps; ++blk) {
         *reinterpret_cast<uint2*>(&stage[warp_local][lane * 8]) = cw;
         const uint4 sc = *reinterpret_cast<const uint4*>(scale_row + blk * 16);
         blk_ptr += 256;
-        const uint2 cw_next = (blk + 1 < steps)
-                                  ? *reinterpret_cast<const uint2*>(blk_ptr + lane * 8)
-                                  : cw;
+        uint2 cw_next = cw;
+        if constexpr (kDepth >= 2) {
+            cw_next = cw2;
+            if (blk + 2 < steps) { cw2 = *reinterpret_cast<const uint2*>(blk_ptr + 256 + lane * 8); }
+        } else {
+            if (blk + 1 < steps) { cw_next = *reinterpret_cast<const uint2*>(blk_ptr + lane * 8); }
+        }
         __syncwarp();
 #pragma unroll
         for (int i = 0; i < 8; ++i) {

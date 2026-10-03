@@ -36,7 +36,22 @@ struct TernaryBf16Output {
     }
 };
 
-template <int kTiles, class Activation>
+// NACC is the sibling kernels' generation-2 knob: it round-robins the four mma of one 16-k unit into
+// independent accumulators so the RAW chain on the accumulator is not four deep. NACC = 4 at
+// kTiles = 1 (the decode and verify tiles have no other ILP) and 1 above it (the tiles are already
+// independent). NINFER_TERNARY_QPN_NACC overrides it for kTiles = 2 -- T = 9..16, the lookup verify
+// where the route is worth +90% and the mma count doubles with the tile. Experiment, measured before
+// it is defaulted.
+int qpn_nacc_override() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_QPN_NACC");
+        const int parsed = env == nullptr ? 0 : std::atoi(env);
+        return (parsed == 1 || parsed == 2 || parsed == 4) ? parsed : 0;
+    }();
+    return value;
+}
+
+template <int kTiles, class Activation, int kNaccOverride = 0>
 void launch_shape(const Tensor& x, const Weight& w, Tensor& out, std::int32_t out_row_stride,
                    cudaStream_t stream) {
     using S = TernaryVoltaQpnSchedule;
@@ -44,7 +59,7 @@ void launch_shape(const Tensor& x, const Weight& w, Tensor& out, std::int32_t ou
     // One accumulator per k-slice of a 16-k unit would break the mma RAW chain (the sibling kernels'
     // NACC knob), but four accumulators per tile is 32 registers per live tile and kTiles goes to 4;
     // with more than one tile the tiles are already independent, which is the same ILP for free.
-    constexpr int kNacc   = kTiles == 1 ? 4 : 1;
+    constexpr int kNacc   = kNaccOverride != 0 ? kNaccOverride : (kTiles == 1 ? 4 : 1);
     const int n = w.n;
     const unsigned grid = static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta);
     ternary_volta_qpn_gemm_kernel<kTiles, kSplitk, kNacc, TernaryBf16Output, Activation>
@@ -121,9 +136,15 @@ void ternary_prepack_qpn(Weight& w, cudaStream_t stream) {
 }
 
 bool ternary_qpn_enabled() noexcept {
+    // Unset means enabled wherever the shape and the token count qualify; only "0" disables. This is
+    // what the header, the task that commissioned the route, and the docs all assume -- the port
+    // shipped the opposite test (`env != nullptr && env != "0"`), i.e. the route was OFF unless a
+    // value was passed, and every measurement in this tree happened to pass one explicitly (0 or 1),
+    // so the A/B was valid while the default was dead. Found by re-running the lookup arm with no
+    // NINFER_TERNARY_QPN at all: 123.8 t/s (SIMT) against 235.1 with the route on.
     static const bool value = [] {
         const char* env = std::getenv("NINFER_TERNARY_QPN");
-        return env != nullptr && std::string(env) != "0";
+        return env == nullptr || std::string(env) != "0";
     }();
     return value;
 }
@@ -165,7 +186,12 @@ void launch_ternary_volta_qpn(const Tensor& x, const Weight& w, Tensor& out,
                       TernaryVoltaQpnSchedule::kRowsPerTile;
     if (x.dtype == DType::FP16) {
         if (tiles <= 1)      { launch_shape<1, half>(x, w, out, out_row_stride, stream); }
-        else if (tiles == 2) { launch_shape<2, half>(x, w, out, out_row_stride, stream); }
+        else if (tiles == 2) {
+            const int nacc = qpn_nacc_override();
+            if (nacc == 2)      { launch_shape<2, half, 2>(x, w, out, out_row_stride, stream); }
+            else if (nacc == 4) { launch_shape<2, half, 4>(x, w, out, out_row_stride, stream); }
+            else                { launch_shape<2, half>(x, w, out, out_row_stride, stream); }
+        }
         else if (tiles == 3) { launch_shape<3, half>(x, w, out, out_row_stride, stream); }
         else                 { launch_shape<4, half>(x, w, out, out_row_stride, stream); }
     } else {

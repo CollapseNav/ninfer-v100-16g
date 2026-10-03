@@ -351,3 +351,48 @@ IDENTICAL with staging on by default and with `NINFER_TERNARY_TILE_STAGE=0`.
 Against the numbers this session started from, the decode step is **51.1 -> 54.3 t/s** and the MTP
 K = 1 arm -- the window a real task actually uses -- is **61.9 -> 63.9 t/s**, both bit-identical to
 the path that produced the recorded baseline.
+
+---
+
+## Round 6 — the QPN default was dead, plus two more knob verdicts
+
+**A bug that this session's own protocol had been hiding.** `ternary_qpn_enabled()` shipped as
+`env != nullptr && env != "0"`, i.e. the route ran **only when a value was passed**, while its own
+header comment, the task that commissioned the route, and every document in this tree say the
+opposite ("`NINFER_TERNARY_QPN=0` disables"). Every A/B in rounds 1-5 passed the variable explicitly
+(0 or 1), so those comparisons were valid and the +90% was real -- but the *default* path never took
+the route, and the shipped lookup number stayed at the SIMT 123.7 t/s. It was found by re-running the
+lookup arm with no `NINFER_TERNARY_QPN` at all, while chasing an unrelated knob.
+
+| lookup10 K = 7 | t/s |
+|---|---:|
+| `NINFER_TERNARY_QPN=1` | 235.1 |
+| `NINFER_TERNARY_QPN=0` | 123.7 |
+| unset, **before** the fix | **123.8** |
+| unset, **after** the fix | **235.5** |
+
+Fixed to `env == nullptr || env != "0"`. The 96-token greedy md5 against `/root/wt/base.out` is
+still IDENTICAL with the default now on, because the gate excludes T < 6 and the whole baseline path
+(150-token prefill, T = 1 decode, T = 2 tail) is below it. **This is the largest single number the
+session moved: the context-lookup decode is 123.7 -> 235.5 t/s by default**, not only under an
+explicit switch. Lesson worth keeping: a route whose A/B always passes the switch explicitly is not
+evidence that the switch's default works.
+
+**NACC at kTiles = 2** -- the T = 9..16 lookup verify, where the mma count doubles with the tile and
+the accumulator chain is four deep at NACC = 1:
+
+| arm | lookup10 K = 7 |
+|---|---:|
+| NACC = 1 (shipped) | 235.5 |
+| **NACC = 2** | **237.5 (+0.85%)** |
+| NACC = 4 | 227.6 (-3.4%) |
+
+Output text identical at all three, but NACC reassociates the fp32 accumulation, so adopting it would
+require re-running the band's perplexity check; at +0.85% it stays a measured, default-off knob
+(`NINFER_TERNARY_QPN_NACC`). Note the first attempt at this A/B was void -- it ran before the default
+fix, so all three arms were the SIMT route at 123.7 t/s.
+
+**Prefetch depth 2 for the staged decode: refuted.** Same batch, two repetitions: no-spec 54.2/54.3
+-> 52.8/52.7 and MTP K = 1 64.0/64.0 -> 62.4/62.4, i.e. **-2.7%**, with identical output. One block
+of prefetch already covers the DRAM latency; the second block only costs registers. The default stays
+1 (`NINFER_TERNARY_STAGE_DEPTH`).

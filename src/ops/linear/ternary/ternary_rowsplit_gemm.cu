@@ -214,6 +214,20 @@ bool tile_stage_enabled() {
     return value;
 }
 
+// NINFER_TERNARY_STAGE_DEPTH selects the staged kernel's prefetch distance (1 or 2, default 1 =
+// the shipped form). MEASURED, same batch, two repetitions: depth 2 loses ~2.7% -- no-spec 54.2/54.3
+// -> 52.8/52.7 and MTP K = 1 64.0/64.0 -> 62.4/62.4 -- i.e. one block of prefetch (about 160 issue
+// slots, ~800 ns at eight warps per scheduler) already covers the DRAM latency, and the second block
+// only costs registers. Output is identical at both depths, as expected. Keep it as the record.
+int tile_stage_depth() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_STAGE_DEPTH");
+        const int parsed = env == nullptr ? 0 : std::atoi(env);
+        return parsed == 2 ? 2 : 1;
+    }();
+    return value;
+}
+
 // NINFER_TERNARY_TILE_WIDE1=1 selects the wide-lane T = 1 decode GEMV (two code bytes and sixteen
 // activation bytes per lane per iteration) instead of the tile kernel at kT = 1. See the kernel for
 // why: the shipped decode shape is latency-bound, and doubling the bytes per load instruction is the
@@ -411,15 +425,37 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
     if (tokens >= 1 && tokens <= 2 && x.dtype == DType::FP16 && (groups_per_row % 8) == 0 &&
         tile_stage_enabled()) {
         if (tokens == 1) {
-            ternary_pq2_gemv_stage_kernel<1><<<grid, block, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-                static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-                w.n, groups_per_row, tokens, out_row_stride);
+            if (tile_stage_depth() == 2) {
+                ternary_pq2_gemv_stage_kernel<1, 1, 2><<<grid, block, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const std::uint8_t*>(w.qdata),
+                    static_cast<const std::uint8_t*>(w.scales),
+                    static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                    out_row_stride);
+            } else {
+                ternary_pq2_gemv_stage_kernel<1><<<grid, block, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const std::uint8_t*>(w.qdata),
+                    static_cast<const std::uint8_t*>(w.scales),
+                    static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                    out_row_stride);
+            }
         } else {
-            ternary_pq2_gemv_stage_kernel<2><<<grid, block, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-                static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-                w.n, groups_per_row, tokens, out_row_stride);
+            if (tile_stage_depth() == 2) {
+                ternary_pq2_gemv_stage_kernel<2, 1, 2><<<grid, block, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const std::uint8_t*>(w.qdata),
+                    static_cast<const std::uint8_t*>(w.scales),
+                    static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                    out_row_stride);
+            } else {
+                ternary_pq2_gemv_stage_kernel<2><<<grid, block, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const std::uint8_t*>(w.qdata),
+                    static_cast<const std::uint8_t*>(w.scales),
+                    static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                    out_row_stride);
+            }
         }
         CUDA_CHECK(cudaGetLastError());
         return;
