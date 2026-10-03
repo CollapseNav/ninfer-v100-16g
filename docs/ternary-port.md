@@ -1457,6 +1457,33 @@ dequantizers for IQ2_XS / IQ4_XS / IQ1_M, the activation quantization with and w
 architecture constants, the `gate_up` row order, the absence of a converter transform, and the
 workspace. What has not been explained is why the whole thing is still wrong.
 
+### What is left is a reference this tree does not have
+
+Three more checks came back clean:
+
+* **the tokenizer**: the same text tokenizes to the same 61 tokens under both artifacts, so the
+  artifact's tokenizer is not producing a garbled prompt;
+* **`layer_types`**: the artifact's config lists `["linear_attention", "linear_attention",
+  "linear_attention", "full_attention", ...]`, and the artifact's own roles match it for all 64 layers
+  with zero mismatches -- which is also the fork's `i % 4 == 3` rule;
+* **the artifact's tensor set** is exactly what the fork's roles expect, including `ssm_alpha` for
+  `a_projection`, `attn_qkv` plus `attn_gate` for the GDN parent, `attn_q`/`attn_k`/`attn_v` for the
+  full layers, and `nextn.eh_proj` for the MTP stem.
+
+**One lead is new and unresolved**: the artifact's `architectures` is `["Qwen3_5ForCausalLM"]`, while
+this tree's target is the 3.6/3.8 lineage -- and the tree's own ternary artifact identifies as
+`qwen3.8-27b`. Everything measurable matches anyway (all the scalars, `layer_types`, the tensor set),
+so if a 3.5-versus-3.8 difference is the cause it is in something this tree has no way to compare
+against.
+
+That is the honest position after ten rounds: the port is verified stage by stage, the failure is
+uniform rather than localized, and the next step needs an external reference. The source GGUF that
+`provenance.sources.gguf` names -- `Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ2_XS-mtp.gguf` -- run under
+llama.cpp would give both a same-model perplexity and per-layer activations to diff against, and the
+artifact was produced by a converter in a different repository (`Swift15-NInfer2`), so neither is
+available in this tree.
+
+
 
 
 
