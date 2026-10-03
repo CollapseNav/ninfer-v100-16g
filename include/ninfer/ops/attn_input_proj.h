@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/gguf_projection.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -104,5 +105,25 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream);
+
+/**
+ * GGUF block-matrix form, over an explicit list of parts (see ops/gguf_projection.h).
+ *
+ * This overload exists because a GGUF projection's parts may differ in FORMAT: the ModelScope
+ * Swift-1.5 Qwen3.8-27B artifact stores attention gate as gguf_iq2_xxs and value as gguf_iq2_s, so
+ * the pair overload above cannot express it. Each part names the output tensor it feeds (0 = q,
+ * 1 = gate, 2 = k, 3 = v) and the first row it writes there, and every part is projected in ONE
+ * gguf_project call, which quantizes the activation to ggml's q8_1 once and reuses it throughout.
+ *
+ * The parts must cover q/gate [6144,T] and k/v [1024,T] exactly: their row counts must sum to the
+ * output's, with no gap and no overlap. x is contiguous BF16 [5120,T] and all four outputs are
+ * contiguous BF16. T may be any positive value. Inputs and outputs must be mutually non-overlapping.
+ */
+std::size_t attn_input_proj_workspace_capacity_bytes(const GgufProjectionWeights& weights,
+                                                     std::int32_t min_tokens,
+                                                     std::int32_t max_tokens);
+
+void attn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& q, Tensor& gate,
+                     Tensor& k, Tensor& v, WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

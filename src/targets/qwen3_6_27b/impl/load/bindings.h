@@ -9,6 +9,7 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
+#include "ninfer/ops/gguf_projection.h"
 
 #include <array>
 #include <cstddef>
@@ -50,6 +51,12 @@ struct HadamardSignsPlan {
 struct MlpPlan {
     WeightPlan gate_up;
     WeightPlan down;
+    // GGUF only. The ModelScope Swift-1.5 artifacts store MLP gate and up as SEPARATE objects with
+    // different formats (iq1_s/iq1_m, iq2_xxs/iq2_xs, q6_k/q6_k), so they cannot be fused into the
+    // 34816-row gate_up parent the other profiles use. When these are set, gate_up is unused and the
+    // execution leaf projects the pair with the vendored ggml SwiGLU route.
+    std::optional<WeightPlan> gguf_gate;
+    std::optional<WeightPlan> gguf_up;
 };
 
 struct SplitAttentionProjectionPlan {
@@ -61,8 +68,22 @@ struct FusedAttentionProjectionPlan {
     WeightPlan query_key_gate_value;
 };
 
+// One GGUF part in the plan: which object, which output tensor (0 = q, 1 = gate, 2 = k, 3 = v), and
+// the first row it writes there. Parts may differ in format, which is why this alternative exists.
+struct GgufProjectionPartPlan {
+    WeightPlan weight;
+    std::int32_t output = 0;
+    std::int32_t row    = 0;
+};
+
+struct GgufAttentionProjectionPlan {
+    std::vector<GgufProjectionPartPlan> parts;
+};
+
 struct FullAttentionPlan {
-    std::variant<SplitAttentionProjectionPlan, FusedAttentionProjectionPlan> projection;
+    std::variant<SplitAttentionProjectionPlan, FusedAttentionProjectionPlan,
+                 GgufAttentionProjectionPlan>
+        projection;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
     WeightPlan output;
@@ -184,10 +205,20 @@ struct ArtifactLoadPlan {
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features);
 
-struct DensePostMixerPayload {
+struct DenseMlpPayload {
     Weight gate_up;
     Weight down;
 };
+
+// GGUF MLP: gate and up are separate stored objects with different formats, so the pair goes to the
+// vendored ggml SwiGLU route rather than to the fused gate_up path.
+struct GgufDenseMlpPayload {
+    Weight gate;
+    Weight up;
+    Weight down;
+};
+
+using DensePostMixerPayload = std::variant<DenseMlpPayload, GgufDenseMlpPayload>;
 
 struct SplitAttentionProjectionPayload {
     Weight query_key;
@@ -198,8 +229,13 @@ struct FusedAttentionProjectionPayload {
     Weight query_key_gate_value;
 };
 
+struct GgufAttentionProjectionPayload {
+    ops::GgufProjectionWeights weights;
+};
+
 using FullAttentionProjectionPayload =
-    std::variant<SplitAttentionProjectionPayload, FusedAttentionProjectionPayload>;
+    std::variant<SplitAttentionProjectionPayload, FusedAttentionProjectionPayload,
+                 GgufAttentionProjectionPayload>;
 
 struct SplitGdnInputProjectionPayload {
     Weight query_key;

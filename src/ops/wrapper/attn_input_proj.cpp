@@ -7,6 +7,7 @@
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/ternary/ternary_dispatch.h"
@@ -16,8 +17,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -369,6 +372,68 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     require_w8_rowsplit(query_key_value_weight, kRows, hidden, "query/key/value weight");
 
     detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
+}
+
+// --- GGUF parts form -------------------------------------------------------------------------
+// Every part is projected in one gguf_project call, so the activation is quantized to ggml's q8_1
+// once no matter how many parts there are, and parts may differ in format -- which is the whole
+// reason this overload exists (the ModelScope Swift-1.5 artifact stores gate as gguf_iq2_xxs and
+// value as gguf_iq2_s).
+std::size_t attn_input_proj_workspace_capacity_bytes(const GgufProjectionWeights& weights,
+                                                     std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    std::vector<detail::GgufShape> shapes;
+    shapes.reserve(weights.parts.size());
+    for (const auto& part : weights.parts) {
+        shapes.push_back({part.weight.qtype, part.weight.n, part.weight.k});
+    }
+    return detail::gguf_project_workspace_bytes(shapes, min_tokens, max_tokens);
+}
+
+void attn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& q, Tensor& gate,
+                     Tensor& k, Tensor& v, WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    const std::int32_t cols        = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(gate, kQRows, cols, "gate");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+
+    // Each part must be a whole-block GGUF matrix of the right input width, land inside its output's
+    // rows, and together the parts must cover q/gate/k/v exactly -- a gap would leave uninitialised
+    // rows in an output and an overlap would double-count one.
+    std::array<std::int64_t, 4> covered{};
+    for (const auto& part : weights.parts) {
+        detail::require_gguf(part.weight, "attn_input_proj GGUF part");
+        if (part.output < 0 || part.output > 3) {
+            throw std::invalid_argument("attn_input_proj: GGUF part names an unknown output");
+        }
+        const std::int32_t limit = part.output < 2 ? kQRows : kKvRows;
+        if (part.weight.k != kHidden || part.row < 0 || part.row + part.weight.n > limit) {
+            throw std::invalid_argument("attn_input_proj: GGUF part outside the attention profile");
+        }
+        covered[part.output] += part.weight.n;
+    }
+    if (covered[0] != kQRows || covered[1] != kQRows || covered[2] != kKvRows ||
+        covered[3] != kKvRows) {
+        throw std::invalid_argument("attn_input_proj: GGUF parts do not cover q/gate/k/v");
+    }
+
+    Tensor* outputs[] = {&q, &gate, &k, &v};
+    std::vector<detail::GgufProduct> products;
+    products.reserve(weights.parts.size());
+    for (const auto& part : weights.parts) {
+        detail::GgufProduct product;
+        product.weight = &part.weight;
+        product.out    = outputs[part.output];
+        product.row    = part.row;
+        products.push_back(product);
+    }
+    detail::gguf_project(x, products, workspace, stream);
 }
 
 } // namespace ninfer::ops

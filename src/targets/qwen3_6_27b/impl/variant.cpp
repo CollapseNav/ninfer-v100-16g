@@ -9,7 +9,9 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
+#include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/silu_mul.h"
+#include "ops/linear/gguf/gguf_linear.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -323,26 +325,51 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                          qwen3_6::TextPhase, const ::ninfer::ops::SparseMoeHints&,
                          WorkspaceArena& workspace, cudaStream_t stream, const Tensor* in_norm,
                          float norm_eps) {
-    auto scope        = workspace.scope();
+    auto scope = workspace.scope();
+    // GGUF: gate and up are separate objects with different formats, so the pair goes to the vendored
+    // ggml SwiGLU route (which applies silu to the gate half itself) and the norm, when the graph
+    // hands the raw residual in, runs as its own op.
+    if (const auto* gguf = std::get_if<GgufDenseMlpPayload>(&weights)) {
+        const Tensor* use = &hidden;
+        Tensor normed;
+        if (in_norm != nullptr) {
+            normed = workspace.alloc(DType::BF16, {hidden.ne[0], hidden.ne[1]});
+            ops::rmsnorm(hidden, *in_norm, norm_eps, true, normed, stream);
+            use = &normed;
+        }
+        Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
+        ops::detail::gguf_swiglu(*use, gguf->gate, &gguf->up, activation, workspace, stream);
+        ops::linear_add(activation, gguf->down, residual, text_policy(gguf->down), workspace, stream);
+        return;
+    }
+    const auto& fused = std::get<DenseMlpPayload>(weights);
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
-    ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
+    ops::linear_swiglu(hidden, fused.gate_up, activation, text_policy(fused.gate_up), workspace,
                        stream, in_norm, norm_eps);
-    ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
-                    stream);
+    ops::linear_add(activation, fused.down, residual, text_policy(fused.down), workspace, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                              Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope     = workspace.scope();
     const int cols = hidden.ne[1];
-    Tensor gate_up = workspace.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, cols});
-    ops::linear(hidden, weights.gate_up, gate_up, stream);
+    if (const auto* gguf = std::get_if<GgufDenseMlpPayload>(&weights)) {
+        Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
+        ops::detail::gguf_swiglu(hidden, gguf->gate, &gguf->up, activation, workspace, stream);
+        Tensor delta = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
+        ops::linear(activation, gguf->down, delta, stream);
+        ops::residual_add(delta, residual, stream);
+        return;
+    }
+    const auto& fused = std::get<DenseMlpPayload>(weights);
+    Tensor gate_up    = workspace.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, cols});
+    ops::linear(hidden, fused.gate_up, gate_up, stream);
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
     ops::silu_mul(gate_up.slice(0, 0, TextConfig::intermediate),
                   gate_up.slice(0, TextConfig::intermediate, TextConfig::intermediate), activation,
                   stream);
     Tensor delta = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
-    ops::linear(activation, weights.down, delta, stream);
+    ops::linear(activation, fused.down, delta, stream);
     ops::residual_add(delta, residual, stream);
 }
 

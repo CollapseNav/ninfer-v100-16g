@@ -318,7 +318,16 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
 
 DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                const artifact::MaterializedArtifact& materialized) {
-    DensePostMixerPayload out;
+    // GGUF: gate and up are separate objects with different formats, so the pair is projected by the
+    // vendored ggml SwiGLU route and never becomes the fused 34816-row parent.
+    if (plan.gguf_gate.has_value()) {
+        GgufDenseMlpPayload out;
+        out.gate = materialized_weight(materialized, *plan.gguf_gate, 17408, 5120);
+        out.up   = materialized_weight(materialized, *plan.gguf_up, 17408, 5120);
+        out.down = materialized_weight(materialized, plan.down, 5120, 17408);
+        return out;
+    }
+    DenseMlpPayload out;
     out.gate_up = materialized_weight(materialized, plan.gate_up, 34816, 5120);
     out.down    = materialized_weight(materialized, plan.down, 5120, 17408);
 #ifdef NINFER_VOLTA_BUILD
