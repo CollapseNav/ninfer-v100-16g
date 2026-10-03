@@ -3,6 +3,7 @@
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
@@ -81,6 +82,15 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    // GGUF block matrices ignore the activation policy: their arithmetic quantizes the activation to
+    // ggml's q8_1 whatever the policy says, so they take their own route and need the workspace.
+    if (is_gguf(w.qtype)) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("linear: a GGUF weight needs the workspace overload");
+        }
+        detail::gguf_linear(x, w, out, *workspace, stream);
+        return;
+    }
     switch (w.qtype) {
     case QType::Q4G64_F16S:
         detail::q4_dispatch(x, w, out, policy, workspace, stream);
@@ -124,6 +134,10 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         throw std::invalid_argument("linear workspace: invalid token interval");
     }
 
+    if (is_gguf(qtype)) {
+        const detail::GgufShape shape{qtype, output_rows, input_rows};
+        return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
+    }
     switch (qtype) {
     case QType::Q4G64_F16S: {
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);

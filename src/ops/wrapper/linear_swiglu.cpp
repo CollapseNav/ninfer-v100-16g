@@ -2,6 +2,7 @@
 
 #include "ninfer/ops/silu_mul.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/ternary/ternary_dispatch.h"
 #include "ops/linear/ternary/ternary_rotation.h"
@@ -41,6 +42,10 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     validate_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
+    }
+    if (is_gguf(qtype)) {
+        const detail::GgufShape parent{qtype, gate_up_rows, input_rows};
+        return detail::gguf_swiglu_workspace_bytes(parent, nullptr, min_tokens, max_tokens);
     }
     if (qtype == QType::W8G32_F16S) {
         if (policy != LinearPolicy::A16Only) {
@@ -112,6 +117,13 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.shape[0] == gate_up_weight.n &&
         gate_up_weight.shape[1] == gate_up_weight.k && gate_up_weight.qdata != nullptr &&
         gate_up_weight.scales != nullptr;
+    // GGUF block weights take the vendored ggml route: it quantizes the activation to ggml's q8_1
+    // and applies silu to the gate half itself, so it neither reads the policy nor the row-split
+    // contract the checks below describe.
+    if (is_gguf(gate_up_weight.qtype)) {
+        detail::gguf_swiglu(x, gate_up_weight, nullptr, out, ws, stream);
+        return;
+    }
     const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4G64_F16S &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
