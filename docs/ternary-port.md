@@ -1438,6 +1438,26 @@ simply the most predictable ones. That fits the remaining unexplained fact: PPL 
 same factor at forward width 7 (vector kernel) and width 15 (matrix kernel), so the error is in
 something both paths share rather than in either kernel.
 
+### Every op is now verified; the dequantizer for the embedding's format included
+
+The last unverified dequantizer was IQ1_M -- the token embedding's format, and the most complex in the
+artifact (its scale is packed across four uint16s and its values come from a 2048-entry grid).
+Transcribed from the vendored device code and compared against `dequantize_rows` on the same 1120
+bytes:
+
+| | |
+|---|---|
+| max absolute difference | **4.5e-4** on values of magnitude 0.126 -- **0.36%, one bf16 step** |
+| first eight | `0.002665 -0.018657 0.023988 ...` against `0.002670 -0.018677 0.024048 ...` |
+
+So the model's INPUT is right too. At this point every stage has been measured rather than argued:
+the container, the binding (523 slices against the converter's own record), the materialization, the
+dequantizers for IQ2_XS / IQ4_XS / IQ1_M, the activation quantization with and without the
+`input_columns` gather, both product kernels, the conv state's update, the explicit rmsnorm, the
+architecture constants, the `gate_up` row order, the absence of a converter transform, and the
+workspace. What has not been explained is why the whole thing is still wrong.
+
+
 
 
 **The composition itself is now verified against the right reference.** The earlier comparison was
