@@ -1624,6 +1624,24 @@ lives, and it is a separate fault from the scoring error.
 arena throws rather than overrunning, so this is a GGUF-profile workspace sizing bug in this port --
 reproducible in one command, and independent of the text-quality problem.
 
+**Its threshold is between context 320 and 384.** Bisecting:
+
+| context | scored width | result |
+|---:|---:|---|
+| 256 | 128 | PPL 10.556 |
+| 288 | 144 | PPL 10.486 |
+| 320 | 160 | PPL 10.561 |
+| 384 | 192 | `std::bad_alloc` |
+| 512 | 256 | `std::bad_alloc` |
+
+and the ternary artifact completes 512 with PPL 2.459, so the GPU has the room and the shortfall is in
+one of this port's GGUF profile cases. Every one of those cases delegates to the op's own query
+(`gguf_project_workspace_bytes`, `linear_add_workspace_capacity_bytes`) with the shape the op will see,
+so the shortfall is either a shape this port reports that the op does not actually use, or an
+allocation the op makes beyond its own query. `--log-level trace` names the stage (`scoring … window
+0`) but not the allocation.
+
+
 
 
 
