@@ -1402,6 +1402,43 @@ at all.** Anything that must be measured per decode step has to be measured from
 a kernel that writes a counter or a dump, or a graph input the runtime updates -- not from the host
 inside the captured region.
 
+### `--no-cuda-graph` makes the probe valid, and it retires the conv hypothesis
+
+There IS a way to make host probes work: the CLI has `--no-cuda-graph`. Two things came out of it.
+
+**CUDA graphs are not the cause.** The artifact's output is byte-identical with and without them:
+
+| run | output |
+|---|---|
+| `--greedy` (graphs on) | `... likely meaning complete identity requesting requesting ... Strec Strec Strec` |
+| `--greedy --no-cuda-graph` | byte-identical |
+
+**And the conv state is being updated correctly.** With graphs off, 336 records (48 GDN layers x 7
+decode steps) read back cleanly, and every step changes every layer:
+
+```
+step 0 -> 1: 48 of 48 layers changed      ... and so on through step 5 -> 6
+step 0: 0 of 48 layers all zero
+layer 0, the three taps of channel 0, read as [3, channels]:
+  step 0: [ 1.288,  1.857, -1.524]
+  step 1: [ 1.857, -1.524,  1.348]     <- shifted left by one, new value appended
+  step 2: [-1.524,  1.348,  2.109]
+```
+
+That is a correct three-tap sliding window, properly seeded by the prefill. The conv state, its
+update, and the composition that feeds it are all right.
+
+The probe is kept in the tree, gated on `NINFER_GGUF_DUMP_CONV`, with the `--no-cuda-graph`
+requirement written next to it, because the next session will want it.
+
+**What this re-frames.** "Coherent for a few tokens, then degenerate" plus a PPL that is wrong but not
+catastrophic (10.256 against the working ternary artifact's 4.836, both finite) is the signature of a
+model that is *slightly wrong everywhere*, not one whose state collapses -- the opening tokens are
+simply the most predictable ones. That fits the remaining unexplained fact: PPL is wrong by nearly the
+same factor at forward width 7 (vector kernel) and width 15 (matrix kernel), so the error is in
+something both paths share rather than in either kernel.
+
+
 
 **The composition itself is now verified against the right reference.** The earlier comparison was
 against `dispatch_single_parent_snapshot`'s W8 fallback; the 27B's own path is the folded-ternary

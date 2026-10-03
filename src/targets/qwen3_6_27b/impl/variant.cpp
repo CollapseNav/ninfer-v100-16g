@@ -16,7 +16,10 @@
 #include "ops/linear/gguf/gguf_linear.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <vector>
 
 #define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_27b::detail::Variant
 #define NINFER_QWEN36_RUNTIME_NS qwen3_6_27b_runtime
@@ -80,6 +83,41 @@ constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 std::size_t folded_rotation_bytes(std::int32_t input_width, std::int32_t last) {
     return ops::linear_workspace_capacity_bytes(QType::PQ2_0_G128, input_width, input_width,
                                                 ops::LinearPolicy::A16Only, 1, last);
+}
+
+// NINFER_GGUF_DUMP_CONV=<path> appends the conv state this leaf produced, one record per call, and a
+// text log of the first values it was given. It only produces valid readings with --no-cuda-graph:
+// during capture the kernels do not run and the host side is visited once, so a probe inside a leaf
+// observes nothing about a replayed decode. The stream is synchronized first because a plain
+// cudaMemcpy runs on the legacy default stream and would read ahead of the kernels.
+void dump_conv_state(const Tensor& conv_states, const Tensor& projected, cudaStream_t stream) {
+    static const char* path = std::getenv("NINFER_GGUF_DUMP_CONV");
+    if (path == nullptr) { return; }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    static std::FILE* file = std::fopen(path, "wb");
+    if (file != nullptr && conv_states.data != nullptr && conv_states.dtype == DType::BF16) {
+        const std::size_t bytes =
+            static_cast<std::size_t>(conv_states.numel()) * sizeof(__nv_bfloat16);
+        std::vector<std::byte> host(bytes);
+        if (cudaMemcpy(host.data(), conv_states.data, bytes, cudaMemcpyDeviceToHost) ==
+            cudaSuccess) {
+            std::fwrite(host.data(), 1, bytes, file);
+            std::fflush(file);
+        }
+    }
+    static std::FILE* log = std::fopen("/root/ms/conv_input.log", "w");
+    if (log != nullptr && projected.data != nullptr && projected.dtype == DType::BF16) {
+        const std::size_t count = std::min<std::size_t>(4, projected.numel());
+        std::vector<__nv_bfloat16> head(count);
+        if (cudaMemcpy(head.data(), projected.data, count * sizeof(__nv_bfloat16),
+                       cudaMemcpyDeviceToHost) == cudaSuccess) {
+            for (std::size_t i = 0; i < count; ++i) {
+                std::fprintf(log, "%.5f ", static_cast<float>(head[i]));
+            }
+            std::fprintf(log, "\n");
+            std::fflush(log);
+        }
+    }
 }
 
 std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
@@ -299,6 +337,7 @@ void Variant::gdn_input_projection_snapshot(
         ops::detail::gdn_projected_conv_snapshot_launch(
             projected.view({kChannels, width, batch}), conv_weight, conv_states, valid_columns,
             initial_slot, snapshot_base_slot, query, key, value, stream);
+        dump_conv_state(conv_states, projected, stream);
         return;
     }
     const Weight& fused =
