@@ -1382,6 +1382,27 @@ window first becomes fully written.
 channel order and the projection feeding it are all right, and what is left is the conv STATE ring and
 the slot bookkeeping the shared launch is handed.
 
+### A probe trap worth recording: the decode is CUDA-graph captured
+
+An attempt to measure the conv state from inside the leaf produced two readings that had to be
+retracted, and both retractions are about the probe rather than the model:
+
+* the first version read the buffers with a plain `cudaMemcpy`, which runs on the legacy default stream
+  and does NOT synchronize with the model's stream. It reported `projected` heads like
+  `215334935317156371410416743765415821312.000000` -- uninitialised device memory, not a model fault;
+* synchronizing the model's stream then crashed (SIGSEGV) and wrote exactly one step's worth of
+  records, because **the decode runs as a captured CUDA graph**. Host code inside a leaf executes
+  during CAPTURE, once, and never during replay -- and capture does not execute the kernels, so what it
+  reads is whatever the buffers held before capture (zeros, for a fresh sequence). That is the whole
+  explanation for the "47 of 48 layers are exactly zero" and "the state freezes after step 1" readings.
+
+So neither reading says anything about decode, and neither is evidence for the conv-state hypothesis.
+The lesson for the next session: **a host-side probe inside a leaf cannot observe this model's decode
+at all.** Anything that must be measured per decode step has to be measured from the device side --
+a kernel that writes a counter or a dump, or a graph input the runtime updates -- not from the host
+inside the captured region.
+
+
 **The composition itself is now verified against the right reference.** The earlier comparison was
 against `dispatch_single_parent_snapshot`'s W8 fallback; the 27B's own path is the folded-ternary
 branch of `gdn_input_proj_conv_snapshot`, and it does
