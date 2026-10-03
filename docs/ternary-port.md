@@ -1265,6 +1265,33 @@ snapshot/record composition added when the model first ran, which is what every 
 composition can be compared against the split path's own `gdn_input_proj_conv_snapshot` output for
 the same inputs, which needs a fixture rather than a reference implementation.
 
+### The gate is the TEXT, not the PPL
+
+That comparison was the wrong instrument. The tree's ternary artifact and the Swift-1.5 artifact are
+**different models**: their BF16/FP32 roles differ in 442 of 537 cases, down to bf16 rounding in
+`a_log` and `dt_bias`. So 4.836 against 10.256 compares two models, not two paths, and it cannot say
+which is wrong. (The v2 ternary artifact is `qwen3.8-27b`/`groupwise-int`; the v3 one is
+`swift-1.5-qwen3.8-27b-gsq-rco-iq2xs`.)
+
+The gate that does work is the generated text, same harness, same prompt:
+
+| artifact | output |
+|---|---|
+| ternary (working) | `用户要求用 C++17 写一个线程安全的环形缓冲区，支持单生产者单消费者（SPSC），给出完整实现、关键设计说明和` |
+| IQ2_XS | `The user is writing/popularizing/populante/populante/poptantepptantepptantepptant` |
+
+and on a one-line prompt the GGUF artifact is telling: it opens coherently --
+`The user wants to know about ...` -- and then collapses into `...myselfakashifujibuzujireireireire`.
+Coherent first, then degenerate, means the error ACCUMULATES rather than being present in the first
+forward pass.
+
+**Exonerated since**: the KV cache (int8 and bf16 produce byte-identical text, so the cache is not
+what accumulates), the dequantizer and the whole product chain (measured against a reference), the
+binding (all 523 slices match the converter's own record in both artifacts), the block geometry, the
+`gate_up` row order, and the converter (no transform). What accumulates is the GDN's recurrent state,
+and the newest code on that path is this port's conv snapshot/record composition.
+
+
 
 
 
