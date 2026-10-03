@@ -67,6 +67,45 @@ std::uint64_t direct_word_bytes(NumericFormat format) {
     }
 }
 
+// GGUF block geometry: (weights per superblock, stored bytes per superblock). Taken from the
+// reference implementation in the upstream tree (src/ops/linear/gguf/ggml_bridge.cu, the
+// block_geometry switch) and then validated against the ModelScope artifact's own declared byte
+// counts -- all 401 gguf tensors satisfy rows * (cols / weights) * bytes == object.bytes, which is
+// the same rule this function implements, so a table error would have shown up as a mismatch.
+struct GgufBlockGeometry {
+    std::uint64_t weights;
+    std::uint64_t bytes;
+};
+
+GgufBlockGeometry gguf_block_geometry(NumericFormat format) {
+    switch (format) {
+    case NumericFormat::GGUF_Q2_K:
+        return {256, 84};
+    case NumericFormat::GGUF_Q4_K:
+        return {256, 144};
+    case NumericFormat::GGUF_Q6_K:
+        return {256, 210};
+    case NumericFormat::GGUF_IQ1_S:
+        return {256, 50};
+    case NumericFormat::GGUF_IQ1_M:
+        return {256, 56};
+    case NumericFormat::GGUF_IQ2_XXS:
+        return {256, 66};
+    case NumericFormat::GGUF_IQ2_XS:
+        return {256, 74};
+    case NumericFormat::GGUF_IQ2_S:
+        return {256, 82};
+    case NumericFormat::GGUF_IQ3_XXS:
+        return {256, 98};
+    case NumericFormat::GGUF_IQ3_S:
+        return {256, 110};
+    case NumericFormat::GGUF_IQ4_XS:
+        return {256, 136};
+    default:
+        throw ArtifactError("gguf_blocks_v1 requires a GGUF block-quantized format");
+    }
+}
+
 } // namespace
 
 std::string_view format_name(NumericFormat format) noexcept {
@@ -93,6 +132,28 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "PTQ1_0_G128";
     case NumericFormat::PQ2_0_G128:
         return "PQ2_0_G128";
+    case NumericFormat::GGUF_Q2_K:
+        return "GGUF_Q2_K";
+    case NumericFormat::GGUF_Q4_K:
+        return "GGUF_Q4_K";
+    case NumericFormat::GGUF_Q6_K:
+        return "GGUF_Q6_K";
+    case NumericFormat::GGUF_IQ1_S:
+        return "GGUF_IQ1_S";
+    case NumericFormat::GGUF_IQ1_M:
+        return "GGUF_IQ1_M";
+    case NumericFormat::GGUF_IQ2_XXS:
+        return "GGUF_IQ2_XXS";
+    case NumericFormat::GGUF_IQ2_XS:
+        return "GGUF_IQ2_XS";
+    case NumericFormat::GGUF_IQ2_S:
+        return "GGUF_IQ2_S";
+    case NumericFormat::GGUF_IQ3_XXS:
+        return "GGUF_IQ3_XXS";
+    case NumericFormat::GGUF_IQ3_S:
+        return "GGUF_IQ3_S";
+    case NumericFormat::GGUF_IQ4_XS:
+        return "GGUF_IQ4_XS";
     }
     return {};
 }
@@ -107,6 +168,8 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "blockscale-k16-m128x4-v1";
     case StorageLayout::RowScaleV1:
         return "row-scale-v1";
+    case StorageLayout::GgufBlocksV1:
+        return "gguf_blocks_v1";
     }
     return {};
 }
@@ -148,6 +211,17 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     }
     if (layout == StorageLayout::RowScaleV1) {
         return row_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::GgufBlocksV1) {
+        if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
+            throw ArtifactError("gguf_blocks_v1 requires a positive rank-two shape");
+        }
+        const auto geometry = gguf_block_geometry(format);
+        if (shape[1] % geometry.weights != 0) {
+            throw ArtifactError("gguf_blocks_v1 requires K divisible by the superblock's weight count");
+        }
+        const auto blocks = checked_mul(shape[0], shape[1] / geometry.weights, "gguf block count");
+        return checked_mul(blocks, geometry.bytes, "tensor encoded size");
     }
     throw ArtifactError("unknown tensor layout");
 }

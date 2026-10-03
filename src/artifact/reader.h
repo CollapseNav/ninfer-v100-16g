@@ -30,6 +30,21 @@ enum class NumericFormat {
     FP8_E4M3FN_ROW_BF16S,
     PTQ1_0_G128,
     PQ2_0_G128,
+    // GGUF block-quantized families. The ModelScope Swift-1.5 artifact stores 401 of its 1192
+    // tensors in these, so the container layer accepts them independently of whether a kernel
+    // exists yet. Storage is the gguf_blocks_v1 layout: 256-weight superblocks (32 for IQ4_NL)
+    // exactly as GGUF writes them, so no conversion is involved on read.
+    GGUF_Q2_K,
+    GGUF_Q4_K,
+    GGUF_Q6_K,
+    GGUF_IQ1_S,
+    GGUF_IQ1_M,
+    GGUF_IQ2_XXS,
+    GGUF_IQ2_XS,
+    GGUF_IQ2_S,
+    GGUF_IQ3_XXS,
+    GGUF_IQ3_S,
+    GGUF_IQ4_XS,
 };
 
 enum class StorageLayout {
@@ -37,6 +52,7 @@ enum class StorageLayout {
     RowSplitK128V1,
     BlockScaleK16M128x4V1,
     RowScaleV1,
+    GgufBlocksV1,
 };
 
 enum class ResourceEncoding {
