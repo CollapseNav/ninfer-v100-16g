@@ -1291,6 +1291,24 @@ binding (all 523 slices match the converter's own record in both artifacts), the
 `gate_up` row order, and the converter (no transform). What accumulates is the GDN's recurrent state,
 and the newest code on that path is this port's conv snapshot/record composition.
 
+### The port is fundamentally right; something accumulates
+
+The conv composition survived its own audit, and the artifact shows the port's core is correct:
+
+| check | result |
+|---|---|
+| `conv_record` shape | the working ternary path composes with the same `compose_record` and the same `gdn_input_proj(x, weight, record_flat, z_flat)`, so `conv_record` is `kChannels = 2048+2048+6144 = 10240` rows -- what this port reshapes to |
+| workspace sufficiency | the shape-keyed capacity query reserves the `[channels, projected_width]` leaf the compose route asks for, and `DeviceArena::alloc` throws rather than silently overrunning -- the runs do not throw, so the arena is not the problem |
+| `Tensor::view`/`reshape` | requires contiguity and preserves the `data` pointer including a slice's offset, so the rank-3-to-rank-2 reshapes in the conv leaves cannot silently mis-address |
+| basic capability | on `Complete this: 2 + 2 =` the GGUF artifact opens `User sent instruction requesting completion likely ...` and on a one-line question `The user wants to know about ...` -- both coherent |
+
+That last row matters most: **the model reasons about the prompt correctly and then collapses**, so the
+weights, the binding and the kernels are fundamentally right and what is wrong is state that
+accumulates over decode steps. `--prefill-chunk` cannot help pin it down (it must be a multiple of
+128, so the prefill cannot be forced onto the record path), and the KV dtype does not change the text
+at all.
+
+
 
 
 
