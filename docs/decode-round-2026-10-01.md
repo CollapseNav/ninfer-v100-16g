@@ -953,6 +953,33 @@ So the curve is a plateau of two: K = 1 at 15.52 and K = 5..7 at 15.6-16.8 ms/to
 between them. There is no win here, only a trap to avoid, and `--draft-tokens` is now a documented
 choice rather than a swept one.
 
+**The same sweep on the code workload, where the draft head is much better and the optimum moves.**
+Same batch, two repetitions, `real_code`, `--max-new 128`:
+
+| arm | t/s | acceptance | round ms | **L ms/token** | against no spec |
+|---|---:|---:|---:|---:|---:|
+| no spec | 53.3 | 1.00 | 18.76 | 18.76 | -- |
+| K = 1 | 71.60 | 1.94 | 27.09 | 13.97 | -25.5% |
+| K = 2 | 72.80 | 2.57 | 35.30 | 13.74 | -26.8% |
+| K = 3 | 70.15 | 3.00 | 42.77 | 14.26 | -24.0% |
+| K = 4 | 64.25 | 3.23 | 50.27 | 15.56 | -17.1% |
+| **K = 5** | **77.10** | 3.23 | 41.89 | **12.97 <- best** | **-30.9%** |
+| K = 7 | 75.00 | 3.50 | 46.67 | 13.33 | -28.9% |
+
+Code is far friendlier to the draft head than ordinary prose -- acceptance 1.94 against 1.65 at K = 1,
+3.00 against 2.03 at K = 3, 3.23 against 2.49 at K = 5 -- so speculation pays much more there (+45%
+against no spec at its best, against +24% on `real_task`). Two differences from the prose curve:
+
+* the dominated basin is narrower but still there: K = 2 (13.74) actually edges K = 1 (13.97), and the
+  only unambiguous trap is **K = 4 (15.56)**;
+* **K = 5 is a real optimum on code**, 7% better per token than K = 1, which it was not on `real_task`.
+
+The K = 4 -> K = 5 step reproduces exactly and for the same reason: round 50.27 -> 41.89 ms
+(**-16.7%**) at *identical* acceptance 3.23, because K = 5 verifies at T = 6 and takes the QPN route
+while K = 4's T = 5 is below the edge and runs the SIMT tile. So `--draft-tokens` is a workload
+parameter -- high-acceptance workloads want the large window -- and K = 4 is wrong everywhere.
+
+
 **A run-length artifact, recorded because it looked like a 24% win.** A probe at `--max-new 64` read
 K = 7 at 90.9 t/s and acceptance 3.94 against K = 1's 70.2 and 1.82, i.e. 11.0 against 14.5 ms/token.
 The round cost is identical at both lengths (43.3 against 43.4 ms) -- what changes is the acceptance,
