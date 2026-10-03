@@ -1285,11 +1285,22 @@ and on a one-line prompt the GGUF artifact is telling: it opens coherently --
 Coherent first, then degenerate, means the error ACCUMULATES rather than being present in the first
 forward pass.
 
-**Exonerated since**: the KV cache (int8 and bf16 produce byte-identical text, so the cache is not
-what accumulates), the dequantizer and the whole product chain (measured against a reference), the
+**Exonerated since**: the dequantizer and the whole product chain (measured against a reference), the
 binding (all 523 slices match the converter's own record in both artifacts), the block geometry, the
 `gate_up` row order, and the converter (no transform). What accumulates is the GDN's recurrent state,
 and the newest code on that path is this port's conv snapshot/record composition.
+
+**A correction on the KV cache.** An earlier round recorded the KV cache as exonerated because int8
+and bf16 produced byte-identical text. That test used a prompt short enough that the cache barely
+participated, so it was a false negative. On a 24-token generation the two dtypes DO differ:
+
+| artifact | `--kv-dtype int8` | `--kv-dtype bf16` |
+|---|---|---|
+| ternary (working) | `We need answer simple arithmetic. Done. Final: 4. 4` | byte-identical to int8 |
+| IQ2_XS | `omplete identity requesting evaluating requesting ... Strec Strec Strec` | `加拿大的 statement加拿大的 #=>加拿大的 ... Istitu Istitu` |
+
+and the working artifact answers the arithmetic correctly, which is the cleanest gate this port has.
+
 
 ### The port is fundamentally right; something accumulates
 
