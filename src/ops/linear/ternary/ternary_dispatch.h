@@ -35,4 +35,16 @@ void ternary_dispatch_basis_strided(const Tensor& x_folded, const Weight& w, Ten
                                     std::int32_t out_row_stride, LinearPolicy policy,
                                     WorkspaceArena* workspace, cudaStream_t stream);
 
+// residual_out += W * x, with the add folded into the GEMM's epilogue when the decode/verify arm
+// can carry it. Returns FALSE without launching anything when it cannot -- the caller must then
+// compose: ternary_dispatch() into a scratch, then ops::residual_add(). Every non-default route
+// (prefill, the QPN verify band, any switched arm, rotation disabled) takes that path.
+//
+// Bit-identical to the composed route on both paths: the fused epilogue rounds the projection to
+// bf16 before adding, which is what the composed route's intermediate scratch does. See
+// gemv_store() in ternary_rowsplit_gemv.cuh.
+[[nodiscard]] bool ternary_dispatch_add(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                        LinearPolicy policy, WorkspaceArena* workspace,
+                                        cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

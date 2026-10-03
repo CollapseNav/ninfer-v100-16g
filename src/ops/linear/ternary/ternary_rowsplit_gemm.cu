@@ -799,6 +799,83 @@ bool gemv_admits(const Tensor& x, const Weight& w, std::int32_t max_tokens) {
            (w.k % 128) == 0 && x.ne[1] >= 1 && x.ne[1] <= max_tokens && x.ne[0] == w.k;
 }
 
+// The fused-residual arm: the same kernels as the shipped decode/verify band, with the residual add
+// folded into the epilogue (see gemv_store() in the kernel header). It is bit-identical to the
+// composed route, so it needs no numerical qualification -- only the md5 gate the bit-identity
+// already implies.
+//
+// The gate is deliberately narrow: it names the exact arms the shipped defaults select, so a
+// switched route falls back to the composed path instead of silently taking a kernel it did not
+// ask for. Band:
+//   T = 1..2  the warp-staged kernel (staging on at its shipped depth 1; staging is what the
+//             decode step ships, and at depth 2 or off the T = 1..2 arm is a different kernel)
+//   T = 3..5  the small-tile kernel at unroll 4, fp16 container, mode 1, no weight table
+// Measured ceiling for deleting the residual_add launches outright:
+// NINFER_TERNARY_PROBE_SKIP_RESIDUAL gives 54.2/54.3 -> 55.3/55.3 t/s on the T = 1 decode step
+// (+1.9%), two repetitions, same batch.
+bool ternary_pq2_gemv_add_admits(const Tensor& x, const Weight& w) noexcept {
+    // NINFER_TERNARY_FUSED_RESIDUAL=0 restores the composed route (GEMM into a scratch, then
+    // ops::residual_add) for every layer. It is the A/B arm, and the rollback switch: because the
+    // fused epilogue is bit-identical, the two arms must produce byte-identical output.
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_TERNARY_FUSED_RESIDUAL");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    if (!enabled) { return false; }
+    // Geometry and token band only -- the container is ternary_activation_is_fp16()'s decision and
+    // the launcher enforces it. Deciding the dtype here as well would make this predicate
+    // unsatisfiable from the only place that can call it before the rotation, which is exactly the
+    // bug this comment exists to prevent.
+    if (!gemv_admits(x, w, 5)) { return false; }
+    if (((w.k / 128) % 8) != 0) { return false; }
+    // Any switched arm means the fused instantiation is not the one the dispatcher would pick.
+    if (tile_weight_table_enabled() || fp16_mode2() || tile_wide1_enabled()) { return false; }
+    if (x.ne[1] <= 2) { return tile_stage_enabled() && tile_stage_depth() == 1; }
+    return true;
+}
+
+void launch_ternary_pq2_gemv_add(const Tensor& x, const Weight& w, Tensor& out,
+                                 std::int32_t out_row_stride, cudaStream_t stream) {
+    if (x.dtype != DType::FP16) {
+        throw std::invalid_argument(
+            "ternary pq2 fused residual: the fused epilogue serves the fp16 decode container only");
+    }
+    const std::int32_t groups_per_row = w.k / 128;
+    const std::int32_t tokens         = x.ne[1];
+    const unsigned grid = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
+    const dim3 block(kGemvWarpsPerBlock * 32, 1u, 1u);
+    // `out` is the residual stream: the fused epilogue reads it at the same index it writes.
+    const auto* x_ptr     = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* codes     = static_cast<const std::uint8_t*>(w.qdata);
+    const auto* scales    = static_cast<const std::uint8_t*>(w.scales);
+    auto* out_ptr         = static_cast<__nv_bfloat16*>(out.data);
+    const __nv_bfloat16* residual = static_cast<const __nv_bfloat16*>(out.data);
+    const auto fire_stage = [&](auto token_tag) {
+        constexpr int kTokens = decltype(token_tag)::value;
+        ternary_pq2_gemv_stage_kernel<kTokens, 1, 1, true>
+            <<<grid, block, 0, stream>>>(x_ptr, codes, scales, out_ptr, w.n, groups_per_row,
+                                         tokens, out_row_stride, residual);
+    };
+    const auto fire_tile = [&](auto token_tag) {
+        constexpr int kTokens = decltype(token_tag)::value;
+        ternary_pq2_gemv_tile_kernel<kTokens, 4, false, 1, kGemvProbeOff, false, 1, true>
+            <<<grid, block, 0, stream>>>(x_ptr, codes, scales, out_ptr, w.n, groups_per_row,
+                                         tokens, out_row_stride, residual);
+    };
+    using std::integral_constant;
+    switch (tokens) {
+    case 1: fire_stage(integral_constant<int, 1>{}); break;
+    case 2: fire_stage(integral_constant<int, 2>{}); break;
+    case 3: fire_tile(integral_constant<int, 3>{}); break;
+    case 4: fire_tile(integral_constant<int, 4>{}); break;
+    case 5: fire_tile(integral_constant<int, 5>{}); break;
+    default:
+        // admits() has already excluded this; fail loudly rather than launch nothing.
+        throw std::invalid_argument("ternary pq2 fused residual: token count outside the band");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // Routing switch for the speculative VERIFY band (T = 2..4), which the small-tile GEMV serves by
 // default. That kernel reads each weight byte once for every token in the tile, but it re-reads the
 // ACTIVATION for every output row: per group per lane it loads 2*kT activation elements against one

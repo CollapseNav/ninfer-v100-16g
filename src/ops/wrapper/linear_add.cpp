@@ -255,10 +255,14 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("ternary linear_add admits only A16");
         }
-        // residual_out += W * x. There is no fused ternary residual kernel, so compose it from the
-        // shared ternary GEMM and the existing elementwise add. The GEMM also maps x into the
-        // folded basis, which is why the projection scratch and the rotation buffer both come from
-        // this op's workspace.
+        // residual_out += W * x. On the decode and verify band the ternary GEMM can add the
+        // residual in its own epilogue, which deletes one launch per layer from the decode step;
+        // that arm is bit-identical to the composed route below because it reproduces the
+        // intermediate bf16 rounding. It declines every other shape (prefill, the QPN verify band,
+        // a switched arm), and then this composes the shared ternary GEMM with the elementwise add.
+        // The GEMM also maps x into the folded basis, which is why the projection scratch and the
+        // rotation buffer both come from this op's workspace.
+        if (detail::ternary_dispatch_add(x, w, residual_out, policy, &ws, stream)) { return; }
         auto scope       = ws.scope();
         Tensor projected = ws.alloc(DType::BF16, {w.n, t});
         detail::ternary_dispatch(x, w, projected, policy, &ws, stream);

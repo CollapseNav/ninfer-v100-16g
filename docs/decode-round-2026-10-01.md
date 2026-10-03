@@ -465,3 +465,126 @@ Not attempted. Four files plus two validation runs for a measured ceiling an ord
 the two changes that did move this session (the staged code plane, +6% decode; the QPN default fix,
 +90% on the lookup path). Recorded with its cost so the next session can decide on numbers rather
 than on the 5-8% estimate that the launch-count arithmetic suggested.
+
+---
+
+## Round 9 — the fused residual epilogue: **+1.8-2.0% decode, bit-identical**
+
+Round 8 left item ② unbuilt on a ceiling of +0.8-1%. That ceiling was an estimate from launch
+arithmetic; this round re-priced it before writing any kernel, and the estimate was wrong by a factor
+of two.
+
+### The price, measured first
+
+`ops::residual_add` already carried a probe (`NINFER_TERNARY_PROBE_SKIP_RESIDUAL=1`, "do not launch
+this kernel at all"), so the ceiling was one same-batch A/B away. Interleaved arms, two repetitions,
+`real_task`, no spec:
+
+| arm | run 1 | run 2 |
+|---|---:|---:|
+| control | 54.2 | 54.3 |
+| `NINFER_TERNARY_PROBE_SKIP_RESIDUAL=1` | **55.3** | **55.3** |
+
+**+1.9%**, against round 8's +0.8-1% and at the top of round 3's "5-8% for the whole tail" band. The
+MTP arm of the same probe is unusable as a price: skipping the add corrupts the verify logits, so the
+acceptance length collapses from 1.65 to 1.00 tok/round and the arm measures a different amount of
+work (39.3 t/s). Recorded so nobody re-runs it as a speed arm.
+
+### What was built
+
+`gemv_store<kAddResidual>` in `ternary_rowsplit_gemv.cuh`, used by the two kernels that serve the
+shipped decode/verify band: the warp-staged kernel at T = 1..2 (depth 1) and the small-tile kernel at
+T = 3..5. `ops::linear_add`'s ternary branch now tries `ternary_dispatch_add` first and composes only
+when it declines. Everything outside the band -- prefill, the QPN 6..32 verify, the MTP head's own
+`mtp_post_mixer` (one launch per draft forward, not worth a workspace change) -- is untouched.
+
+**The arithmetic is the one round 8 did not consider, and it is why this was cheap.** Round 8 assumed
+the epilogue would add the fp32 accumulator to the residual: strictly more accurate, but it moves
+greedy ids, so it needed a re-recorded md5 baseline plus a perplexity run -- which is the cost that
+made a +1% change a bad trade. Instead the epilogue rounds the projection to bf16 *first* and adds in
+fp32 with a second rounding, reproducing the composed route's double rounding exactly. The change is
+therefore **bit-identical**, and the whole numerical-qualification budget disappears: the 96-token
+greedy md5 against `/root/wt/base.out` is IDENTICAL with the arm on and off, and the generated text is
+byte-identical on all eight fixtures.
+
+### Proof that it is actually running
+
+A route that is never taken is trivially bit-identical, and that is exactly what the first build
+measured: **0.0% on every arm with a passing md5 gate.** The bug was the gate itself --
+`ternary_pq2_gemv_add_admits` checked for the fp16 activation container, and `ternary_dispatch_add`
+called it on the *raw* bf16 activation, so it always declined and the composed route ran. Recorded
+because "identical output, identical speed" is an easy state to mistake for a negative result; the
+way out is to check that the kernel actually ran:
+
+| evidence | composed | fused |
+|---|---:|---:|
+| `ternary_pq2_gemv_stage_kernel<..., bool=1>` calls in a 64-step decode trace | 0 | 16,896 |
+| `residual_add_bf16x8` launches, whole trace | 8,576 | 128 |
+| -- of those, at the decode geometry grid(3) | 8,320 | **0** |
+| -- of those, prefill geometry grid(208) | 128 | 128 |
+
+The 128 that remain are the prefill's; a decode step now issues **zero** `residual_add` launches.
+
+### A/B, same batch, interleaved arms
+
+Two repetitions of the full band, `NINFER_TERNARY_FUSED_RESIDUAL=0` as the control:
+
+| load | composed | fused | delta |
+|---|---:|---:|---:|
+| T = 1 decode, `real_task` | 54.2 / 54.2 | **55.2 / 55.3** | **+1.9%** |
+| T = 1 decode, `real_code` | 52.3 / 52.3 | **53.2 / 53.2** | **+1.7%** |
+| T = 1 decode, `prose4k` | 50.6 / 50.7 | **51.5 / 51.5** | **+1.7%** |
+| MTP K = 1 | 63.9 / 63.9 | **64.4 / 64.4** | +0.8% |
+| MTP K = 2 | 54.5 / 54.6 | **54.9 / 54.8** | +0.6% |
+| MTP K = 3 | 49.3 / 49.3 | **49.6 / 49.5** | +0.5% |
+| lookup10 K = 7 (T = 16) | 237.3 / 237.6 | 237.7 / 237.8 | +0.1% |
+| lookup16 K = 7 | 250.0 / 250.0 | 249.8 / 249.7 | -0.1% |
+| prefill, `real_code` | 1.16k | 1.16k | 0 |
+
+Acceptance length identical on every MTP arm (1.65 / 1.85 / 2.03 / 12.11 / 12.70 tok/round) and the
+generated text byte-identical on all sixteen run pairs -- the discrete confirmation of bit-identity.
+The last three rows are the control: the fused band is T = 1..5, so the QPN band and prefill should
+not move, and they do not.
+
+**MTP gains only a third of what T = 1 does, and that is reported rather than explained away.** The
+verify forward at T = 2 deletes the same 132 launches the T = 1 step does, and the round should
+therefore gain about 0.33 ms of its 25.8 ms; it gains 0.16 ms. The MTP head's *own* `residual_add`
+cannot account for the difference -- it is one launch per draft forward, not 132. Whatever absorbs the
+rest, the same-batch fused/composed comparison is the number that matters and it is consistent across
+three K values and two repetitions.
+
+### What is left
+
+The tail-fusion direction is now half collected. `residual_add` (the 130-132 launches/token) is gone
+from the decode step; the other two elementwise consumers the probes priced are not:
+
+1. **`rmsnorm`, +3.9% / 0.77 ms by the same probe** (210 calls/pass) -- the largest single item left
+   on the tail. Not an epilogue problem: the norm reduces over the whole hidden vector while each
+   GEMV warp produces one element of it, so folding it into the producer needs a grid-wide reduction.
+   The one fusion this tree tried in that family (norm+rotation, bit-identical) lost 2.0-2.6% to the
+   barrier it added.
+2. **`silu_and_mul`, +1.8% / 0.37 ms** (61-65 calls/pass). Its producer is `linear_swiglu`'s gate_up
+   GEMM, whose two halves are different output rows of one tensor, so the epilogue of the warp that
+   computes `gate[r]` cannot see `up[r]` without a cross-warp handshake. A kernel whose warp owns
+   rows `r` and `r + intermediate` would make it local, at the price of changing the GEMV's row ->
+   warp mapping.
+3. **Tail structural concurrency** is now worth strictly less than when round 3 priced it: the
+   ~0.45 ms it was meant to overlap is gone. The chain is still strictly serial and the only siblings
+   are still the attention input projections, already fused into one op.
+4. Unchanged from round 8: small-n split-K (~1%), and the QPN in-band leftovers (kTiles 3/4 NACC,
+   small-n grids, weight-fetch pipelining -- lookup only).
+
+### Reproduce
+
+```bash
+# the ceiling, before any code change
+bash /root/probe_skipres.sh          # -> /root/ninfer_ab/skipres
+
+# bit-identity + the whole band, fused on vs NINFER_TERNARY_FUSED_RESIDUAL=0
+bash /root/fused_final.sh            # -> /root/ninfer_ab/fused9f
+
+# the launch-count and kernel-instantiation proof
+bash /root/fused_check.sh            # -> /root/nvp_t1/fused_{on,off}.txt
+```
+
+

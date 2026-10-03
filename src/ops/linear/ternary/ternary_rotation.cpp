@@ -70,20 +70,15 @@ std::size_t ternary_projection_workspace_bytes(std::int32_t output_rows, std::in
            ternary_cutlass_sm70_workspace_bytes(input_rows, tokens);
 }
 
-Tensor folded_activation(const Tensor& x, const Weight& weight, WorkspaceArena& workspace,
-                         cudaStream_t stream) {
-    if (!ternary_rotation_enabled()) { return x; }
-    if (!ternary_weight_is_folded(weight)) {
-        throw std::invalid_argument(
-            "folded ternary weight has no sign block; the artifact must carry "
-            "text/hadamard_signs and text/hadamard_widths");
-    }
-    // The decode band (T = 1 and the speculative verify widths) gets an fp16 activation container so
-    // the GEMV can run the group dot with half2 math -- T = 1 included, which routes through the same
-    // tile kernel at kT = 1 rather than through the dedicated T = 1 kernel. Prefill keeps bf16 because
-    // its consumers (the fused MMA arm and the CUTLASS arm) read bf16. fp16 is still 2 bytes, so the workspace reservation is unchanged.
-    // The wide-tile predicate is duplicated on purpose: with NINFER_TERNARY_TILE_WIDE=0 the T = 5..16
-    // band runs the row-blocked kernel, which is bf16-only.
+// The decode band (T = 1 and the speculative verify widths) gets an fp16 activation container so
+// the GEMV can run the group dot with half2 math -- T = 1 included, which routes through the same
+// tile kernel at kT = 1 rather than through the dedicated T = 1 kernel. Prefill keeps bf16 because
+// its consumers (the fused MMA arm and the CUTLASS arm) read bf16. fp16 is still 2 bytes, so the
+// workspace reservation is unchanged.
+//
+// The wide-tile predicate is duplicated in the *other* direction on purpose: with
+// NINFER_TERNARY_TILE_WIDE=0 the T = 5..16 band runs the row-blocked kernel, which is bf16-only.
+bool ternary_activation_is_fp16(const Tensor& x, const Weight& weight) {
     static const bool wide_tile = [] {
         const char* env = std::getenv("NINFER_TERNARY_TILE_WIDE");
         return env == nullptr || std::string(env) != "0";
@@ -99,11 +94,22 @@ Tensor folded_activation(const Tensor& x, const Weight& weight, WorkspaceArena& 
     // to the bf16-only reference/SIMT kernels, which reject an fp16 activation outright
     // ("a non-bf16 activation reached the bf16 reference route"). Gating on qtype, not on a
     // global default, is what keeps a PTQ1_0 or mixed artifact loadable.
-    const bool want_fp16 = fp16_act && wide_tile && weight.qtype == QType::PQ2_0_G128 &&
-                           x.ne[1] >= 1 && x.ne[1] <= 16;
+    return fp16_act && wide_tile && weight.qtype == QType::PQ2_0_G128 && x.ne[1] >= 1 &&
+           x.ne[1] <= 16;
+}
+
+Tensor folded_activation(const Tensor& x, const Weight& weight, WorkspaceArena& workspace,
+                         cudaStream_t stream) {
+    if (!ternary_rotation_enabled()) { return x; }
+    if (!ternary_weight_is_folded(weight)) {
+        throw std::invalid_argument(
+            "folded ternary weight has no sign block; the artifact must carry "
+            "text/hadamard_signs and text/hadamard_widths");
+    }
     const DeviceSpan span =
         workspace.alloc_bytes(ternary_rotation_workspace_bytes(weight.k, x.ne[1]));
-    Tensor rotated(span.data, want_fp16 ? DType::FP16 : DType::BF16, {weight.k, x.ne[1]});
+    Tensor rotated(span.data, ternary_activation_is_fp16(x, weight) ? DType::FP16 : DType::BF16,
+                   {weight.k, x.ne[1]});
     launch_ternary_rotation(x, rotated, weight, stream);
     return rotated;
 }

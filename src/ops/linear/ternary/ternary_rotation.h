@@ -44,6 +44,13 @@ namespace ninfer::ops::detail {
 // and a perplexity that is *not* in the hundreds is the signal that the rotation is correct.
 [[nodiscard]] bool ternary_rotation_enabled();
 
+// Whether folded_activation() will hand back the FP16 activation container that the decode band's
+// fp16 GEMV reads, as opposed to the BF16 one the prefill routes read. Single statement of that
+// predicate: folded_activation() itself is the only other place that may decide it, and the fused
+// residual entry point asks this before it commits to the fused kernel -- a mismatch would either
+// silently fall back or feed an fp16-only kernel a bf16 tensor.
+[[nodiscard]] bool ternary_activation_is_fp16(const Tensor& x, const Weight& weight);
+
 // Whether the folded GDN feature permutation P is applied.
 //
 // llama.cpp applies P because ITS runtime keeps the GDN V channels tiled, matching the GGUF's

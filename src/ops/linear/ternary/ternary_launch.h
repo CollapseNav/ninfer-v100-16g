@@ -42,4 +42,22 @@ void launch_ternary_gemm_t8(const Tensor& x, const Weight& w, Tensor& out,
 void launch_ternary_volta_mma(const Tensor& x, const Weight& w, Tensor& out,
                               std::int32_t out_row_stride, cudaStream_t stream);
 
+// Fused-residual arm of the PQ2 GEMV: the same kernel as the shipped one, with the layer's
+// residual add folded into its epilogue so that `out` is both read and written and no separate
+// ops::residual_add launch is needed. Bit-identical to the composed route -- see gemv_store().
+//
+// `admits` decides the GEOMETRY, the token band and the route knobs; `x` may be the raw activation
+// in either container. The container the fused kernel needs (fp16) is decided by
+// ternary_activation_is_fp16() before the rotation, because it is the same predicate
+// folded_activation() applies -- and launch_ternary_pq2_gemv_add() rejects a non-fp16 activation
+// outright, so the two can never disagree silently.
+//
+// Band: the shipped decode/verify arms -- the staged kernel at T = 1..2 (staging on at its shipped
+// depth) and the small-tile kernel at T = 3..5, with the default route knobs. Everything else
+// (prefill, the QPN verify band, a switched arm) returns false and the caller composes the GEMM and
+// ops::residual_add as before.
+[[nodiscard]] bool ternary_pq2_gemv_add_admits(const Tensor& x, const Weight& w) noexcept;
+void launch_ternary_pq2_gemv_add(const Tensor& x, const Weight& w, Tensor& out,
+                                 std::int32_t out_row_stride, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

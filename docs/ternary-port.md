@@ -15,8 +15,8 @@ Artifact: `bonsai2_27b_swift_pq2.ninfer` (8.31 GB, identity `qwen3.8-27b/groupwi
 |---|---|
 | prefill, 3412-token prompt | **1190 t/s** (3 runs: 1190 / 1190 / 1190); re-measured on the current build at **1200-1210** (3662 tokens) and **1230** (4042 tokens, 4096 chunk) |
 | — as a fraction of the card | 59.5 TFLOP/s = **47.6%** of the 125 TFLOP/s fp16 peak |
-| decode | **51.1 t/s** with `NINFER_TERNARY_ROTATE_SPLIT=16`, **48.7** with no environment variables, 44.6 before `327f4b10` + `1df45be1`. The `41.6` used throughout the Decode section is the dedicated warp-per-row kernel, which is no longer the default route. **54.2-54.3** after the warp-staged decode code plane (`e0dd854d`, `e974ec60`; rounds 4-5 of `docs/decode-round-2026-10-01.md`), which also takes the MTP K = 1 verify from 61.9 to 63.9 t/s |
-| context-lookup K=7 (repeated text, T = 16 verify) | **234.8** t/s `lookup10`, **246.6** `lookup16` with the QPN wide-verify route (default); **123.7 / 126.7** with `NINFER_TERNARY_QPN=0`. Only the T >= 6 verify band changes -- the decode and MTP bands are md5-identical |
+| decode | **51.1 t/s** with `NINFER_TERNARY_ROTATE_SPLIT=16`, **48.7** with no environment variables, 44.6 before `327f4b10` + `1df45be1`. The `41.6` used throughout the Decode section is the dedicated warp-per-row kernel, which is no longer the default route. **54.2-54.3** after the warp-staged decode code plane (`e0dd854d`, `e974ec60`; rounds 4-5 of `docs/decode-round-2026-10-01.md`), which also takes the MTP K = 1 verify from 61.9 to 63.9 t/s. **55.2-55.3** after the fused residual epilogue (round 9 of the same document), which deletes the decode step's last 132 `residual_add` launches; on `real_code` 52.3 -> 53.2 and on `prose4k` 50.6 -> 51.5, all with byte-identical output |
+| context-lookup K=7 (repeated text, T = 16 verify) | **234.8** t/s `lookup10`, **246.6** `lookup16` with the QPN wide-verify route (default); **123.7 / 126.7** with `NINFER_TERNARY_QPN=0`. Only the T >= 6 verify band changes -- the decode and MTP bands are md5-identical. Unchanged by round 9: the fused epilogue covers T = 1..5, so the lookup band still composes |
 | causal scoring (`ninfer-perplexity`) | 1091 tok/s, was 106.3 |
 | startup | 8.7 s (weights 6.70 GiB); 10.1-10.2 s re-measured as `engine ready` at `--max-context 8192` on this build |
 
@@ -95,6 +95,10 @@ Both fast prefill arms are selected automatically; `NINFER_TERNARY_CUTLASS=0` re
 | `NINFER_TERNARY_GEMV_PROBE` | `noact` / `nocode` / `codealu` / `noscale`. Deletes one load class at a time, **numerically wrong by design**. This is how the decode step's cost was located |
 | `NINFER_TERNARY_HADAMARD=0` | skip the folded-basis rotation. **Numerically meaningless** — diagnostic only |
 | `NINFER_TERNARY_GDN_PERM` | default off. `=1` restores llama.cpp's `.ssm_out.` permutation; leave it off, the runtime already emits grouped V |
+| `NINFER_TERNARY_FUSED_RESIDUAL` | **default on** (unset or any value except `0`). `0` restores the composed route (ternary GEMM into a scratch, then `ops::residual_add`) for the T = 1..5 decode/verify band. Bit-identical either way — it is the round-9 A/B arm and the rollback switch, not a numerical knob |
+| `NINFER_TERNARY_TILE_STAGE` | default on. `0` disables the warp-staged T = 1..2 decode GEMV (costs 3.9%) and also takes the fused residual epilogue off that band, since the fused arm is the staged kernel |
+| `NINFER_TERNARY_STAGE_DEPTH` | staged kernel prefetch distance, default 1. `2` measured -2.7%, and also falls back to the composed route |
+| `NINFER_TERNARY_PROBE_SKIP_RESIDUAL` | do not launch `ops::residual_add` at all. **Numerically wrong by design**; this is how the fused epilogue's ceiling was priced (+1.9% on the T = 1 step) |
 
 ### Wrong values, and what they cost
 
@@ -524,6 +528,35 @@ cap with **no spill** (STACK and LOCAL both 0 at every value):
 ids unchanged at every value. Below 48 registers it falls off — the unroll-8 arm runs out of room for
 its eight in-flight loads — so the memory-level-parallelism hypothesis is confirmed but with a small
 payoff: +14% occupancy for +4.8% throughput.
+
+### The fused residual epilogue (round 9): 54.2 -> 55.3 t/s, bit-identical
+
+The decode step's largest remaining tail item was the 132 `residual_add` launches it issued, one per
+folded linear. `ops::linear_add` **looked** fused and was not: its ternary branch composed the shared
+`ternary_dispatch` into a scratch tensor and then called `ops::residual_add`, because no ternary
+kernel had a residual epilogue. The GEMV family now has one (`gemv_store<kAddResidual>` in
+`ternary_rowsplit_gemv.cuh`), and the decode/verify band uses it, so a T = 1 step issues **zero**
+`residual_add` launches; the only ones left in a decode trace are the prefill's.
+
+It is **bit-identical**, and by construction: `residual_add` computes
+`__float2bfloat16_rn(bf16(y) + bf16(x))` on a projection the GEMV has already rounded to bf16, so the
+composed route rounds twice. The fused epilogue reproduces exactly those two roundings. Adding the
+fp32 accumulator instead would be more accurate and would move greedy ids — that is the version
+round 8 priced, and the reason it estimated a re-recorded baseline plus a perplexity run. Doing the
+double rounding instead is what made the change cheap: the 96-token greedy md5 against
+`/root/wt/base.out` is IDENTICAL with the arm on and off, and the output text is byte-identical on
+all eight fixtures (`real_task`, `real_code`, `prose4k`, `lookup10`, `lookup16`).
+
+| arm, same batch, interleaved | T = 1 | MTP K = 1 | MTP K = 2 | MTP K = 3 | `real_code` | `prose4k` | lookup10 | lookup16 | prefill `real_code` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| composed (`NINFER_TERNARY_FUSED_RESIDUAL=0`) | 54.2 | 63.9 | 54.5 | 49.3 | 52.3 | 50.6 | 237.3 | 250.0 | 1.16k |
+| **fused (default)** | **55.3** | **64.4** | **54.9** | **49.6** | **53.2** | **51.5** | 237.7 | 249.8 | 1.16k |
+| delta | **+2.0%** | +0.8% | +0.6% | +0.5% | **+1.7%** | **+1.7%** | +0.1% | -0.1% | 0 |
+
+The lookup and prefill columns are the control: the fused band is T = 1..5, so the QPN verify band
+(6..32) and prefill are not touched and sit inside their own noise. Acceptance length is identical on
+every MTP arm (1.65 / 1.85 / 2.03 / 12.11 / 12.70 tok/round), which is the discrete confirmation of
+the bit-identity. `NINFER_TERNARY_FUSED_RESIDUAL=0` is both the A/B arm and the rollback.
 
 Re-sweeping `kUnroll` *inside* the 64-register cap does not unlock a higher unroll, which was the
 obvious follow-up: 4 -> 39.7, **8 -> 43.6**, 12 -> 41.1, 16 -> 39.6, 20 -> 42.4. Unroll 8 is still the
@@ -1364,6 +1397,12 @@ and the rotation gained a split-shaped copy arm. Control 49.3 tok/s = 20.28 ms/t
 | skip `residual_add` (128 calls) | 50.4 | +2.2% | 0.45 ms |
 | skip `silu_mul` (61 calls) | 50.2 | +1.8% | 0.37 ms |
 | all three | 52.9 | +7.3% | 1.47 ms -- **within 8% of the sum: the arms are additive** |
+
+**The `residual_add` row has since been collected** (round 9 of
+`docs/decode-round-2026-10-01.md`): the re-priced probe read +1.9% on this build's faster step
+(54.2/54.3 -> 55.3/55.3) and the fused epilogue delivered the whole of it -- 54.2 -> 55.3 t/s, md5
+unchanged. The other two rows are still open, and the `rmsnorm` row is the largest single item left
+on the tail.
 | split-shaped copy probe | 50.6 | +2.6% | -> **split rotation's transform = 0.52 ms** |
 
 Two readings that matter:

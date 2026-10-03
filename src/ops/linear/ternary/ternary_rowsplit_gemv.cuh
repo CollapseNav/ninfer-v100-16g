@@ -47,6 +47,30 @@ inline constexpr int kGemvGroupK             = 128;
 // measured optimum, not a conservative default.
 inline constexpr int kBlockMinCtasPerSm = 3;
 
+// Epilogue store shared by the decode and verify GEMV kernels.
+//
+// kAddResidual = true folds ops::residual_add into the producer. The arithmetic is chosen, not
+// inherited: ops::residual_add computes __float2bfloat16_rn(bf16(y) + bf16(x)) on a projection the
+// GEMV has ALREADY rounded to bf16, so the composed route rounds twice. This epilogue reproduces
+// exactly those two roundings -- round the fp32 accumulator to bf16 first, then add in fp32 and
+// round again -- which makes the fused route bit-identical to the composed one. Adding the fp32
+// accumulator to the residual instead would be strictly more accurate and is NOT what this does:
+// it would move greedy ids and require a re-recorded md5 baseline and a perplexity check for a
+// gain that the launch removal already delivers on its own.
+//
+// `residual` is deliberately not __restrict__: on the fused route it aliases `out`, and the load at
+// `index` must be the value the composed route would have read from the projection scratch.
+template <bool kAddResidual>
+__device__ __forceinline__ void gemv_store(__nv_bfloat16* out, const __nv_bfloat16* residual,
+                                           std::int64_t index, float value) {
+    __nv_bfloat16 projected = __float2bfloat16_rn(value);
+    if constexpr (kAddResidual) {
+        projected = __float2bfloat16_rn(__bfloat162float(projected) +
+                                        __bfloat162float(residual[index]));
+    }
+    out[index] = projected;
+}
+
 __device__ __forceinline__ float gemv_scale(const std::uint8_t* scale_ptr) {
     // One 16-bit load instead of two byte loads plus a shift/or; the scale plane is 2-byte aligned.
     const std::uint16_t bits = *reinterpret_cast<const std::uint16_t*>(scale_ptr);
@@ -288,14 +312,16 @@ void ternary_pq2_gemv_w_kernel(const __nv_bfloat16* __restrict__ x,
 // registers for the fp16 decode shape (32 of 64 warps per SM). The dedicated T = 1 kernel gained
 // +4.8% from exactly this cap, so it is worth a sweep here too.
 template <int kT, int kUnroll = 4, bool kShareActivation = false, int kFpMode = 0,
-          int kProbe = kGemvProbeOff, int kTableWeights = 0, int kMinBlocks = 1>
+          int kProbe = kGemvProbeOff, int kTableWeights = 0, int kMinBlocks = 1,
+          bool kAddResidual = false>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32, kMinBlocks)
 void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
                                   const std::uint8_t* __restrict__ codes,
                                   const std::uint8_t* __restrict__ scales,
                                   __nv_bfloat16* __restrict__ out, std::int32_t rows,
                                   std::int32_t groups_per_row, std::int32_t tokens,
-                                  std::int32_t out_row_stride) {
+                                  std::int32_t out_row_stride,
+                                  const __nv_bfloat16* residual = nullptr) {
     static_assert(kT >= 1 && kT <= 16, "tile size must stay small enough to keep accumulators in registers");
     static_assert(!(kShareActivation && kFpMode != 0),
                   "the activation-sharing probe reads bf16 only; it is not valid with an fp16 tile");
@@ -459,8 +485,8 @@ void ternary_pq2_gemv_tile_kernel(const __nv_bfloat16* __restrict__ x,
         }
         if (lane == 0 && t < tokens) {
             // Token-major output: element (row, token) lives at token * out_row_stride + row.
-            out[static_cast<std::int64_t>(t) * out_row_stride + warp] =
-                __float2bfloat16_rn(value);
+            gemv_store<kAddResidual>(out, residual,
+                                     static_cast<std::int64_t>(t) * out_row_stride + warp, value);
         }
     }
 }
@@ -556,14 +582,18 @@ void ternary_pq2_gemv_wide1_kernel(const __nv_bfloat16* __restrict__ x,
 // (norm+rotation, bit-identical) lost 2.0-2.6% to a block barrier.
 //
 // Requires groups_per_row % 8 == 0; every width in this model qualifies (40/48/80/136).
-template <int kT, int kMinBlocks = 1, int kDepth = 1>
+//
+// kAddResidual folds the layer's residual add into this producer's epilogue; see gemv_store() for
+// why the result stays bit-identical to the composed (GEMM + ops::residual_add) route.
+template <int kT, int kMinBlocks = 1, int kDepth = 1, bool kAddResidual = false>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32, kMinBlocks)
 void ternary_pq2_gemv_stage_kernel(const __nv_bfloat16* __restrict__ x,
                                    const std::uint8_t* __restrict__ codes,
                                    const std::uint8_t* __restrict__ scales,
                                    __nv_bfloat16* __restrict__ out, std::int32_t rows,
                                    std::int32_t groups_per_row, std::int32_t tokens,
-                                   std::int32_t out_row_stride) {
+                                   std::int32_t out_row_stride,
+                                   const __nv_bfloat16* residual = nullptr) {
     static_assert(kT >= 1 && kT <= 5, "the staged kernel serves the decode and MTP verify band");
     __shared__ std::uint8_t stage[kGemvWarpsPerBlock][8 * kGemvCodeBytesPerGroup];
     const int lane       = static_cast<int>(threadIdx.x) & 31;
@@ -646,7 +676,8 @@ void ternary_pq2_gemv_stage_kernel(const __nv_bfloat16* __restrict__ x,
             value += __shfl_down_sync(0xffffffffu, value, offset);
         }
         if (lane == 0 && t < tokens) {
-            out[static_cast<std::int64_t>(t) * out_row_stride + warp] = __float2bfloat16_rn(value);
+            gemv_store<kAddResidual>(out, residual,
+                                     static_cast<std::int64_t>(t) * out_row_stride + warp, value);
         }
     }
 }

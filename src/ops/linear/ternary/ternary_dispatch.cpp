@@ -10,6 +10,7 @@
 #include "ops/linear/ternary/ternary_dispatch.h"
 
 #include "ops/linear/ternary/ternary_cutlass_sm70.h"
+#include "ops/linear/ternary/ternary_launch.h"
 #include "ops/linear/ternary/ternary_rotation.h"
 #include "ops/linear/ternary/ternary_rowsplit_storage.cuh"
 #include "ops/linear/ternary/ternary_volta_qpn_gemm.h"
@@ -156,6 +157,30 @@ void ternary_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolic
     // ignores the scratch. Do not allocate it -- see the file header.
     launch(activation, w, out, w.n, stream, TernaryS8Scratch{});
 #endif
+}
+
+bool ternary_dispatch_add(const Tensor& x, const Weight& w, Tensor& residual_out,
+                          LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+    (void)policy; // every arm below admits only A16, as the composed route does
+    // The whole gate is checked BEFORE the rotation is launched, so a false return costs nothing
+    // and leaves the arena exactly as it was: the caller composes with its own scope.
+    if (workspace == nullptr) { return false; }
+    if (!ternary_rotation_enabled()) { return false; }
+    if (!ternary_weight_is_folded(w)) { return false; }
+    // The fused arm is the fp16-container GEMV; when this layer is not on that container the
+    // composed route is the only correct one. This asks the same predicate folded_activation()
+    // will apply, so agreeing with it is not a guess.
+    if (!ternary_activation_is_fp16(x, w)) { return false; }
+    // Geometry, token band and route knobs. The folded activation has the same [k, tokens] shape as
+    // x, so this can be answered before the rotation; the launcher re-checks the container.
+    if (!ternary_pq2_gemv_add_admits(x, w)) { return false; }
+
+    auto scope              = workspace->scope();
+    const Tensor activation = folded_activation(x, w, *workspace, stream);
+    // residual_out is the [n, tokens] residual stream, read and written at the same index: the
+    // fused epilogue does exactly what a separate ops::residual_add over the projection would.
+    launch_ternary_pq2_gemv_add(activation, w, residual_out, residual_out.ne[0], stream);
+    return true;
 }
 
 } // namespace ninfer::ops::detail
