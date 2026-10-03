@@ -317,6 +317,64 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/target_logprobs.cpp
   ops/wrapper/vision_pos_embed.cpp)
+
+# --- GGUF block-quant kernels (third_party/ggml-quants) behind a plain bridge --------------------
+# The ModelScope Swift-1.5 artifacts store their projections as GGUF block quants (IQ2_XS, IQ2_S,
+# IQ3_S, IQ3_XXS, IQ1_S/M, Q2_K, Q4_K, Q6_K, IQ4_XS), so the linear ops need ggml's block kernels.
+# Same arrangement as the upstream tree: they build as their OWN archive because the vendored ggml
+# headers define CUDA_CHECK and friends, which collide with NInfer's -- no NInfer translation unit
+# may include them. The vendored tree is llama.cpp's ggml-cuda, which already carries sm_70 paths
+# (GGML_CUDA_CC_VOLTA), so Volta needs no new kernel work here.
+#
+# Only the decode (vec) and prefill (mmq) entry points are compiled: ggml_bridge.cu plus one
+# instantiation per (type, path). gguf_linear.cpp, the NInfer-side integration, stays in ninfer_ops
+# because it must see NInfer's headers rather than ggml's.
+set(NINFER_GGML_QUANTS_ROOT "${PROJECT_SOURCE_DIR}/third_party/ggml-quants")
+add_library(ninfer_ggml_quants STATIC
+  ops/linear/gguf/ggml_bridge.cu
+  ops/linear/gguf/ggml_mmq_iq1_s.cu
+  ops/linear/gguf/ggml_mmq_iq2_s.cu
+  ops/linear/gguf/ggml_mmq_iq2_xs.cu
+  ops/linear/gguf/ggml_mmq_iq2_xxs.cu
+  ops/linear/gguf/ggml_mmq_iq3_s.cu
+  ops/linear/gguf/ggml_mmq_iq3_xxs.cu
+  ops/linear/gguf/ggml_mmq_iq4_nl.cu
+  ops/linear/gguf/ggml_mmq_iq4_xs.cu
+  ops/linear/gguf/ggml_mmq_q2_k.cu
+  ops/linear/gguf/ggml_mmq_q3_k.cu
+  ops/linear/gguf/ggml_mmq_q4_k.cu
+  ops/linear/gguf/ggml_mmq_q5_k.cu
+  ops/linear/gguf/ggml_mmq_q6_k.cu
+  ops/linear/gguf/ggml_mmq_q8_0.cu
+  ops/linear/gguf/ggml_vec_q8_0.cu
+  ops/linear/gguf/ggml_vec_q2_k.cu
+  ops/linear/gguf/ggml_vec_q3_k.cu
+  ops/linear/gguf/ggml_vec_q4_k.cu
+  ops/linear/gguf/ggml_vec_q5_k.cu
+  ops/linear/gguf/ggml_vec_q6_k.cu
+  ops/linear/gguf/ggml_vec_iq2_xxs.cu
+  ops/linear/gguf/ggml_vec_iq2_xs.cu
+  ops/linear/gguf/ggml_vec_iq2_s.cu
+  ops/linear/gguf/ggml_vec_iq3_xxs.cu
+  ops/linear/gguf/ggml_vec_iq3_s.cu
+  ops/linear/gguf/ggml_vec_iq1_s.cu
+  ops/linear/gguf/ggml_vec_iq1_m.cu
+  ops/linear/gguf/ggml_vec_iq4_nl.cu
+  ops/linear/gguf/ggml_vec_iq4_xs.cu)
+target_include_directories(ninfer_ggml_quants PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/ops/linear/gguf"
+  "${NINFER_GGML_QUANTS_ROOT}/include"
+  "${NINFER_GGML_QUANTS_ROOT}/src")
+set_target_properties(ninfer_ggml_quants PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+target_compile_options(ninfer_ggml_quants PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=177>)
+target_link_libraries(ninfer_ggml_quants PRIVATE CUDA::cudart CUDA::cublas)
+target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants)
+target_sources(ninfer_ops PRIVATE ops/linear/gguf/gguf_linear.cpp)
+
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   # Volta-only execution leaves. Shared Op contracts and planners remain in the
   # ordinary source list above; these files provide the sm_70 implementations.

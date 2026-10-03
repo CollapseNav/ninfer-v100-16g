@@ -504,6 +504,20 @@ struct Reader::Impl {
                     identity.model_id = require_string(meta.at("name"), "metadata.name");
                 }
             }
+            // v3 artifacts name themselves after the release rather than after the checkpoint, e.g.
+            // "swift-1.5-qwen3.8-27b-gsq-rco-iq2xs" for what is a qwen3.8-27b. The compiled target
+            // registry keys on the checkpoint-native id, so normalize by the ids this fork
+            // registers. Longest id first so a prefix cannot shadow a longer one.
+            if (!identity.model_id.empty()) {
+                static constexpr std::array<std::string_view, 3> kRegisteredModelIds = {
+                    "qwen3.6-35b-a3b", "qwen3.8-27b", "qwen3.6-27b"};
+                for (const auto registered : kRegisteredModelIds) {
+                    if (identity.model_id.find(registered) != std::string::npos) {
+                        identity.model_id = std::string(registered);
+                        break;
+                    }
+                }
+            }
             if (directory.contains("provenance") && directory.at("provenance").is_object()
                 && directory.at("provenance").contains("upgraded_from")
                 && directory.at("provenance").at("upgraded_from").is_object()) {
@@ -525,6 +539,14 @@ struct Reader::Impl {
                         identity.weights_id = "groupwise-int";
                     } else if (recipe.find("nvfp4") != std::string::npos) {
                         identity.weights_id = "nvfp4";
+                    } else if (recipe.find("gguf") != std::string::npos) {
+                        // The GGUF block families. One weights_id covers the whole published family
+                        // (iq2_s/iq2_xs/iq3_s/iq3_xxs) because the parameter inventory, names and
+                        // fusion are identical across them and only the per-role format assignment
+                        // differs; the binder accepts the declared GGUF format rather than a fixed
+                        // one, the same loosening the ternary port already uses for row-split
+                        // formats.
+                        identity.weights_id = "gguf-mixed";
                     }
                 }
                 if (identity.weights_id.empty()) {
@@ -541,6 +563,10 @@ struct Reader::Impl {
                         const auto& format = fmt->get_ref<const std::string&>();
                         if (format == "nvfp4" || format == "NVFP4") {
                             identity.weights_id = "nvfp4";
+                            break;
+                        }
+                        if (format.rfind("gguf_", 0) == 0 || format.rfind("GGUF_", 0) == 0) {
+                            identity.weights_id = "gguf-mixed";
                             break;
                         }
                     }

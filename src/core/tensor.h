@@ -40,7 +40,59 @@ enum class QType : std::uint16_t {
     // Prism-private ternary (Bonsai 2 27B): group 128, base-3 / 2-bit codes.
     PTQ1_0_G128          = 9,
     PQ2_0_G128           = 10,
+    // ggml block types kept byte-for-byte as a GGUF stored them (GgufBlocks layout only): each row
+    // is its K / block_elements blocks, exactly as the file holds them, so the ModelScope
+    // Swift-1.5 artifacts need no conversion on read. Their products quantize the activation to
+    // ggml's q8_1 and run through the vendored ggml-cuda kernels in third_party/ggml-quants.
+    GGUF_Q8_0            = 11,
+    GGUF_Q2_K            = 12,
+    GGUF_Q3_K            = 13,
+    GGUF_Q4_K            = 14,
+    GGUF_Q5_K            = 15,
+    GGUF_Q6_K            = 16,
+    GGUF_IQ2_XXS         = 17,
+    GGUF_IQ2_XS          = 18,
+    GGUF_IQ2_S           = 19,
+    GGUF_IQ3_XXS         = 20,
+    GGUF_IQ3_S           = 21,
+    GGUF_IQ1_S           = 22,
+    GGUF_IQ1_M           = 23,
+    GGUF_IQ4_NL          = 24,
+    GGUF_IQ4_XS          = 25,
 };
+
+[[nodiscard]] constexpr bool is_gguf(QType format) {
+    return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_IQ4_XS;
+}
+
+// One ggml superblock: how many weights it holds and how many stored bytes it occupies. The values
+// are ggml's own (see third_party/ggml-quants/src/ggml-common.h) and are what the artifact's
+// declared tensor byte counts were validated against.
+struct GgufBlockShape {
+    int elements = 0;
+    int bytes    = 0;
+};
+
+[[nodiscard]] constexpr GgufBlockShape gguf_block_shape(QType format) {
+    switch (format) {
+    case QType::GGUF_Q8_0: return {32, 34};
+    case QType::GGUF_Q2_K: return {256, 84};
+    case QType::GGUF_Q3_K: return {256, 110};
+    case QType::GGUF_Q4_K: return {256, 144};
+    case QType::GGUF_Q5_K: return {256, 176};
+    case QType::GGUF_Q6_K: return {256, 210};
+    case QType::GGUF_IQ2_XXS: return {256, 66};
+    case QType::GGUF_IQ2_XS: return {256, 74};
+    case QType::GGUF_IQ2_S: return {256, 82};
+    case QType::GGUF_IQ3_XXS: return {256, 98};
+    case QType::GGUF_IQ3_S: return {256, 110};
+    case QType::GGUF_IQ1_S: return {256, 50};
+    case QType::GGUF_IQ1_M: return {256, 56};
+    case QType::GGUF_IQ4_NL: return {32, 18};
+    case QType::GGUF_IQ4_XS: return {256, 136};
+    default: return {};
+    }
+}
 
 enum class QuantLayout : std::uint16_t {
     RowSplit            = 0,
@@ -48,6 +100,7 @@ enum class QuantLayout : std::uint16_t {
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
     VoltaQpnPrepacked   = 4,
+    GgufBlocks          = 5,
 };
 
 struct Weight {
@@ -94,6 +147,12 @@ struct Weight {
     std::int32_t hadamard_perm_hd  = 0;
     std::int32_t hadamard_perm_nk  = 0;
     std::int32_t hadamard_perm_rep = 1;
+
+    // INT32 [K] input gather of a GGUF matrix whose stored columns are a permutation of its
+    // input's: column c multiplies input element input_columns[c]. Null for every other matrix.
+    // GGUF stores the GDN output projection's V heads as [repeat, key, 128] while the recurrent
+    // state and the runtime produce tiled v-heads, so that one matrix carries the permutation.
+    const std::int32_t* input_columns = nullptr;
 };
 
 } // namespace ninfer
