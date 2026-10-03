@@ -1483,6 +1483,37 @@ llama.cpp would give both a same-model perplexity and per-layer activations to d
 artifact was produced by a converter in a different repository (`Swift15-NInfer2`), so neither is
 available in this tree.
 
+### Every kernel is now cross-checked, and the port is exhausted
+
+`ggml_bridge_vec.cuh` is **not** vendored llama.cpp -- it is this fork's own vector dot, and only
+IQ2_XS and IQ4_XS had ever been checked against a reference. So both kernels were cross-checked
+against the bridge's own `dequantize_rows` plus a host dot, for every block type in the artifact. The
+two are independent implementations of the same arithmetic, and `dequantize_rows` has already been
+verified against Python references for IQ2_XS, IQ4_XS and IQ1_M -- so agreement means both are right
+and disagreement would have meant the kernel was wrong.
+
+| arm | coverage | result |
+|---|---|---|
+| `vector_product` (decode, T <= 8) | all 11 types | worst absolute 6.4e-4 .. 1.07e-3, worst relative 3.0% .. 7.7% |
+| `matrix_product` (prefill, T > 8) | 10 types with an integer kernel | worst absolute 6.9e-4 .. 2.6e-3, worst relative 5.5% .. 19% |
+| `matrix_product` **with** `input_columns` | `gdn/output`, iq4_xs | worst absolute 7.87e-3 on the largest product (0.68%) |
+
+IQ1_M aborts the matrix arm by design (`has_matrix_kernel` is false), which is exactly why the model
+routes it to `dequantize_produkt` -- dequantize plus cuBLAS -- and that path was verified separately.
+The residual percentages are the activation quantization's own error, largest where a product nearly
+cancels, and they are the same order in both kernels.
+
+**So every GGUF-specific stage is now measured**: the container, the binding, the materialization, the
+dequantizers, both kernels with and without the gather, the conv state, the explicit rmsnorm, the
+config, the tokenizer, the tensor set. What remains unverified is only the shared model code, and that
+same code runs the tree's ternary artifact correctly.
+
+**Which leaves the artifact itself as the leading hypothesis**, and there is precedent: this family's
+README documents a v3 release whose ternary core was corrupted with PPL stuck near 16.3. The artifact
+also declares `architectures: ["Qwen3_5ForCausalLM"]` while this tree implements the 3.6/3.8 lineage.
+Testing that needs the source GGUF under llama.cpp, which is not in this tree.
+
+
 
 
 
