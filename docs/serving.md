@@ -49,6 +49,36 @@ with `--vision`; each accelerates generated-text decode after multimodal prefill
 and prefill remain outside speculative acceleration. A later request cannot enable a capability
 omitted at startup.
 
+### The draft window is a workload parameter
+
+`--draft-tokens` is not a constant and the server has no default for it -- `--spec mtp` without it is
+rejected, so the deployment's window is whatever the start command says. Measured on the V100 ternary
+port (round 13 of `docs/decode-round-2026-10-01.md`), with `L` = ms per generated token = 1000/t_s,
+which is the column that decides because a wider window can raise t/s purely by getting luckier
+drafts:
+
+| workload | K = 1 | K = 5 | wider still |
+|---|---:|---:|---:|
+| prose | **62.3** (L 16.05) | 58.6 (17.06) | — |
+| ordinary task text | **64.45** (L 15.52) | 64.0 (15.63) | — |
+| code | 71.6 (L 13.97) | **77.1** (L 12.97) | — |
+| repeated text (context lookup) | 171.8 (L 5.82) | 245.3 (L 4.08) | **256.7 at K = 7** (L 3.90) |
+
+So **K = 5** is the right single default for a code-heavy or mixed deployment (7% on code, 43% on
+repeated text, 6% on prose against K = 1), and **K = 1** remains right for a prose-only one.
+Repetition-heavy traffic (prompt echoing, extraction, long quotes) wants **K = 7**. K = 2, 3 and 4
+are dominated on every workload measured -- they verify at T = 3..5, below the QPN route's band edge
+at 6, and land on the SIMT tile, where K = 5's T = 6 does *more* work in *less* time.
+
+Because the window is frozen at startup and the graph families and workspace are planned around it,
+there is no adaptive option today: an acceptance-driven window would need several window families
+captured and planned at once.
+
+This host's resident server is started by `/root/serve_start.sh <window>` (default 5), which also
+records the exact `docker run` line and the reason the env list is minimal. `bash /root/serve_start.sh 1`
+is the revert. The container keeps the name `ninfer-serve` so `docker stop` / `docker start` around a
+measurement batch preserves the deployed window.
+
 ## Endpoints
 
 | Method and path | Behavior |

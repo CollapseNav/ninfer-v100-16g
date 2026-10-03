@@ -217,17 +217,29 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     // `--spec mtp` on its own used to be rejected: the draft window had no default and
-    // --draft-tokens had to be explicit. Measured on this port, window 1 is the best choice for text
-    // that is not reproducing the prompt (prose 51.8 t/s against 43.7 with no spec at all, everyday
-    // dialogue 53.2 against 43.8) and it is within 4% of the widest window on the repetition
-    // workloads where the 15-token context lookup fires (100.8 against 104.7). It is also the window
-    // most likely to satisfy the lookup's third gate, which requires the MTP head's first K drafts
-    // to agree with the lookup exactly, so a small window is what lets the fast path engage. An
-    // unspecified window therefore means 1 rather than an error. The measured sweeps are in
-    // docs/ternary-port.md.
+    // --draft-tokens had to be explicit. An unspecified window now means 5.
+    //
+    // This default changed in round 13 of docs/decode-round-2026-10-01.md, which measured every
+    // workload's own optimum on a build that carries round 12's kTiles = 1 NACC fix. The old default
+    // of 1 was correct on the build it was chosen on and is not any more: the arm window >= 5 lands
+    // on is the one that fix was worth +20.7% on, so a wide window that used to lose now wins.
+    //
+    //   workload              K = 1              K = 5              wider still
+    //   prose4k               62.3 (L 16.05)     58.6 (17.06)       --      -> K = 1 is 6% better
+    //   real_task             64.45 (L 15.52)    64.0 (15.63)       --      -> tie
+    //   real_code             71.6 (L 13.97)     77.1 (12.97)       --      -> K = 5 is 7% better
+    //   lookup10 (repetition) 171.8 (L 5.82)     245.3 (4.08)       256.7 at K = 7 (3.90)
+    //
+    // L is ms per generated token, 1000/t_s, and it is the column that decides: a window can raise
+    // t/s purely by getting luckier drafts. So 5 is a deliberate trade -- 7% on code and 43% on
+    // repeated text against the old default of 1, paid for with 6% on prose -- and `--draft-tokens 1`
+    // is the revert. Two claims in the previous version of this comment are also now refuted by
+    // measurement: speculative decoding on prose is not a wash (window 1 is 62.3 against 51.5 with no
+    // spec at all, +21%), and the context-lookup fast path does NOT want a small window -- on the
+    // workload its third gate exists for, window 1 is 49% behind window 7, so pass 7 there.
     if (options.speculative.backend != ninfer::SpeculativeBackend::None &&
         options.speculative.draft_tokens == 0) {
-        options.speculative.draft_tokens = 1;
+        options.speculative.draft_tokens = 5;
     }
     product::validate_speculative_cli_options(options.speculative);
     if (!options.enable_thinking && options.reasoning_effort) {
