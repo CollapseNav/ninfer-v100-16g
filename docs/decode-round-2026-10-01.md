@@ -1238,6 +1238,46 @@ excluded -- not a better guess at a cut.**
 blocked by exactly this harness problem. One no-spec trace at 39k context, cut the same way, settles
 which kernel pays it. That is worth ~43% against this round's 3%.
 
+---
+
+## Round 16 — the long-context cost is one kernel, and it is 99% of the +43%
+
+Round 15 fixed the capture cut (last CUTLASS launch) and the first thing it unlocks is the item round 14
+could not attribute. Two no-spec captures, `--max-new 32` so every decode step is one token and one
+round, same binary, same batch, 5,120 against 39,009 tokens of prompt:
+
+| kernel | 5,120 ctx ms/rd | 39,009 ctx ms/rd | delta | calls/rd |
+|---|---:|---:|---:|---:|
+| ternary GEMV (staged + tile) | 15.46 | 15.47 | **+0.01** | 401 |
+| **`causal_attention_small_t_tc`** | **1.54** | **9.98** | **+8.45** | 16.0 |
+| `causal_attention_small_t_reduce` | 0.16 | 0.26 | +0.11 | 16.0 |
+| rotation, rmsnorm, GDN, silu, everything else | ~4.0 | ~4.0 | ~0.00 | -- |
+| **total** | **21.13** | **29.70** | **+8.57** | -- |
+
+**The entire long-context cost is one kernel.** +8.45 of the +8.57 ms/token is
+`causal_attention_small_t_tc_volta_partial_i8`, the 16 calls per round that correspond to the model's
+16 full-attention layers. The ternary GEMV -- 401 calls and 15.5 ms of the round, and the family that
+has absorbed every round of optimisation in this document -- is **completely context independent**
+(+0.01 ms).
+
+Per call, the attention goes from 96 us at 5k to 624 us at 39k: the context grows 7.6x and the call
+grows 6.5x, i.e. linear. That is ~16 ns per context token per layer, or about 24 cycles, which for a
+GQA dot of `n_kv x head_dim` is on the order of 43 MAC/cycle -- **a loop/compute-bound number, not a
+KV-bandwidth-bound one**, so there is room in it that a bandwidth argument would have written off.
+
+Size of the prize: at 39k context this single kernel is 9.98 ms of a 29.70 ms step (**34%**), and at
+81k the step is 35.0 ms. Halving it takes decode from 33.5 to roughly 40 t/s (**+20%**) at 39k, and
+more at the 21k-56k range the resident server actually serves. **Every previous round of this document
+measured at 45-20,000 tokens of context and optimised the 15.5 ms GEMV; the kernel that decides the
+serving rate is the 10 ms one nobody has touched.**
+
+Reproduce:
+```bash
+bash /root/trace_ctx_cost.sh
+python3 /root/nvp_phases.py /root/nvp_ctx/long.txt 400
+```
+
+
 
 
 
