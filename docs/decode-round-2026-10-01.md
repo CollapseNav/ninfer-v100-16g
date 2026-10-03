@@ -779,6 +779,126 @@ oversight, and the reachable levers on round latency are now:
 bash /root/stage_act.sh              # -> /root/ninfer_ab/stageact  (+ /root/nvp_t1/stageact.txt)
 ```
 
+---
+
+## Round 12 — the QPN `kTiles = 1` accumulator default had never been swept: **lookup +8%, free**
+
+Round 10 left the QPN route as the only lever that reaches both the MTP and the lookup bands, and
+round 10's own negative said why: lowering the band edge to T = 2 cost +41% on the K = 1 round. This
+round went after the route's own cost instead, and found a default that had been wrong since the
+route was ported.
+
+### First, a correction to how the bands are described
+
+**The context-lookup verify is T = 8, not T = 16.** `K = 7` draft tokens verify as `T = K + 1 = 8`.
+With `kRowsPerTile = 8` that is `tiles = ceil(8/8) = 1`, i.e. the `kTiles = 1` arm -- not the
+`kTiles = 2` arm the notes in this tree assumed. Everything below follows from that.
+
+### The unswept default
+
+`launch_shape` computes `kNacc = kNaccOverride != 0 ? kNaccOverride : (kTiles == 1 ? 4 : 1)`, and
+`NINFER_TERNARY_QPN_NACC` was read **only** in the `tiles == 2` branch -- so the knob was silently
+inert on `kTiles = 1`, and its value of 4 there had never been measured. (Same class of dead default
+as round 6's `NINFER_TERNARY_QPN` gate.) The override now reaches every `kTiles` (refused above
+`kTiles = 2`, where four accumulators per tile cannot fit), with every built-in default unchanged
+except this one. Measured with `NINFER_TERNARY_QPN_MIN_T=1`, which puts the whole T = 1 step on QPN
+and isolates the weight path -- the A tile is eight tokens tall with seven dead, so there is no
+activation slope to confuse the reading:
+
+| NACC at kTiles = 1 | T = 1 whole step | MTP K = 1 (QPN verify only) |
+|---|---:|---:|
+| 4 (the old default) | 31.2 / 31.2 t/s | 45.6 / 45.6 |
+| **1 (now shipped)** | **38.0 / 38.0 (+21.8%)** | **54.6 / 54.6 (+19.7%)** |
+| 2 | 38.0 / 38.0 | 54.6 / 54.6 |
+
+SIMT control in the same batch: 55.2/55.3 at T = 1, 64.4 at MTP K = 1. One and two tie, which says
+the four-deep mma chain was not what the four accumulators were buying -- the registers were.
+
+### It also moved the lookup path
+
+The sweep's `lookup10` arm read **235.0/235.2 t/s** with the old default and **254.2/254.5** with the
+new one, in two adjacent batches whose T = 1 SIMT control was identical (55.2/55.3 both) -- so
++8.2% causal, not drift. That was the surprise that led to the T = 8 correction above. Shipped-default
+smoke, same batch, two repetitions:
+
+| load | before | after | delta |
+|---|---:|---:|---:|
+| T = 1 decode | 55.2 / 55.3 | 55.2 / 55.3 | 0 (control) |
+| MTP K = 1 | 64.4 | 64.4 / 64.3 | 0 (control) |
+| MTP K = 3 | 49.3 | 49.3 / 49.2 | 0 (control) |
+| `real_code` decode | 53.3 | 53.3 / 53.2 | 0 (control) |
+| `prose4k` decode | 51.5 | 51.5 | 0 (control) |
+| **lookup10 K = 7** | 237.4 / 237.6 | **253.9 / 254.5** | **+7.4%** |
+| **lookup16 K = 7** | 249.8 / 249.8 | **265.0 / 265.4** | **+6.1%** |
+| prefill | 1.16k / 1.18k | 1.16k / 1.18k | 0 (control) |
+| perplexity score rate, `--context 8` | 98.5 tok/s | **122.4** | **+24.3%** |
+
+The 96-token greedy md5 against `/root/wt/base.out` is IDENTICAL (T = 1 never enters the QPN band),
+and the acceptance lengths are unmoved (1.65 / 12.11 / 12.70).
+
+**Continuous check**, `--context 8 --stride 4` so every forward is an 8-token `kTiles = 1` call,
+NACC 4 against 1 over 8,675 scored tokens: mean_nll 4.835767 against 4.835772, **+0.00055% PPL** --
+one forty-fourth of the fp16 prefill operand margin this tree accepted (+0.0245%).
+
+### The band edge: re-measured, moved, and then refused
+
+With the `kTiles = 1` arm fixed, the crossover moves and the edge deserves a re-look. Same batch,
+interleaved, two repetitions, round = acceptance / decode_speed:
+
+| arm | K = 1 (T = 2) | K = 2 (T = 3) | K = 3 (T = 4) |
+|---|---:|---:|---:|
+| min_t = 6 (shipped) | **25.62** | **33.73** | 41.01 |
+| min_t = 4 | 25.62 | 33.73 | **37.37 (-8.9%)** |
+| min_t = 3 | 25.62 | 33.93 | 37.37 |
+| min_t = 2 | 30.40 (+18.7%) | 34.06 | 37.74 |
+
+So the crossover is now T ~ 3.5. **The edge stays at 6**, and not for the round-time reason:
+
+* The T = 4 window costs **+0.097% PPL** against SIMT -- four times the accepted fp16 prefill margin
+  and 2.7x the NACC = 2 trade. (Forward width 7, the other `kTiles = 1` window, costs only
+  **+0.0043%**; the two differ by 22x in absolute NLL and the reason is not established.)
+* What it buys is only that K = 3 and K = 4 stop being so much worse than K = 1. They stay worse.
+  Per-token latency `round / acceptance` after the NACC fix: K = 1 **15.54 ms**, K = 2 18.27,
+  K = 3 17.06, K = 4 17.13. **K = 1 is still the best setting and its round does not move at all with
+  the edge**, so the change cannot improve the best configuration -- it pays a real numerical cost to
+  make a losing one less losing. `NINFER_TERNARY_QPN_MIN_T=4` is left as the escape hatch and
+  recorded as a trade.
+
+**Method note that cost this round two runs:** `ninfer-perplexity` scores at a forward width of
+`context - 1`, not `context`. Traced: `--context 4` runs `ternary_pq2_gemv_tile_kernel<int=3,...>`
+and no QPN kernel at all, which is why the first edge check (`--context 4 --stride 2`) came back
+bit-identical to six decimals and measured nothing. `--context 5 --stride 4` is the T = 4 window.
+
+### What this round changes about where the remaining headroom is
+
+Round 10's budget said a K = 1 round is 73% verify GEMV, and rounds 10-11 closed the activation
+re-read from the SIMT side. This round adds the other half of that picture: the GEMV's weight side
+runs at 789 GB/s = 88% of the card's peak, so it is done, and the QPN route -- the only structure that
+avoids the re-read -- had a 21.8% default bug in it. With that fixed, QPN's T = 1 step is 26.3 ms
+against SIMT's 18.1 ms, i.e. still 1.45x, so T = 2 stays SIMT and the K = 1 round is unchanged.
+
+That puts the round-latency budget at roughly: **~0% left in the weight stream, ~0% in the SIMT
+activation side (three mechanisms measured and refused), ~2.5% in a rmsnorm fusion, ~1.3% in a
+silu_and_mul fusion, 2-4% in the MTP head's per-draft-token projections, and everything else in one
+uncertain item -- bringing the QPN small-T weight path to parity, worth ~18% on the K = 1 round if it
+lands.** Against that, the acceptance spread this tree has already measured is 1.65 (real_task, K = 1)
+against 12.11 (repeated text), and the lookup path's 3.93 ms/token against K = 1's 15.54 comes
+entirely from acceptance -- its round is 1.86x *more* expensive. So the round is close to done and
+the draft is not, which is where the next round should go.
+
+### Reproduce
+
+```bash
+bash /root/qpn_weight_path.sh        # QPN's weight path alone, T = 1 -> /root/ninfer_ab/qpnt1
+bash /root/qpn_nacc.sh               # the kTiles = 1 NACC sweep -> /root/ninfer_ab/qpnnacc
+bash /root/qpn_cross.sh              # the band edge with the fix in -> /root/ninfer_ab/qpncross
+bash /root/r12_ship_smoke.sh         # the shipped default -> /root/ninfer_ab/r12ship
+bash /root/ppl_qpn_acc.sh            # A: NACC 4 against 1, forward width 7
+bash /root/ppl_width_probe.sh        # the forward-width trace + QPN against SIMT at width 7
+bash /root/ppl_edge_t4.sh            # D: the T = 4 window (forward width 4)
+```
+
+
 
 
 

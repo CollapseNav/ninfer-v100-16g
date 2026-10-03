@@ -37,11 +37,10 @@ struct TernaryBf16Output {
 };
 
 // NACC is the sibling kernels' generation-2 knob: it round-robins the four mma of one 16-k unit into
-// independent accumulators so the RAW chain on the accumulator is not four deep. NACC = 4 at
-// kTiles = 1 (the decode and verify tiles have no other ILP) and, since this change, **2 at
-// kTiles = 2** -- T = 9..16, the lookup verify where the route is worth +90% and the mma count
-// doubles with the tile. NINFER_TERNARY_QPN_NACC=1 restores the previous behaviour, =4 is measured
-// and worse.
+// independent accumulators so the RAW chain on the accumulator is not four deep. The built-in
+// default is 4 at kTiles = 1 (the decode and verify tiles have no other ILP) and 1 elsewhere, with
+// **2 at kTiles = 2** since that change -- T = 9..16, the lookup verify where the route is worth
+// +90% and the mma count doubles with the tile.
 //
 // Measured, same batch, lookup10 K = 7: NACC 1 -> 235.5, NACC 2 -> 237.5 (+0.85%), NACC 4 -> 227.6
 // (-3.4%), output text identical at all three. Continuous check at --context 16 --stride 8, which is
@@ -50,14 +49,55 @@ struct TernaryBf16Output {
 // real numerics cost -- 2.5x the QPN band's own deviation from SIMT (+0.0143%) and 1.5x the fp16
 // operand margin this tree accepted for its prefill routes (+0.0245%) -- bought for +0.85% on one
 // path, so `=1` is the escape hatch for anyone who wants the tighter numbers.
+//
+// The override now reaches EVERY kTiles instead of only kTiles = 2. It did not before, which made
+// the knob silently inert on the T = 1..8 band (kTiles = 1 sits at NACC 4 without ever having been
+// swept) and on T >= 17 -- the same class of dead default as the `NINFER_TERNARY_QPN` gate that
+// round 6 of docs/decode-round-2026-10-01.md found. Unset still means "every kTiles at its built-in
+// default", so nothing shipped moves.
 int qpn_nacc_override() {
     static const int value = [] {
         const char* env = std::getenv("NINFER_TERNARY_QPN_NACC");
-        if (env == nullptr) { return 2; }
+        if (env == nullptr) { return 0; }
         const int parsed = std::atoi(env);
-        return (parsed == 1 || parsed == 2 || parsed == 4) ? parsed : 2;
+        return (parsed == 1 || parsed == 2 || parsed == 4) ? parsed : 0;
     }();
     return value;
+}
+
+// The built-in default per kTiles, and the override applied on top. The kTiles = 4 shape cannot
+// carry four accumulators per tile (32 registers per live tile, four tiles), so the override is
+// refused above kTiles = 2 rather than spilling.
+//
+// kTiles = 1 defaults to 1, NOT 4. The 4 was inherited from the sibling kernels' note "the decode
+// and verify tiles have no other ILP" and had never been swept on this route, and it is badly wrong:
+// MEASURED (round 12), same batch, interleaved, two repetitions, with NINFER_TERNARY_QPN_MIN_T=1 so
+// the whole T = 1 step runs QPN and the weight path is isolated (A tile 8 rows tall, 7 dead, no
+// activation slope):
+//
+//   NACC      T = 1 whole step     MTP K = 1 (QPN verify only)
+//   4 (old)   31.2 / 31.2 t/s      45.6 / 45.6
+//   2         38.0 / 38.0          54.6 / 54.6     (+21.8% / +19.7%)
+//   1         38.0 / 38.0          54.6 / 54.6     (tied with 2)
+//
+// SIMT control in the same batch: 55.2/55.3 at T = 1, 64.4 at MTP K = 1.
+//
+// IT ALSO MOVED THE LOOKUP PATH, which is how wrong the old default was outside the MTP band. The
+// sweep's lookup10 arm read 235.0/235.2 t/s with the old default and 254.2/254.5 with this one, in
+// two adjacent batches whose T = 1 SIMT control was identical (55.2/55.3 both) -- i.e. +8.2% causal,
+// not drift. That was surprising, because lookup10's verify is T = 8 and the band was thought to sit
+// at kTiles = 2; a trace settles it -- ninfer-perplexity and the CLI both run the verify at T = K + 1
+// = 8, and tiles = ceil(8/8) = 1, so the lookup verify has ALWAYS been on this kTiles = 1 arm and the
+// unswept NACC = 4 was holding it back. SHIPPED DEFAULT, same-batch smoke: lookup10 253.9/254.5,
+// lookup16 265.0/265.4, against 237.4/237.6 and 249.8/249.8 before the change, with T = 1, MTP K = 1
+// and MTP K = 3 unmoved to the digit and the md5 against /root/wt/base.out IDENTICAL.
+//
+// Two and one tying says the four-deep chain was not the binding cost at four accumulators -- the
+// extra registers are. Past kTiles = 2 the tiles are independent, which is the same ILP for free,
+// so 1 stays.
+constexpr int qpn_nacc_for(int kTiles, int override_value) {
+    if (override_value != 0 && kTiles <= 2) { return override_value; }
+    return kTiles == 2 ? 2 : 1;
 }
 
 template <int kTiles, class Activation, int kNaccOverride = 0>
@@ -180,19 +220,43 @@ bool ternary_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t)
     // tokens tall whatever T is, so one token runs the schedule with seven eighths of M dead.
     //
     // NINFER_TERNARY_QPN_MIN_T moves the lower edge so that sweep can be re-run on a later build
-    // instead of trusted. RE-MEASURED on the current build (round 10 of
+    // instead of trusted. RE-MEASURED TWICE on the current build (rounds 10 and 12 of
     // docs/decode-round-2026-10-01.md), same batch, interleaved, two repetitions, round = acceptance
     // / decode_speed:
     //
-    //   arm      K=1 (T=2) round   K=2 (T=3)   K=3 (T=4)
-    //   min_t=6      25.62            33.67       40.97     <- shipped
-    //   min_t=4      25.62            33.73       43.49     (+6.2% at T=4)
-    //   min_t=2      36.18  (+41%)    39.92       43.13
+    //   round 10, before the kTiles = 1 NACC fix:
+    //     arm      K=1 (T=2) round   K=2 (T=3)   K=3 (T=4)
+    //     min_t=6      25.62            33.67       40.97     <- then shipped
+    //     min_t=4      25.62            33.73       43.49     (+6.2% at T=4)
+    //     min_t=2      36.18  (+41%)    39.92       43.13
     //
-    // i.e. the table above still holds, so the edge stays at 6. The knob also changes the 96-token
-    // non-MTP greedy output at min_t = 2 (984 against 982 bytes, while min_t = 4 is identical), so
-    // some non-MTP launch does run in 2 <= T <= 32; not chased, because the arm loses on round time
-    // regardless.
+    //   round 12, after it:
+    //     min_t=6      25.62            33.73       41.01
+    //     min_t=4      25.62            33.73       37.37     (-8.9% at T=4)
+    //     min_t=3      25.62            33.93       37.37
+    //     min_t=2      30.40  (+18.7%)  34.06       37.74
+    //
+    // So the crossover moved from T ~ 4.3 to T ~ 3.5. THE EDGE STAYS AT 6 ANYWAY, and the reason is
+    // not the round: the T = 4 window costs +0.097% PPL against SIMT, four times the fp16 prefill
+    // operand margin this tree accepted (+0.0245%) and 2.7x the NACC = 2 trade (+0.036%). And what
+    // it buys is only that MTP K = 3 and K = 4 stop being so much worse than K = 1 -- they remain
+    // worse. Per-token latency (round / acceptance) after the kTiles = 1 NACC fix:
+    //
+    //   K = 1   25.64 / 1.65 = 15.54 ms      K = 3   37.37 / 2.19 = 17.06 ms
+    //   K = 2   33.79 / 1.85 = 18.27 ms      K = 4   41.10 / 2.40 = 17.13 ms
+    //
+    // K = 1's round does not move at all with the edge, so the change cannot improve the best
+    // setting on this workload -- it pays a real numerical cost to make a losing setting less
+    // losing. `NINFER_TERNARY_QPN_MIN_T=4` is left as the one-line escape hatch for a workload whose
+    // acceptance curve makes K >= 3 worth running, and it is a trade, recorded as one.
+    //
+    // Continuous checks (round 12), both against SIMT with the same kTiles = 1 NACC default:
+    //   forward width 4 (--context 5 --stride 4)  +0.097%   PPL  -> this is the T the edge moves
+    //   forward width 7 (--context 8 --stride 4)  +0.0043%  PPL  -> kTiles = 1, below the tree's
+    //                                                              accepted fp16 margin (+0.0245%)
+    // ninfer-perplexity scores at a forward width of context - 1 -- traced: --context 4 runs
+    // ternary_pq2_gemv_tile_kernel<int=3,...> and no QPN kernel at all -- which is what makes
+    // --context 5 the T = 4 window.
     static const std::int32_t min_t = [] {
         const char* env    = std::getenv("NINFER_TERNARY_QPN_MIN_T");
         const int parsed   = env == nullptr ? 0 : std::atoi(env);
@@ -213,11 +277,17 @@ void launch_ternary_volta_qpn(const Tensor& x, const Weight& w, Tensor& out,
 #ifdef NINFER_VOLTA_BUILD
     const int tiles = (x.ne[1] + TernaryVoltaQpnSchedule::kRowsPerTile - 1) /
                       TernaryVoltaQpnSchedule::kRowsPerTile;
+    const int nacc_env = qpn_nacc_override();
     if (x.dtype == DType::FP16) {
-        if (tiles <= 1)      { launch_shape<1, half>(x, w, out, out_row_stride, stream); }
-        else if (tiles == 2) {
-            const int nacc = qpn_nacc_override();
-            if (nacc == 2)      { launch_shape<2, half, 2>(x, w, out, out_row_stride, stream); }
+        if (tiles <= 1) {
+            // Built-in default here is NACC = 4; the override reaches it now (it did not before).
+            const int nacc = qpn_nacc_for(1, nacc_env);
+            if (nacc == 1)      { launch_shape<1, half, 1>(x, w, out, out_row_stride, stream); }
+            else if (nacc == 2) { launch_shape<1, half, 2>(x, w, out, out_row_stride, stream); }
+            else                { launch_shape<1, half>(x, w, out, out_row_stride, stream); }
+        } else if (tiles == 2) {
+            const int nacc = qpn_nacc_for(2, nacc_env);
+            if (nacc == 1)      { launch_shape<2, half, 1>(x, w, out, out_row_stride, stream); }
             else if (nacc == 4) { launch_shape<2, half, 4>(x, w, out, out_row_stride, stream); }
             else                { launch_shape<2, half>(x, w, out, out_row_stride, stream); }
         }
