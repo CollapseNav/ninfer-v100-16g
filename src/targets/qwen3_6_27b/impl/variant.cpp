@@ -11,6 +11,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/silu_mul.h"
+#include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/gguf/gguf_linear.h"
 
@@ -282,14 +283,23 @@ void Variant::gdn_input_projection_snapshot(
                                           leaf_workspace, stream);
         return;
     }
-    if (std::holds_alternative<GgufGdnInputProjectionPayload>(weights.input_projection)) {
-        // Not implemented rather than approximated. The composition exists -- project the parts into
-        // one [16384, T] plane and hand it to gdn_projected_conv_snapshot_launch, which is how the
-        // NVFP4 batched path composes it -- but the conv snapshot's row/state semantics have to be
-        // got exactly right, and a wrong version would corrupt the GDN state silently rather than
-        // fail. Until that is written and checked, refuse instead.
-        throw std::logic_error(
-            "gdn_input_projection_snapshot: the GGUF parts projection has no conv snapshot yet");
+    if (const auto* gguf = std::get_if<GgufGdnInputProjectionPayload>(&weights.input_projection)) {
+        // Compose exactly as the NVFP4 batched path does: project q|k|v into ONE [channels, W, B]
+        // plane and z into its own output, then let the projected-conv launch snapshot the conv
+        // state from that plane. The parts route writes those two outputs directly, so the only
+        // thing this leaf adds is the flatten/view pair the launch's shapes need.
+        constexpr std::int32_t kChannels = 2 * TextConfig::key_dim + TextConfig::value_dim;
+        const std::int32_t width         = hidden.ne[1];
+        const std::int32_t batch         = hidden.ne[2];
+        const std::int32_t cols          = width * batch;
+        Tensor projected = leaf_workspace.alloc(DType::BF16, {kChannels, cols});
+        Tensor gate_flat = output_gate_view.reshape({TextConfig::value_dim, cols});
+        ops::gdn_input_proj(hidden.reshape({TextConfig::hidden, cols}), gguf->weights, projected,
+                            gate_flat, leaf_workspace, stream);
+        ops::detail::gdn_projected_conv_snapshot_launch(
+            projected.view({kChannels, width, batch}), conv_weight, conv_states, valid_columns,
+            initial_slot, snapshot_base_slot, query, key, value, stream);
+        return;
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
@@ -316,11 +326,21 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                         stream);
         return;
     }
-    if (std::holds_alternative<GgufGdnInputProjectionPayload>(weights.input_projection)) {
-        // See gdn_input_projection_snapshot: the composition is known but the conv record semantics
-        // are not written yet, and a wrong version corrupts the GDN state silently.
-        throw std::logic_error(
-            "gdn_input_projection_record: the GGUF parts projection has no conv record yet");
+    if (const auto* gguf = std::get_if<GgufGdnInputProjectionPayload>(&weights.input_projection)) {
+        // See gdn_input_projection_snapshot: project into the conv-record plane and z, then let the
+        // projected-conv launch record from that plane.
+        constexpr std::int32_t kChannels = 2 * TextConfig::key_dim + TextConfig::value_dim;
+        const std::int32_t width         = hidden.ne[1];
+        const std::int32_t batch         = hidden.ne[2];
+        const std::int32_t cols          = width * batch;
+        Tensor gate_flat   = output_gate_view.reshape({TextConfig::value_dim, cols});
+        Tensor record_flat = conv_record.reshape({kChannels, cols});
+        ops::gdn_input_proj(hidden.reshape({TextConfig::hidden, cols}), gguf->weights, record_flat,
+                            gate_flat, leaf_workspace, stream);
+        ops::detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states,
+                                                      valid_columns, initial_slots, query, key, value,
+                                                      stream);
+        return;
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;

@@ -898,6 +898,24 @@ struct Reader::Impl {
                 const auto found = index.find(entry.object);
                 if (found != index.end()) { reachable[found->second] = true; }
             }
+            // And so is any object a `uses` entry names as an auxiliary. Those carry per-weight
+            // tables rather than weights -- the ModelScope Swift-1.5 artifacts ship the GDN output
+            // projection's input_columns permutation as auxiliary/000000, a single INT32 [K] object
+            // shared by every GDN layer -- and a model binder binds them by object id.
+            if (directory.contains("uses") && directory.at("uses").is_array()) {
+                for (const auto& use : directory.at("uses")) {
+                    const auto auxiliaries = use.find("auxiliaries");
+                    if (auxiliaries == use.end() || !auxiliaries->is_object()) { continue; }
+                    for (const auto& [role, reference] : auxiliaries->items()) {
+                        if (!reference.is_object()) { continue; }
+                        const auto object_id = reference.find("object");
+                        if (object_id == reference.end() || !object_id->is_string()) { continue; }
+                        const auto found =
+                            index.find(object_id->get_ref<const std::string&>());
+                        if (found != index.end()) { reachable[found->second] = true; }
+                    }
+                }
+            }
             std::vector<std::size_t> remap(entries.size(), kUnmapped);
             std::vector<ObjectDescriptor> kept;
             kept.reserve(logical_index.size());

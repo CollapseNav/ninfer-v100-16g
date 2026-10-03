@@ -36,6 +36,13 @@ struct WeightPlan {
     std::int32_t hadamard_perm_hd  = 0;
     std::int32_t hadamard_perm_nk  = 0;
     std::int32_t hadamard_perm_rep = 1;
+    // GGUF only: an INT32 [K] gather naming which input element each stored column multiplies.
+    // The ModelScope Swift-1.5 artifacts store the GDN output projection's V heads as
+    // [repeat, key, 128] while the runtime produces tiled v-heads, so that one matrix needs the
+    // permutation; the artifact ships it as an auxiliary object and every GDN layer shares it.
+    // `has_input_columns` distinguishes "no gather" from a valid handle index 0.
+    bool has_input_columns = false;
+    artifact::ObjectHandle input_columns;
 };
 
 // Folded (rotated-basis) sign table, present only on artifacts whose weights are folded into a

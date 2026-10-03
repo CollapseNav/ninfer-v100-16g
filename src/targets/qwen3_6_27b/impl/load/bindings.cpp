@@ -238,6 +238,15 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
     if (plan.format != NumericFormat::NVFP4) {
         Weight out = artifact::materialized_weight(materialized, plan.object, plan.format, rows,
                                                    columns);
+        // GGUF: the stored columns of this matrix are a permutation of its input's, and the artifact
+        // ships the INT32 [K] gather as an auxiliary object. Without it every stored column would
+        // multiply the wrong input element -- which for the GDN output projection, a recurrent
+        // layer, does not merely give a wrong answer: the state diverges and the whole forward pass
+        // returns non-finite logprobs.
+        if (plan.has_input_columns) {
+            out.input_columns = static_cast<const std::int32_t*>(
+                materialized.device_data(plan.input_columns));
+        }
 #ifdef NINFER_VOLTA_BUILD
         // The load-time QPN permutation is only legal for weights consumed by the QPN linear
         // kernels. text/token_embedding is read row-major by the embedding gather, so it must
@@ -763,7 +772,8 @@ std::optional<HadamardSignsPlan> bind_hadamard_signs(artifact::Binder& binder);
 // pair. Everything else keeps the shape the other profiles use -- the GDN q|k|v|z parent is one
 // 16384-row object, the MTP layer's four attention projections are row ranges of one 14336-row
 // object and its gate/up pair of one 34816-row object, and the vision tower is q4/q5/bf16.
-void bind_gguf_text_layers(artifact::Binder& binder, BindingPlan& out) {
+void bind_gguf_text_layers(artifact::Binder& binder, BindingPlan& out,
+                           const std::optional<artifact::ObjectHandle>& gdn_input_columns) {
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
@@ -888,6 +898,14 @@ void bind_gguf_text_layers(artifact::Binder& binder, BindingPlan& out) {
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {128});
             target.gdn.output = bind_gguf_weight(binder, prefix + "gdn/output", {5120, 6144});
+            // The GDN output projection's stored columns are a permutation of its input's, and the
+            // artifact ships that INT32 [K] gather ONCE for every GDN layer (see the auxiliary bind
+            // in bind_gguf_artifact, which happens before this loop because a binder consumes each
+            // object exactly once).
+            if (gdn_input_columns.has_value()) {
+                target.gdn.output.has_input_columns = true;
+                target.gdn.output.input_columns     = *gdn_input_columns;
+            }
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
@@ -906,7 +924,26 @@ void bind_gguf_text_layers(artifact::Binder& binder, BindingPlan& out) {
 
 void bind_gguf_artifact(artifact::Binder& binder, BindingPlan& out,
                         qwen3_6::StartupFeatures features) {
-    bind_gguf_text_layers(binder, out);
+    // The GDN output projection's input_columns permutation, shipped as a single auxiliary object
+    // that every GDN layer shares. Bound once, here, because a binder consumes each object exactly
+    // once and the loop below would otherwise try to bind it 48 times.
+    std::optional<artifact::ObjectHandle> gdn_input_columns;
+    // NINFER_GGUF_NO_PERM=1 drops the GDN output permutation. It exists to tell the two possible
+    // readings of the artifact's table apart by measurement: either stored column c multiplies input
+    // element input_columns[c] (what the kernel does), or the table is the inverse mapping and the
+    // kernel needs the table's inverse instead. One of those must fit better than the other.
+    static const bool drop_perm = [] {
+        const char* env = std::getenv("NINFER_GGUF_NO_PERM");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    if (binder.contains("auxiliary/000000")) {
+        // Always consume the object: the binder rejects an artifact whose objects were not all
+        // consumed, so the A/B below can only choose whether to USE the handle.
+        const auto handle = artifact::bind_tensor(binder, "auxiliary/000000", NumericFormat::I32,
+                                                  {6144}, artifact::TensorPlacement::Device);
+        if (!drop_perm) { gdn_input_columns = handle; }
+    }
+    bind_gguf_text_layers(binder, out, gdn_input_columns);
     out.final_norm = artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16,
                                                   {5120});
     out.token_embedding = bind_gguf_weight(binder, "text/token_embedding", {248320, 5120});
