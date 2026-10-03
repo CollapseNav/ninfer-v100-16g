@@ -1143,6 +1143,51 @@ That is a multi-file, multi-hour change and it is the next unit of work; it is n
 rather than half-landed, because a partially plumbed binding cannot load and would leave the tree
 worse than the four verified commits above.
 
+### The GGUF load path, and the one leaf it still needs
+
+Landed since (each verified, v2 bit-identical throughout):
+
+| commit | what |
+|---|---|
+| `bd362e0e` | the GGUF projection parts: `GgufProjectionPart`/`GgufProjectionWeights`, the `attn_input_proj` parts overload, the payload variants, the GGUF MLP triple |
+| `abbb7f88` | the v3 row-range reader (`ObjectSlice`), the GGUF binder, the GGUF materializer, the GDN parts overload, the variant/profile plumbing, the embedding route, the chat-template fallback |
+
+`ninfer /models/swift15_iq2xs_mtp.ninfer` now reports
+
+```
+loading weights | 7.83 GiB
+weights ready | 7.83 GiB | 9.3s | 863.6 MiB/s
+error: startup failed | preparing CUDA graphs | 2.18 ms
+error: gdn_input_projection_snapshot: the GGUF parts projection has no conv snapshot yet
+```
+
+so the container, the binder, the materializer and the frontend are all through, and the remaining
+item is one leaf.
+
+**What the artifact actually is, which the binder had to match.** Its v3 `parts` are ROW RANGES of
+one stored object, and the fusion varies per layer:
+
+| role | stored as |
+|---|---|
+| attention query, key | two row ranges of one 7168-row object on 2 of the 16 full layers, separate objects on the other 14 |
+| attention gate, value | always separate objects, and their formats differ (`iq2_xxs` against `iq2_s`) |
+| GDN q, k, v | one 10240-row object, with z its own object on 37 of the 48 GDN layers |
+| MLP gate, up | one 34816-row object on some layers (so the fused parent exists), separate objects with different formats on the rest |
+| MTP layer | fuses cleanly: its four attention projections are ranges of one 14336-row object and its gate/up pair of one 34816-row object |
+| vision | `q4_g64_fp16`/`q5_g64_fp16`/bf16 -- already supported |
+
+Hence the parts route for attention and GDN, a per-layer conditional for MLP, and `bind_gguf_object`
+to bind a range's object at its own declared name and shape.
+
+**What is left.** `gdn_input_projection_snapshot` and `..._record` have no GGUF form. The composition
+is known -- project the parts into one `[16384, T]` plane and hand it to
+`gdn_projected_conv_snapshot_launch`, which is exactly how the NVFP4 batched path composes it -- but
+the conv snapshot's row and state semantics have to be exact, and a wrong version corrupts the GDN
+state *silently* rather than failing. So both leaves refuse with a named error rather than
+approximate, and that is the next unit of work. After it, the decode path's GGUF GEMV still has to be
+verified end to end against the CLI's own numbers.
+
+
 
 
 
