@@ -1308,6 +1308,49 @@ accumulates over decode steps. `--prefill-chunk` cannot help pin it down (it mus
 128, so the prefill cannot be forced onto the record path), and the KV dtype does not change the text
 at all.
 
+### Prefill and decode take different paths -- and only decode is wrong
+
+The runtime settles this. A wide prefill never touches the conv composition at all:
+
+```cpp
+    } else {                                            // T > 1
+        Tensor qkv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
+        Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
+        ops::causal_conv1d_silu_split(qkv, *w.conv1d, conv_state_in, conv_state_out, qc, kc, vc, s);
+    }
+```
+
+so the prompt goes through `gdn_input_projection` plus a separate conv, while T == 1 goes through
+`gdn_input_projection_snapshot`. **The prefill's output is coherent, so the projection op is right in
+situ**; the collapse is on the decode side.
+
+And this port's snapshot leaf turns out to be line-for-line the composition the WORKING ternary path
+uses -- `dispatch_single_parent_snapshot`'s final fallback is
+
+```cpp
+    ProjectedWorkspace scratch = allocate_projected_workspace(workspace, kChannels, geometry.width);
+    gdn_input_proj(x, weight, scratch.projected, z, stream);
+    detail::gdn_projected_conv_snapshot_launch(scratch.projected, conv_weight, conv_states, ...);
+```
+
+which is exactly what this port does with the parts overload in place of the fused one.
+
+**Three more negatives from this round:**
+
+* the vector product WITH the artifact's `input_columns` permutation is correct -- measured against a
+  reference IQ4_XS dequantization with the same gather, relative error p50 0.32%, p90 1.1%, p99 2.4%,
+  max 5.3%, and the largest absolute difference (6.8e-3) sits on the largest product (|expected| =
+  1.155, i.e. 0.59%);
+* greedy decoding is deterministic -- three runs of the same prompt give byte-identical output, so
+  nothing is reading unwritten memory;
+* `Tensor::view`/`reshape` and the workspace are both safe (above).
+
+**The signature is a repetition loop.** Coherent for about eight tokens, then
+`... likely meaning complete identity requesting requesting requesting ... Strec Strec Strec` -- the
+state collapses rather than drifting. That is the shape of a broken recurrent state or positional
+handling, not of wrong weights.
+
+
 
 
 
