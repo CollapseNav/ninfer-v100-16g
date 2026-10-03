@@ -1592,6 +1592,39 @@ text comparison above is not ambiguous, and the port's own run on this slice cur
 per-layer activations or logits for one prompt will localize the fault directly, instead of continuing
 to verify stages that already agree.
 
+### Two separate bugs, and the scoring path is only mildly wrong
+
+With llama.cpp as a reference the picture splits in two, which no single measurement had shown before.
+
+**Scoring is only 1.27x off.** On the same 4000-character slice:
+
+| measurement | PPL |
+|---|---:|
+| this port, IQ2_XS, context 16 | 10.322 |
+| this port, IQ2_XS, context 64 | 10.691 |
+| this port, IQ2_XS, context 256 | 10.556 |
+| **llama.cpp on the source GGUF, context 512** | **8.140** |
+| this tree's ternary artifact, context 512 (different model) | 2.459 |
+
+So the scoring path is consistent across contexts (10.3-10.7, no drift with width) and only about
+1.27x worse than llama.cpp on identical weights. That is a modest error, not a broken model.
+
+**Generation is badly wrong.** The same weights through the same port produce
+`User sent instruction requesting completion likely meaning complete identity requesting requesting …
+Strec Strec Strec` where llama.cpp produces `The user is asking me to complete the equation "2 + 2 = ".
+This is a simple arithmetic problem.` A model scoring at PPL 10.3 does not emit loops.
+
+**The difference between the two paths is the token feedback**: perplexity re-prefills every window,
+while generation samples a token and appends it to the KV cache before the next step. So the decode
+step's KV append -- and the K/V this port's GGUF projections feed it -- is where the generation fault
+lives, and it is a separate fault from the scoring error.
+
+**And there is a second, harder bug**: at context 512 the IQ2_XS artifact dies with
+`std::bad_alloc` in window 0 while the ternary artifact completes the same run at PPL 2.4589. The
+arena throws rather than overrunning, so this is a GGUF-profile workspace sizing bug in this port --
+reproducible in one command, and independent of the text-quality problem.
+
+
 
 
 
