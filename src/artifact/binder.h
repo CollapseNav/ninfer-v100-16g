@@ -52,6 +52,8 @@ public:
     // members are container-compatible and the artifact may store a different member than the
     // caller's plan names. (V100 ternary port.)
     [[nodiscard]] const ObjectDescriptor* find(std::string_view name) const noexcept;
+    // Version 3 only: the row range a binding names, or nullptr. See ObjectSlice in reader.h.
+    [[nodiscard]] const ObjectSlice* find_slice(std::string_view name) const noexcept;
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);

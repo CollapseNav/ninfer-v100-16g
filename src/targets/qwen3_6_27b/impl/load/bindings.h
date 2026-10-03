@@ -70,13 +70,26 @@ struct FusedAttentionProjectionPlan {
 
 // One GGUF part in the plan: which object, which output tensor (0 = q, 1 = gate, 2 = k, 3 = v), and
 // the first row it writes there. Parts may differ in format, which is why this alternative exists.
+//
+// source_row/source_rows select a ROW SLICE of the bound object: the artifact stores attention
+// query and key as two row ranges of one 7168-row object, and one GgufProjectionPart feeds exactly
+// one output tensor, so the object is bound once and read as two slices. source_rows == 0 means the
+// whole object. A GGUF row is always a whole number of blocks, so a slice is a pointer and row-count
+// adjustment and needs no repacking.
 struct GgufProjectionPartPlan {
     WeightPlan weight;
-    std::int32_t output = 0;
-    std::int32_t row    = 0;
+    std::int32_t object_rows = 0;
+    std::int32_t output      = 0;
+    std::int32_t row         = 0;
+    std::int32_t source_row  = 0;
+    std::int32_t source_rows = 0;
 };
 
 struct GgufAttentionProjectionPlan {
+    std::vector<GgufProjectionPartPlan> parts;
+};
+
+struct GgufGdnInputProjectionPlan {
     std::vector<GgufProjectionPartPlan> parts;
 };
 
@@ -115,7 +128,8 @@ struct GdnPlan {
     artifact::ObjectHandle dt_bias;
     artifact::ObjectHandle convolution;
     GdnControlProjectionPlan control_projection;
-    std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan> input_projection;
+    std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan, GgufGdnInputProjectionPlan>
+        input_projection;
     artifact::ObjectHandle norm;
     WeightPlan output;
 };
@@ -246,8 +260,13 @@ struct FusedGdnInputProjectionPayload {
     Weight query_key_value_z;
 };
 
+struct GgufGdnInputProjectionPayload {
+    ops::GgufProjectionWeights weights;
+};
+
 using GdnInputProjectionPayload =
-    std::variant<SplitGdnInputProjectionPayload, FusedGdnInputProjectionPayload>;
+    std::variant<SplitGdnInputProjectionPayload, FusedGdnInputProjectionPayload,
+                 GgufGdnInputProjectionPayload>;
 
 struct SplitGdnControlProjectionPayload {
     Weight a_projection;

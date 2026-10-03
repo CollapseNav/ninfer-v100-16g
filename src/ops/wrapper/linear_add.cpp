@@ -89,6 +89,12 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_add workspace: invalid token interval");
     }
+    // GGUF block weights take the vendored ggml route, which quantizes the activation to q8_1 and
+    // folds the residual in; their transient bytes come from that route's own query.
+    if (is_gguf(qtype)) {
+        const detail::GgufShape shape{qtype, output_rows, input_rows};
+        return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
+    }
     if (qtype == QType::BF16_CTRL) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear_add workspace: BF16 admits only A16");

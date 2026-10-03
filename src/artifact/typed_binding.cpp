@@ -27,6 +27,18 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::BlockScaleK16M128x4V1;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return StorageLayout::RowScaleV1;
+    case NumericFormat::GGUF_Q2_K:
+    case NumericFormat::GGUF_Q4_K:
+    case NumericFormat::GGUF_Q6_K:
+    case NumericFormat::GGUF_IQ1_S:
+    case NumericFormat::GGUF_IQ1_M:
+    case NumericFormat::GGUF_IQ2_XXS:
+    case NumericFormat::GGUF_IQ2_XS:
+    case NumericFormat::GGUF_IQ2_S:
+    case NumericFormat::GGUF_IQ3_XXS:
+    case NumericFormat::GGUF_IQ3_S:
+    case NumericFormat::GGUF_IQ4_XS:
+        return StorageLayout::GgufBlocksV1;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -55,6 +67,30 @@ QType qtype_for(NumericFormat format) {
         return QType::PTQ1_0_G128;
     case NumericFormat::PQ2_0_G128:
         return QType::PQ2_0_G128;
+    // GGUF block families keep ggml's own type identity all the way to the kernel: the vendored
+    // ggml-cuda dispatch keys on it, so the artifact format and the core qtype are one-to-one.
+    case NumericFormat::GGUF_Q2_K:
+        return QType::GGUF_Q2_K;
+    case NumericFormat::GGUF_Q4_K:
+        return QType::GGUF_Q4_K;
+    case NumericFormat::GGUF_Q6_K:
+        return QType::GGUF_Q6_K;
+    case NumericFormat::GGUF_IQ1_S:
+        return QType::GGUF_IQ1_S;
+    case NumericFormat::GGUF_IQ1_M:
+        return QType::GGUF_IQ1_M;
+    case NumericFormat::GGUF_IQ2_XXS:
+        return QType::GGUF_IQ2_XXS;
+    case NumericFormat::GGUF_IQ2_XS:
+        return QType::GGUF_IQ2_XS;
+    case NumericFormat::GGUF_IQ2_S:
+        return QType::GGUF_IQ2_S;
+    case NumericFormat::GGUF_IQ3_XXS:
+        return QType::GGUF_IQ3_XXS;
+    case NumericFormat::GGUF_IQ3_S:
+        return QType::GGUF_IQ3_S;
+    case NumericFormat::GGUF_IQ4_XS:
+        return QType::GGUF_IQ4_XS;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -153,6 +189,41 @@ Weight row_scale_weight(const MaterializedArtifact& materialized, ObjectHandle h
 
 } // namespace
 
+// A GGUF block matrix: the payload is ggml's own bytes, one row being K / block_elements whole
+// blocks, and every scale lives inside its block. So there is no separate scale plane, no high
+// plane and no padding -- qdata is the whole payload and the block geometry is what tells a kernel
+// how to walk it.
+Weight gguf_weight(const MaterializedArtifact& materialized, ObjectHandle handle, NumericFormat format,
+                   std::int32_t rows, std::int32_t columns) {
+    const GgufBlockShape geometry = gguf_block_shape(qtype_for(format));
+    if (geometry.elements == 0 || columns <= 0 || columns % geometry.elements != 0) {
+        throw std::logic_error("gguf: K is not a whole number of blocks");
+    }
+    const std::uint64_t row_bytes =
+        static_cast<std::uint64_t>(columns / geometry.elements) * geometry.bytes;
+    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle));
+
+    Weight out{};
+    out.payload         = bytes;
+    out.payload_bytes   = static_cast<std::uint64_t>(rows) * row_bytes;
+    out.qtype           = qtype_for(format);
+    out.layout          = QuantLayout::GgufBlocks;
+    out.group_size      = static_cast<std::uint32_t>(geometry.elements);
+    out.qdata           = bytes;
+    out.qhigh           = nullptr;
+    out.scales          = nullptr;
+    out.n               = rows;
+    out.k               = columns;
+    out.group           = static_cast<std::int32_t>(geometry.elements);
+    out.scale_dtype     = DType::BF16;
+    out.ndim            = 2;
+    out.shape[0]        = rows;
+    out.shape[1]        = columns;
+    out.padded_shape[0] = rows;
+    out.padded_shape[1] = columns;
+    return out;
+}
+
 ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat format,
                          std::initializer_list<std::uint64_t> shape, TensorPlacement placement) {
     const ObjectHandle handle =
@@ -194,6 +265,9 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
     }
     if (storage_layout_for(format) == StorageLayout::RowScaleV1) {
         return row_scale_weight(materialized, handle, format, rows, columns);
+    }
+    if (storage_layout_for(format) == StorageLayout::GgufBlocksV1) {
+        return gguf_weight(materialized, handle, format, rows, columns);
     }
     return row_split_weight(materialized, handle, format, rows, columns);
 }

@@ -12,6 +12,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ops/linear/gguf/gguf_linear.h"
+#include "ops/linear/gguf/gguf_linear.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -84,7 +85,10 @@ std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
                                          const Variant::GdnProjectionWeights& weights) {
     const std::int32_t batch = hidden.ne[2];
     const std::int32_t width = hidden.ne[1];
-    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection)) {
+    // The GGUF parts carry the same q|k|v geometry the split form does, so both take the shape-keyed
+    // snapshot query rather than a QType-keyed one.
+    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection) ||
+        std::holds_alternative<GgufGdnInputProjectionPayload>(weights.input_projection)) {
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
@@ -102,7 +106,8 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
                                        const Variant::GdnProjectionWeights& weights) {
     const std::int32_t batch = hidden.ne[2];
     const std::int32_t width = hidden.ne[1];
-    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection)) {
+    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection) ||
+        std::holds_alternative<GgufGdnInputProjectionPayload>(weights.input_projection)) {
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
@@ -188,6 +193,12 @@ void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    // GGUF: the parts may differ in format, so there is no fused weight to call the single-parent
+    // overload with.
+    if (const auto* gguf = std::get_if<GgufAttentionProjectionPayload>(&weights)) {
+        ops::attn_input_proj(hidden, gguf->weights, query, gate, key, value, workspace, stream);
+        return;
+    }
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
                              workspace, stream);
@@ -236,6 +247,12 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
+    // GGUF: q|k|v|z are separate stored objects on most layers (and differ in format), so the
+    // projection goes to the parts overload, which projects them all in one ggml call.
+    if (const auto* gguf = std::get_if<GgufGdnInputProjectionPayload>(&weights.input_projection)) {
+        ops::gdn_input_proj(hidden, gguf->weights, qkv, output_gate_flat, workspace, stream);
+        return;
+    }
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj(hidden, split->query_key, split->value_z, qkv, output_gate_flat,
@@ -265,6 +282,15 @@ void Variant::gdn_input_projection_snapshot(
                                           leaf_workspace, stream);
         return;
     }
+    if (std::holds_alternative<GgufGdnInputProjectionPayload>(weights.input_projection)) {
+        // Not implemented rather than approximated. The composition exists -- project the parts into
+        // one [16384, T] plane and hand it to gdn_projected_conv_snapshot_launch, which is how the
+        // NVFP4 batched path composes it -- but the conv snapshot's row/state semantics have to be
+        // got exactly right, and a wrong version would corrupt the GDN state silently rather than
+        // fail. Until that is written and checked, refuse instead.
+        throw std::logic_error(
+            "gdn_input_projection_snapshot: the GGUF parts projection has no conv snapshot yet");
+    }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, valid_columns,
@@ -289,6 +315,12 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                         query, key, value, output_gate_view, leaf_workspace,
                                         stream);
         return;
+    }
+    if (std::holds_alternative<GgufGdnInputProjectionPayload>(weights.input_projection)) {
+        // See gdn_input_projection_snapshot: the composition is known but the conv record semantics
+        // are not written yet, and a wrong version corrupts the GDN state silently.
+        throw std::logic_error(
+            "gdn_input_projection_record: the GGUF parts projection has no conv record yet");
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
@@ -393,6 +425,16 @@ std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t
     return 0;
 }
 
+// The GGUF parts route quantizes the activation to ggml's q8_1 once per projection and reuses it for
+// every part, so its transient bytes depend on the part shapes. At plan time only the weights profile
+// is known -- the plan is queried before any weight is bound -- so size for the FUSED parent width the
+// other profiles use. That is an over-estimate for every layer, which is safe because the arena is
+// sized once for the whole model and no part is ever wider than its parent.
+std::size_t gguf_projection_bytes(std::int32_t rows, std::int32_t first, std::int32_t last) {
+    const ops::detail::GgufShape parent{QType::GGUF_IQ2_XXS, rows, TextConfig::hidden};
+    return ops::detail::gguf_project_workspace_bytes({&parent, 1}, first, last);
+}
+
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
                                                                    qwen3_6::TextPhase,
                                                                    std::int32_t first,
@@ -411,6 +453,11 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen38Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 14336, TextConfig::hidden, kFp8TextPolicy, first, last);
+    case WeightsProfile::Qwen38GgufMixed:
+        // The GGUF attention projection is a parts list (query|key are row ranges of one object on
+        // two layers, and gate/value are always separate objects whose formats differ), so its
+        // transient bytes come from the ggml route rather than from a fused-parent query.
+        return gguf_projection_bytes(14336, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -436,6 +483,10 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::query_size,
                                                         kFp8TextPolicy, first, last);
+    case WeightsProfile::Qwen38GgufMixed:
+        return ops::linear_add_workspace_capacity_bytes(QType::GGUF_IQ2_XXS, TextConfig::hidden,
+                                                        TextConfig::query_size,
+                                                        ops::LinearPolicy::A16Only, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -457,6 +508,10 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen38Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last);
+    case WeightsProfile::Qwen38GgufMixed:
+        // GDN q|k|v|z share one object on 11 of the 48 GDN layers and have z split out on the rest,
+        // so this is the parts route too.
+        return gguf_projection_bytes(16384, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -482,6 +537,15 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
                             batch_size, first, last));
+    case WeightsProfile::Qwen38GgufMixed:
+        // The GGUF route has no QType-keyed snapshot profile: it quantizes the activation itself, so
+        // the shape-keyed snapshot composition (which is registered for exactly this q/k/v geometry)
+        // plus the ggml projection transient is what it needs.
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
+                            batch_size, first, last) +
+                            gguf_projection_bytes(16384, batch_size * first, batch_size * last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -507,6 +571,12 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
                             batch_size, first, last));
+    case WeightsProfile::Qwen38GgufMixed:
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
+                            batch_size, first, last) +
+                            gguf_projection_bytes(16384, batch_size * first, batch_size * last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -531,6 +601,10 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::value_dim,
                                                         kFp8TextPolicy, first, last);
+    case WeightsProfile::Qwen38GgufMixed:
+        return ops::linear_add_workspace_capacity_bytes(QType::GGUF_IQ2_XXS, TextConfig::hidden,
+                                                        TextConfig::value_dim,
+                                                        ops::LinearPolicy::A16Only, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -567,6 +641,12 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
             QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S, kFp8TextPolicy, first, last);
         return std::max(nvfp4, fp8);
     }
+    case WeightsProfile::Qwen38GgufMixed:
+        // gate and up are separate objects with different formats on most layers, so the pair takes
+        // the ggml SwiGLU route; post_mixer_workspace_bytes reaches the GGUF branches of both the
+        // SwiGLU and the residual linear queries through the qtype.
+        return post_mixer_workspace_bytes(QType::GGUF_IQ2_XXS, QType::GGUF_IQ2_XXS,
+                                          ops::LinearPolicy::A16Only, first, last);
     }
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
 }

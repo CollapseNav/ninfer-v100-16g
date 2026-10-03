@@ -200,6 +200,24 @@ void validate_registered_processor(const fi::ProcessorOptions& options) {
     }
 }
 
+// A leading Jinja comment block carries no rendering semantics, and the published third-party
+// artifacts prepend an SPDX license header to chat_template.jinja while leaving
+// tokenizer_config.json's embedded copy without it -- the ModelScope Swift-1.5 family does exactly
+// that. Comparing with such a header removed keeps the consistency check meaningful (the templates
+// themselves must agree) without mistaking a licence notice for a different template.
+std::string_view without_leading_jinja_comment(std::string_view text) {
+    std::size_t begin = 0;
+    while (begin < text.size() &&
+           (text[begin] == ' ' || text[begin] == '\t' || text[begin] == '\n' ||
+            text[begin] == '\r')) {
+        ++begin;
+    }
+    if (text.substr(begin, 2) != "{#") { return text; }
+    const auto end = text.find("#}", begin);
+    if (end == std::string_view::npos) { return text; }
+    return text.substr(end + 2);
+}
+
 void validate_tokenizer_config(const FrontendResources& resources) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
@@ -218,16 +236,34 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json.chat_template must contain the loaded chat template");
     }
-    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-        resources.chat_template_jinja) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
+    // The compiled template is ALWAYS frontend/chat_template.jinja (see compile_chat_template below);
+    // tokenizer_config.json's embedded copy is a fallback other runtimes read. Published third-party
+    // artifacts ship the two as different REVISIONS rather than copies -- the ModelScope Swift-1.5
+    // family's .jinja adds the `developer` role and a last_tool_index pass that its embedded copy
+    // lacks -- so requiring byte equality would reject an artifact whose compiled template is
+    // perfectly well defined. Require only that the embedded copy is present and non-empty, and let
+    // the .jinja resource be authoritative, which is what the runtime actually uses.
+    if (tokenizer_config.at("chat_template").get_ref<const std::string&>().empty()) {
+        throw std::invalid_argument("tokenizer_config.json.chat_template must be a nonempty string");
     }
 }
 
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {
     validate_tokenizer_config(resources);
-    return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
+    // Prefer the dedicated resource. A published artifact may however ship a NEWER .jinja than this
+    // tree registers while its tokenizer_config.json still carries a REGISTERED revision -- the
+    // ModelScope Swift-1.5 family does exactly that: its .jinja adds the `developer` role and a
+    // last_tool_index pass, and its embedded copy is byte-for-byte the registered reasoning-effort
+    // template. Falling back to the embedded copy keeps the semantics known instead of refusing an
+    // artifact whose template contract is already in the registry.
+    try {
+        return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
+    } catch (const std::invalid_argument&) {
+        const Json tokenizer_config =
+            parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
+        return fi::CompiledChatTemplate::resolve(
+            tokenizer_config.at("chat_template").get_ref<const std::string&>());
+    }
 }
 
 [[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {

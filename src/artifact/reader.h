@@ -145,6 +145,23 @@ struct ArtifactIdentity {
     bool operator==(const ArtifactIdentity&) const = default;
 };
 
+/**
+ * A version-3 binding that names a ROW RANGE of one stored object. The ModelScope Swift-1.5 artifacts
+ * use this heavily: attention query and key are two row ranges of one 7168-row object, the GDN q|k|v|z
+ * parent is one 16384-row object with z sometimes sliced out, and the MLP gate|up pair is one
+ * 34816-row object on some layers.
+ *
+ * `range` in the v3 directory is an element offset, so first_row is that offset divided by the
+ * object's column count. A row slice of a GGUF block matrix is a pointer and row-count adjustment
+ * (every row is a whole number of blocks), which is why the reader can expose it without copying.
+ * Version-2 artifacts have no such bindings and their map is empty.
+ */
+struct ObjectSlice {
+    const ObjectDescriptor* object = nullptr;
+    std::uint64_t first_row        = 0;
+    std::uint64_t rows             = 0;
+};
+
 class Reader {
 public:
     static constexpr std::size_t direct_io_alignment = 4096;
@@ -160,6 +177,9 @@ public:
     const ArtifactIdentity& identity() const noexcept;
     const std::vector<ObjectDescriptor>& objects() const noexcept;
     const ObjectDescriptor* find(std::string_view name) const noexcept;
+    // Version 3 only: the row range a binding names, or nullptr when the binding is absent or names
+    // a whole object. See ObjectSlice.
+    const ObjectSlice* find_slice(std::string_view name) const noexcept;
 
     std::uint64_t file_bytes() const noexcept;
     std::uint64_t payload_offset() const noexcept;

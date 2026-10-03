@@ -705,6 +705,10 @@ struct Reader::Impl {
             bool simple       = true;
             std::string object;  // simple: the bound object; parts: first part object
             std::size_t part_count = 0;
+            // The first part's element range, when the binding names one. `range` is an element
+            // offset, so dividing by the object's column count gives rows.
+            std::uint64_t range_begin = 0;
+            std::uint64_t range_end   = 0;
         };
         std::unordered_map<std::string, BindingEntry, TransparentStringHash, std::equal_to<>>
             bindings;
@@ -733,6 +737,13 @@ struct Reader::Impl {
                         throw ArtifactError("v3 binding part must reference an object: " + name);
                     }
                     parsed.object = parts.at(0).at("object").get<std::string>();
+                    if (parts.at(0).contains("range") && parts.at(0).at("range").is_array() &&
+                        parts.at(0).at("range").size() == 2 &&
+                        parts.at(0).at("range").at(0).is_number_unsigned() &&
+                        parts.at(0).at("range").at(1).is_number_unsigned()) {
+                        parsed.range_begin = parts.at(0).at("range").at(0).get<std::uint64_t>();
+                        parsed.range_end   = parts.at(0).at("range").at(1).get<std::uint64_t>();
+                    }
                 } else {
                     throw ArtifactError("v3 binding entry has neither object nor parts: " + name);
                 }
@@ -878,6 +889,15 @@ struct Reader::Impl {
             constexpr std::size_t kUnmapped = std::numeric_limits<std::size_t>::max();
             std::vector<bool> reachable(entries.size(), false);
             for (const auto& [name, old_index] : logical_index) { reachable[old_index] = true; }
+            // An object a v3 binding addresses by ROW RANGE is reachable as well: a model binder
+            // reaches it through Reader::find_slice rather than through a logical alias, and the
+            // fused-family rule does not cover every such binding (attention query|key share an
+            // object that no family name resolves, for instance).
+            for (const auto& [name, entry] : bindings) {
+                if (entry.simple || entry.part_count != 1) { continue; }
+                const auto found = index.find(entry.object);
+                if (found != index.end()) { reachable[found->second] = true; }
+            }
             std::vector<std::size_t> remap(entries.size(), kUnmapped);
             std::vector<ObjectDescriptor> kept;
             kept.reserve(logical_index.size());
@@ -902,6 +922,28 @@ struct Reader::Impl {
             index         = std::move(physical);
             logical_index = std::move(logical);
         }
+
+        // Row ranges, recorded after the remap so the entry indices are final and keyed by the
+        // binding's own v3 name because that is what a model binder asks for. Only single-part
+        // bindings are representable: a multi-part binding is a concatenation, not a slice.
+        for (const auto& [name, entry] : bindings) {
+            if (entry.simple || entry.part_count != 1 || entry.range_end <= entry.range_begin) {
+                continue;
+            }
+            const auto found = index.find(entry.object);
+            if (found == index.end()) { continue; }
+            const auto& object  = entries[found->second];
+            const auto* tensor  = std::get_if<TensorDescriptor>(&object);
+            if (tensor == nullptr || tensor->shape.size() != 2 || tensor->shape[1] == 0) {
+                continue;
+            }
+            const std::uint64_t columns = tensor->shape[1];
+            ObjectSlice slice;
+            slice.object    = &object;
+            slice.first_row = entry.range_begin / columns;
+            slice.rows      = (entry.range_end - entry.range_begin) / columns;
+            if (slice.rows != 0) { slice_index.emplace(name, slice); }
+        }
     }
 
     MappedFile file;
@@ -913,6 +955,9 @@ struct Reader::Impl {
     // the physical index misses.
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>>
         logical_index;
+    // v3 row ranges: binding name -> (object, first row, row count). See ObjectSlice.
+    std::unordered_map<std::string, ObjectSlice, TransparentStringHash, std::equal_to<>>
+        slice_index;
     std::uint64_t payload_start = 0;
 };
 
@@ -932,6 +977,11 @@ const ObjectDescriptor* Reader::find(std::string_view name) const noexcept {
     const auto logical = impl_->logical_index.find(name);
     return logical == impl_->logical_index.end() ? nullptr
                                                  : &impl_->entries[logical->second];
+}
+
+const ObjectSlice* Reader::find_slice(std::string_view name) const noexcept {
+    const auto it = impl_->slice_index.find(name);
+    return it == impl_->slice_index.end() ? nullptr : &it->second;
 }
 
 std::uint64_t Reader::file_bytes() const noexcept { return impl_->file.size(); }

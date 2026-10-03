@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/gguf_projection.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -87,6 +88,22 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  */
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
                     cudaStream_t stream);
+
+/**
+ * GGUF block-matrix form, over an explicit list of parts (see ops/gguf_projection.h).
+ *
+ * The ModelScope Swift-1.5 Qwen3.8-27B artifacts store the GDN q|k|v|z parent as one 16384-row
+ * object on 11 of the 48 GDN layers and split z into its own object on the rest, and the parts may
+ * differ in format. Each part names the output it feeds (0 = qkv, 1 = z) and the first row it writes
+ * there, and all parts are projected in ONE gguf_project call, so the activation is quantized to
+ * ggml's q8_1 once. The parts must cover qkv [10240,T] and z [6144,T] exactly.
+ */
+std::size_t gdn_input_proj_workspace_capacity_bytes(const GgufProjectionWeights& weights,
+                                                    std::int32_t min_tokens,
+                                                    std::int32_t max_tokens);
+
+void gdn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& qkv, Tensor& z,
+                    WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
  * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent W8

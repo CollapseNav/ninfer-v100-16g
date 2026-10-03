@@ -12,6 +12,7 @@
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/ternary/ternary_dispatch.h"
@@ -24,6 +25,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -1255,6 +1257,62 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
                                   valid_columns, initial_state_slots, conv_record, query, key,
                                   value, z, LinearPolicy::A16Only, workspace, stream);
+}
+
+// --- GGUF parts form -------------------------------------------------------------------------
+// The GDN q|k|v|z parent is one 16384-row object on some layers and has z split into its own object
+// on others, and the parts may differ in format, so the pair overloads above cannot express every
+// layer. Every part is projected in ONE gguf_project call, so the activation is quantized to ggml's
+// q8_1 once.
+std::size_t gdn_input_proj_workspace_capacity_bytes(const GgufProjectionWeights& weights,
+                                                    std::int32_t min_tokens,
+                                                    std::int32_t max_tokens) {
+    std::vector<detail::GgufShape> shapes;
+    shapes.reserve(weights.parts.size());
+    for (const auto& part : weights.parts) {
+        shapes.push_back({part.weight.qtype, part.weight.n, part.weight.k});
+    }
+    return detail::gguf_project_workspace_bytes(shapes, min_tokens, max_tokens);
+}
+
+void gdn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& qkv, Tensor& z,
+                    WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr std::int32_t kHidden  = 5120;
+    constexpr std::int32_t kQkvRows = 10240;
+    constexpr std::int32_t kZRows   = 6144;
+    const std::int32_t cols         = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(qkv, kQkvRows, cols, "qkv");
+    require_matrix(z, kZRows, cols, "z");
+
+    std::array<std::int64_t, 2> covered{};
+    for (const auto& part : weights.parts) {
+        detail::require_gguf(part.weight, "gdn_input_proj GGUF part");
+        if (part.output < 0 || part.output > 1) {
+            throw std::invalid_argument("gdn_input_proj: GGUF part names an unknown output");
+        }
+        const std::int32_t limit = part.output == 0 ? kQkvRows : kZRows;
+        if (part.weight.k != kHidden || part.row < 0 || part.row + part.weight.n > limit) {
+            throw std::invalid_argument("gdn_input_proj: GGUF part outside the GDN profile");
+        }
+        covered[part.output] += part.weight.n;
+    }
+    if (covered[0] != kQkvRows || covered[1] != kZRows) {
+        throw std::invalid_argument("gdn_input_proj: GGUF parts do not cover qkv/z");
+    }
+
+    Tensor* outputs[] = {&qkv, &z};
+    std::vector<detail::GgufProduct> products;
+    products.reserve(weights.parts.size());
+    for (const auto& part : weights.parts) {
+        detail::GgufProduct product;
+        product.weight = &part.weight;
+        product.out    = outputs[part.output];
+        product.row    = part.row;
+        products.push_back(product);
+    }
+    detail::gguf_project(x, products, workspace, stream);
 }
 
 } // namespace ninfer::ops
