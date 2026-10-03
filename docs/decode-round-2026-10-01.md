@@ -1192,24 +1192,52 @@ Where each workload's optimum actually sits, and whether the edge is involved:
 | `real_code` | **K = 5** | T = 6 | yes |
 | `lookup10` | **K = 7** | T = 8 | yes |
 
-### The one thing this round could not attribute, and why
+### The 3% anomaly, attributed -- and the harness fix that made it possible
 
-K = 5 beats K = 4 **by 3% even at the same edge, with identical acceptance (3.23) and identical round
-counts**, while doing one more draft step and verifying one more token (87.8 against 85.5 t/s on the
-`--max-new 64` trace, 77.10 against 74.70 on the 128-token run -- reproducible). Attention cannot
-explain it: K = 5's dominant `causal_attention_small_t_tc` call is 153 us against K = 4's 92 us.
+K = 5 beats K = 4 **by 3% even at the same edge, with identical acceptance (3.23 / 4.13) and identical
+round counts**, while doing one more draft step and verifying one more token (87.8 against 85.5 t/s at
+`--max-new 64`, 77.10 against 74.70 at 128 -- reproducible). Attention cannot explain it: K = 5's
+dominant `causal_attention_small_t_tc` call is *slower* (153 us against 92 us).
 
-**It is not attributed, because the profiler harness cannot separate the phases for this app.** The
-nvprof log for a `--prefill-chunk 4096` run of a 4,381-token prompt holds only 11,538-16,421 ms --
-4.88 s for a 0.75 s decode -- and contains **4,192 ternary CUTLASS prefill calls inside the window the
-phase logic calls decode** (the prefill chunks at ~128 tokens, so it issues ~32 chunks x 65 layers x 2
-projections). Every per-round column is therefore diluted by an unknown mixture of prefill and decode,
-and two attempts to place the cut (first decode GEMV; `mtp_prepare_next_round`) both placed it wrong --
-the staged GEMV is used by the prefill's tail chunk, and `mtp_prepare_next_round` runs during the
-staged MTP prefill. **Attributing this needs the profiler started after the prefill
-(`cudaProfilerStart`, or a decode-dominated capture), not a better cut on the same capture.** Recorded
-rather than guessed; it is worth 3%, and the two rounds spent on it were spent because the harness
-kept producing plausible-looking columns.
+Three cut rules were tried before this could be measured, and two were wrong, each for a reason worth
+recording: "first decode GEMV" fails because the staged GEMV serves the prefill's tail chunk, and
+"first `mtp_prepare_next_round`" fails because that kernel runs during the staged MTP prefill too. The
+right rule is **the last CUTLASS launch** -- CUTLASS is the prefill's GEMM and refuses T < 256, so
+nothing in a decode round can use it. `nvp_phases.py` proves it instead of asserting it: bucketing the
+capture by time gives 0.6-3.4 s of CUTLASS-only rows, a transition at 3.8-4.2 s, then ~1 s of
+QPN/rotation/tile rows with no CUTLASS. The capture is 4.88 s for a 0.75 s decode -- 84% of it is
+prefill, which is why every per-round column before this was meaningless.
+
+With the cut fixed, `real_code`, `QPN_MIN_T=5`, 15 rounds per arm:
+
+| kernel | K = 4 (T = 5) ms/rd | K = 5 (T = 6) ms/rd | delta | calls/rd A / B |
+|---|---:|---:|---:|---:|
+| `ternary_volta_qpn_gemm` | 22.10 | 29.26 | +7.15 | 299.7 / 427.7 |
+| **`ternary_pq2_gemv_tile_kernel`** | **11.68** | **0.00** | **-11.68** | 128.0 / 0.0 |
+| `causal_attention_small_t_tc` | 2.30 | 3.44 | +1.14 | 23.6 / 24.7 |
+| lm_head class (`w8_rowsplit` + `q4_rowsplit`) | 4.71 | 6.04 | +1.33 | 21.0 / 27.4 |
+| everything else | ~9.10 | ~9.87 | +0.77 | -- |
+| **TOTAL** | **49.89** | **48.61** | **-1.27** | -- |
+
+-1.27 ms/round against a wall-clock -1.35 ms. **The anomaly is 128 GEMV calls per round that take the
+SIMT tile kernel (11.68 ms) in the K = 4 arm and the tensor-core route (+7.15 ms) in the K = 5 arm** --
+the QPN count rises by exactly the 128 the tile count loses. So the draft window does not only set the
+verify's width; it also moves a second, K-dependent pass in the draft path between routes. That is why
+the window's cost/benefit has never matched a simple "wider verify, more accepted tokens" model.
+
+It also confirms the edge decision from the other side: edge 4 and edge 5 give K = 4 the same 74.70
+t/s, so lowering the edge cannot move those 128 calls, which bounds their width at <= 3. The T = 5
+window's +0.0446% PPL therefore buys only a configuration's verify that K = 5 dominates anyway.
+
+**Method lesson, recorded because it cost two rounds: a per-round table is not evidence until the
+phase boundary is proven, and the right proof is a marker that cannot appear in the phase being
+excluded -- not a better guess at a cut.**
+
+**Next, and it is the larger item:** round 14's finding that the base T = 1 step goes 19.3 -> 27.6 ->
+35.0 ms/token from 5k to 39k to 81k of context (+43% at 39k) is *still* unattributed, and it was
+blocked by exactly this harness problem. One no-spec trace at 39k context, cut the same way, settles
+which kernel pays it. That is worth ~43% against this round's 3%.
+
 
 
 
