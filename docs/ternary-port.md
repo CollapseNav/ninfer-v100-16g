@@ -1235,6 +1235,37 @@ next step is a reference implementation -- dequantize one GGUF row in Python the
 read back what the bridge produces for the same bytes, and compare. That needs a small device
 readback harness, which is why it is a fresh unit of work rather than a fix.
 
+### The chain is verified; the numbers still are not
+
+That harness was built, and it says the GGUF path is correct at every link:
+
+| what | how | result |
+|---|---|---|
+| dequant | Python transcription of llama.cpp's `dequantize_iq2_xs` (grid/sign/mask tables parsed straight out of the vendored `ggml-common.h`) against `dequantize_rows` on the same 1480 bytes | worst absolute difference **1.14e-4** on values ~0.04 -- **0.3%, one bf16 step** |
+| the whole product | one IQ2_XS tensor (10240 x 5120) through `quantize_vector_activation` + `vector_product`, all 10240 rows, against reference dequant + dot | 8479 rows have \|expected\| > 0.01; worst absolute difference **7.86e-4** on values ~0.1; worst relative difference among meaningful rows **5.6%**, i.e. one bf16 output step |
+| every format | dequantize a row of all fifteen types present in iq3xxs | **zero non-finite**, ranges 0.04-0.16 |
+| every slice | all 523 parameters' row slices against the shapes in the artifact's own `methods` record | **0 mismatches, both artifacts** |
+| no converter transform | the `methods` section | every GGUF tensor is `import_encoded` |
+| the architecture | `TextConfig` against `components.text.config` | field for field identical |
+| `query` vs `gate` bytes | the `methods` list both as `blk.N.attn_q.weight`, which would mean duplication | sha256 differ -- the labels name the source tensor, not the slice |
+| the one FUSED parent this port uses | `mlp/gate_up` row ranges in both artifacts | `gate` is the first half in both, matching the swiglu's assumption |
+
+So the path is not where the error is. Two things narrow it further:
+
+**iq3xxs generates but does not score.** Its CLI run emits 24 tokens at 46.3 tok/s -- a finite forward
+pass -- while `ninfer-perplexity` reports a non-finite logprob. That combination means the hidden
+state does not go NaN but does grow until the logits overflow: argmax still picks a finite maximum,
+the log-softmax does not.
+
+**Both artifacts are wrong, and they share everything the ternary artifact does not exercise.** The
+converter's record proves the binding; the harness proves the arithmetic. What is left is code that
+runs for both GGUF artifacts and for neither ternary one -- and the newest such code is the GDN conv
+snapshot/record composition added when the model first ran, which is what every prefill goes through
+(the first generated token comes from it). That is the next thing to check, and it is checkable: the
+composition can be compared against the split path's own `gdn_input_proj_conv_snapshot` output for
+the same inputs, which needs a fixture rather than a reference implementation.
+
+
 
 
 
