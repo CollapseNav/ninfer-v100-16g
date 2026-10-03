@@ -1361,6 +1361,43 @@ which is exactly what this port does with the parts overload in place of the fus
 state collapses rather than drifting. That is the shape of a broken recurrent state or positional
 handling, not of wrong weights.
 
+### The collapse counts decode steps, not positions
+
+That distinction is measurable. The collapse lands after roughly the same number of DECODE steps
+whatever the prompt length is:
+
+| prompt | coherent for |
+|---|---|
+| 10 tokens (`Complete this: 2 + 2 =`) | ~8 generated tokens |
+| 64 tokens (one-line question) | ~6 |
+| 85 tokens | ~4 |
+| 4421 tokens | ~4 |
+
+so it is a per-decode-step counter, not an absolute position -- which rules out positional encoding
+and points at the GDN conv state, whose window is exactly four taps. Four to eight steps is where that
+window first becomes fully written.
+
+**And the conv weight cannot be the cause**: the prefill convolves the same qkv channels with the same
+`conv1d` through `causal_conv1d_silu_split`, and the prefill's output is coherent. So the weight, its
+channel order and the projection feeding it are all right, and what is left is the conv STATE ring and
+the slot bookkeeping the shared launch is handed.
+
+**The composition itself is now verified against the right reference.** The earlier comparison was
+against `dispatch_single_parent_snapshot`'s W8 fallback; the 27B's own path is the folded-ternary
+branch of `gdn_input_proj_conv_snapshot`, and it does
+
+```cpp
+        ProjectedWorkspace scratch = allocate_projected_workspace(ws, kChannels, geometry.width);
+        const Tensor activation = detail::folded_activation(x, qk_weight, ws, stream);
+        launch_ternary_split(activation, qk_weight, value_z_weight, scratch.projected, z, ...);
+        detail::gdn_projected_conv_snapshot_launch(scratch.projected, conv_weight, conv_states, ...);
+```
+
+and `allocate_projected_workspace` is nothing but `allocator.alloc(DType::BF16, {channels, tokens})` --
+no padding, no alignment special case. So this port's plain `leaf_workspace.alloc` plus parts
+projection plus the same launch is equivalent to it.
+
+
 
 
 
