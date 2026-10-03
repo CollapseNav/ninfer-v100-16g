@@ -898,6 +898,114 @@ bash /root/ppl_width_probe.sh        # the forward-width trace + QPN against SIM
 bash /root/ppl_edge_t4.sh            # D: the T = 4 window (forward width 4)
 ```
 
+---
+
+## Round 13 — the round-latency budget closes, and the draft window has a dominated basin
+
+Round 12 left one item with more than 10% in it: bring the QPN route's small-T weight path to parity,
+which would let T = 2 take the tensor-core route and cut the K = 1 round by ~18%. It also left the
+observation that the acceptance spread this tree has already measured (1.65 against 12.11) is an order
+of magnitude larger than anything left on the round. This round closed the first and went looking in
+the second.
+
+### The QPN small-T weight path: closed, negative
+
+| min-blocks | T = 1 whole step (QPN everywhere) | MTP K = 3 (T = 4 on QPN) |
+|---|---:|---:|
+| **4 (the built-in value)** | **38.0 / 38.0 t/s** | **58.6 / 58.6** |
+| 6 | 31.7 / 31.7 (-16.6%) | 51.1 / 51.1 (-12.8%) |
+| 8 | 9.2 / 9.2 (**-76%**) | 18.1 / 18.1 (-69%) |
+
+(`lookup10`, which does not touch this arm, read 256.8/256.8 -- the control.) So the kernel is **not**
+occupancy-starved despite sitting at 50%: it wants its registers, like the rest of this family, and
+`minBlocks = 8` caps it at 32 and destroys it. SPLITK was not swept alongside it because it has to
+divide the group count and every width in this model has groups in {40, 48, 80, 136}, whose only
+common divisors are 1, 2, 4 and 8 -- 8 is shipped and 4 is the only alternative, which the constant's
+own comment already rejects on warp count.
+
+With NACC's +21.8% (round 12) as the only thing the route had, **lever 1 is closed**: QPN's T = 1 step
+stays at 26.3 ms against SIMT's 18.1, T = 2 stays SIMT, and the K = 1 round stays at 25.6 ms.
+
+### The draft window, swept past 4 for the first time
+
+The tree's recorded sweep is K = 1..4, and it concluded window 1 is the right choice for text that is
+not reproducing the prompt. The validation ceiling is K = 7 (`--spec mtp requires --draft-tokens in
+[1,7]`). Same batch, two repetitions, `real_task`, `--max-new 128`, L = 1000/t/s:
+
+| K | t/s | acceptance | round ms | **L ms/token** | acceptance rate |
+|---:|---:|---:|---:|---:|---:|
+| **1** | 64.45 | 1.65 | 25.60 | **15.52** | 64.9% |
+| 2 | 54.90 | 1.85 | 33.70 | 18.22 | 43.0% |
+| 3 | 49.50 | 2.03 | 41.01 | 20.20 | 34.8% |
+| 4 | 45.65 | 2.21 | 48.41 | **21.91 -- the worst point** | 30.3% |
+| **5** | 64.00 | 2.49 | 38.91 | **15.62** | 30.3% |
+| 6 | 61.80 | 2.54 | 41.10 | 16.18 | 26.3% |
+| 7 | 59.70 | 2.59 | 43.38 | 16.75 | 23.4% |
+
+**The 29% step between K = 4 and K = 5 is the QPN band edge, seen from the other side.** K = 4 verifies
+at T = 5, which is below the edge and therefore runs the SIMT tile; K = 5 verifies at T = 6, takes QPN,
+and its round is 38.9 ms against 48.4 ms *while accepting more*: doing more work is 20% cheaper. That
+makes **K = 2, 3 and 4 a strictly dominated basin**, and it also confirms round 12's refusal of the
+edge change -- moving the edge to 4 would take K = 4 from 21.91 to roughly 18.6 ms/token, still worse
+than K = 5's 15.62, so it cannot move the optimum.
+
+So the curve is a plateau of two: K = 1 at 15.52 and K = 5..7 at 15.6-16.8 ms/token, with a valley
+between them. There is no win here, only a trap to avoid, and `--draft-tokens` is now a documented
+choice rather than a swept one.
+
+**A run-length artifact, recorded because it looked like a 24% win.** A probe at `--max-new 64` read
+K = 7 at 90.9 t/s and acceptance 3.94 against K = 1's 70.2 and 1.82, i.e. 11.0 against 14.5 ms/token.
+The round cost is identical at both lengths (43.3 against 43.4 ms) -- what changes is the acceptance,
+because the first 64 tokens of this trace are easier to draft than the whole 128. Any acceptance or
+L comparison has to fix `--max-new`.
+
+### The acceptance dead ends
+
+* **`--spec dflash2` is unreachable, and not for a kernel reason.** The CMakeLists does compile Volta
+  implementations for five of its pieces (dynamic conv, attn-input, linear_topk, **candidate_selector**,
+  rmsnorm_rope), and `dflash2_sm70_stub.cu` throws for the rest -- but the run does not get that far:
+  `error: DFlash2 was selected but the artifact has no DFlash2 weight bundle`. The codebook drafter
+  needs weights `bonsai2_27b_swift_pq2.ninfer` does not carry, so it is an artifact-repackaging job,
+  not a port. `--spec dflash` reports `selected masked draft backend is not supported by this target`.
+* **The lookup path is not a general drafter.** `lookup_draft` looks for the nearest prior occurrence
+  of the last **16 tokens** and copies what followed; the caller only takes it when
+  `agrees_with_mtp && max_lookup_extent > draft_window`, i.e. when the context literally repeats and
+  the MTP head already agrees. On ordinary text `lookup_draft` returns `nullopt` and the MTP head
+  drafts alone.
+* **The proposal head is already the better one.** `ProposalHead::Full` is the default and
+  `--lm-head-draft` selects `Optimized`; every number in this tree was taken with `Optimized`, and it
+  wins on both metrics -- acceptance 1.65 against 1.57 at K = 1, 2.49 against 2.31 at K = 5, 2.59
+  against 2.35 at K = 7, with a round 0.1-0.7 ms cheaper as well.
+
+Acceptance on ordinary text is therefore bounded by the MTP draft head, which lives in the artifact.
+
+### Where both directions now stand
+
+| direction | remaining | what it needs |
+|---|---:|---|
+| round latency, SIMT activation side | 0 | three mechanisms measured and refused |
+| round latency, weight stream | 0 | 789 GB/s = 88% of the card |
+| round latency, QPN small-T | 0 | NACC +21.8% is all it had; min-blocks negative |
+| round latency, rmsnorm fusion | ~2.5% | non-bit-identical, so PPL |
+| round latency, `silu_and_mul` fusion | ~1.3% | row -> warp remap in the SwiGLU producer |
+| round latency, MTP head per-draft-token projections | 2-4% | merge the draft tokens' lm_head call |
+| acceptance | 0 in-tree | the MTP head is artifact-bound; dflash2 needs a weight bundle |
+
+Both directions are close to exhausted inside this tree. The remaining round-latency work is a set of
+small, non-bit-identical fusions worth ~4-8% in total, and the remaining acceptance work is outside
+the tree.
+
+### Reproduce
+
+```bash
+bash /root/qpn_minblocks.sh          # -> /root/ninfer_ab/qpnminb
+bash /root/dflash2_probe.sh          # -> /root/ninfer_ab/dflash2
+bash /root/k_sweep.sh                # -> /root/ninfer_ab/ksweep
+bash /root/head_ab.sh                # -> /root/ninfer_ab/head
+python3 /root/k_extract.py /root/ninfer_ab/ksweep
+```
+
+
 
 
 

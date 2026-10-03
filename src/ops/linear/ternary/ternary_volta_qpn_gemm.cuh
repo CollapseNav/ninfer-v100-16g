@@ -80,11 +80,22 @@ __device__ __forceinline__ void pq2_stage_activation(const Activation* xrow, hal
 }
 
 // `t` is the live token count; rows beyond it are zeroed so the mma still executes.
-template <int kTiles, int SPLITK, int NACC, class OutputPolicy, class Activation>
-__global__ __launch_bounds__(
-    SPLITK * 32, (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK < 1
-        ? 1
-        : (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK)
+//
+// kMinBlocksOverride is the sweep hook for __launch_bounds__'s second argument, which had never been
+// swept on this route. The built-in value gives 32/SPLITK = 4 CTAs of 256 threads, i.e. 32 of the
+// SM's 64 warps -- 50% occupancy -- which is a suspect on a kernel whose whole job is streaming
+// weights. 0 means the built-in value.
+template <int kTiles, int SPLITK>
+constexpr int qpn_default_minblocks() {
+    constexpr int warps = kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4;
+    return warps / SPLITK < 1 ? 1 : warps / SPLITK;
+}
+
+template <int kTiles, int SPLITK, int NACC, class OutputPolicy, class Activation,
+          int kMinBlocksOverride = 0>
+__global__ __launch_bounds__(SPLITK * 32,
+                             kMinBlocksOverride != 0 ? kMinBlocksOverride
+                                                     : qpn_default_minblocks<kTiles, SPLITK>())
 void ternary_volta_qpn_gemm_kernel(const std::uint8_t* __restrict__ codes,
                                    const std::uint8_t* __restrict__ scales,
                                    const Activation* __restrict__ x, int n, int k, int t,

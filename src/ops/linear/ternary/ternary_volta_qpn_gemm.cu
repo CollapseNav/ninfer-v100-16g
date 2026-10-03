@@ -100,7 +100,26 @@ constexpr int qpn_nacc_for(int kTiles, int override_value) {
     return kTiles == 2 ? 2 : 1;
 }
 
-template <int kTiles, class Activation, int kNaccOverride = 0>
+// NINFER_TERNARY_QPN_MINBLOCKS caps the QPN kernel's registers through __launch_bounds__'s second
+// argument. The built-in value is 32/SPLITK = 4 for kTiles = 1, i.e. 50% occupancy of this SM, and it
+// had never been swept -- the same lever that gave the dedicated T = 1 SIMT GEMV +4.8%.
+//
+// SPLITK is deliberately NOT swept alongside it. It has to divide the group count, and every width in
+// this model has groups in {40, 48, 80, 136}, whose only common divisors are 1, 2, 4 and 8; 8 is the
+// shipped value and 4 is the only alternative, which the constant's own comment already rejects
+// ("one CTA covers only 32 output rows, so the grid is n/32 ... at SPLITK = 4 that is 8 warps per SM
+// -- nowhere near enough to hide a weight stream's latency"). Recorded so it is not re-proposed.
+int qpn_minblocks_override() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_QPN_MINBLOCKS");
+        if (env == nullptr) { return 0; }
+        const int parsed = std::atoi(env);
+        return (parsed == 4 || parsed == 6 || parsed == 8) ? parsed : 0;
+    }();
+    return value;
+}
+
+template <int kTiles, class Activation, int kNaccOverride = 0, int kMinBlocksOverride = 0>
 void launch_shape(const Tensor& x, const Weight& w, Tensor& out, std::int32_t out_row_stride,
                    cudaStream_t stream) {
     using S = TernaryVoltaQpnSchedule;
@@ -108,10 +127,11 @@ void launch_shape(const Tensor& x, const Weight& w, Tensor& out, std::int32_t ou
     // One accumulator per k-slice of a 16-k unit would break the mma RAW chain (the sibling kernels'
     // NACC knob), but four accumulators per tile is 32 registers per live tile and kTiles goes to 4;
     // with more than one tile the tiles are already independent, which is the same ILP for free.
-    constexpr int kNacc   = kNaccOverride != 0 ? kNaccOverride : (kTiles == 1 ? 4 : 1);
+    constexpr int kNacc = qpn_nacc_for(kTiles, kNaccOverride);
     const int n = w.n;
     const unsigned grid = static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta);
-    ternary_volta_qpn_gemm_kernel<kTiles, kSplitk, kNacc, TernaryBf16Output, Activation>
+    ternary_volta_qpn_gemm_kernel<kTiles, kSplitk, kNacc, TernaryBf16Output, Activation,
+                                  kMinBlocksOverride>
         <<<grid, kSplitk * 32, 0, stream>>>(
             static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
             static_cast<const Activation*>(x.data), n, w.k, x.ne[1],
@@ -278,13 +298,22 @@ void launch_ternary_volta_qpn(const Tensor& x, const Weight& w, Tensor& out,
     const int tiles = (x.ne[1] + TernaryVoltaQpnSchedule::kRowsPerTile - 1) /
                       TernaryVoltaQpnSchedule::kRowsPerTile;
     const int nacc_env = qpn_nacc_override();
+    const int minb_env = qpn_minblocks_override();
     if (x.dtype == DType::FP16) {
         if (tiles <= 1) {
-            // Built-in default here is NACC = 4; the override reaches it now (it did not before).
+            // Built-in default here is NACC = 1 and min-blocks = 4; both overrides reach it now.
             const int nacc = qpn_nacc_for(1, nacc_env);
-            if (nacc == 1)      { launch_shape<1, half, 1>(x, w, out, out_row_stride, stream); }
-            else if (nacc == 2) { launch_shape<1, half, 2>(x, w, out, out_row_stride, stream); }
-            else                { launch_shape<1, half>(x, w, out, out_row_stride, stream); }
+            if (nacc == 1 && minb_env == 6) {
+                launch_shape<1, half, 1, 6>(x, w, out, out_row_stride, stream);
+            } else if (nacc == 1 && minb_env == 8) {
+                launch_shape<1, half, 1, 8>(x, w, out, out_row_stride, stream);
+            } else if (nacc == 1) {
+                launch_shape<1, half, 1>(x, w, out, out_row_stride, stream);
+            } else if (nacc == 2) {
+                launch_shape<1, half, 2>(x, w, out, out_row_stride, stream);
+            } else {
+                launch_shape<1, half>(x, w, out, out_row_stride, stream);
+            }
         } else if (tiles == 2) {
             const int nacc = qpn_nacc_for(2, nacc_env);
             if (nacc == 1)      { launch_shape<2, half, 1>(x, w, out, out_row_stride, stream); }
