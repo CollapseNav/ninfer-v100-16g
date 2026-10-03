@@ -821,16 +821,44 @@ void bind_gguf_text_layers(artifact::Binder& binder, BindingPlan& out,
                     .output      = 2,
                     .row         = 0});
             }
-            projection.parts.push_back(GgufProjectionPartPlan{
-                .weight      = bind_gguf_weight(binder, prefix + "attention/gate", {6144, 5120}),
-                .object_rows = 6144,
-                .output      = 1,
-                .row         = 0});
-            projection.parts.push_back(GgufProjectionPartPlan{
-                .weight      = bind_gguf_weight(binder, prefix + "attention/value", {1024, 5120}),
-                .object_rows = 1024,
-                .output      = 3,
-                .row         = 0});
+            // gate and value may ALSO be row ranges of one object -- the fork's gate_value pair --
+            // and the two published variants differ in which pairs they fuse: iq2xs stores
+            // query|key as one object on two layers and gate/value separately everywhere, while
+            // iq3xxs stores gate|value as one object on some layers and query/key separately. So
+            // each pair is resolved from the artifact rather than assumed.
+            const artifact::ObjectSlice* g_slice = binder.find_slice(prefix + "attention/gate");
+            const artifact::ObjectSlice* v_slice = binder.find_slice(prefix + "attention/value");
+            if (g_slice != nullptr && v_slice != nullptr && g_slice->object == v_slice->object) {
+                const auto& object = *g_slice->object;
+                const auto rows    = static_cast<std::int32_t>(
+                    std::get<artifact::TensorDescriptor>(object).shape[0]);
+                const WeightPlan shared = bind_gguf_object(binder, object);
+                projection.parts.push_back(GgufProjectionPartPlan{
+                    .weight      = shared,
+                    .object_rows = rows,
+                    .output      = 1,
+                    .row         = 0,
+                    .source_row  = static_cast<std::int32_t>(g_slice->first_row),
+                    .source_rows = static_cast<std::int32_t>(g_slice->rows)});
+                projection.parts.push_back(GgufProjectionPartPlan{
+                    .weight      = shared,
+                    .object_rows = rows,
+                    .output      = 3,
+                    .row         = 0,
+                    .source_row  = static_cast<std::int32_t>(v_slice->first_row),
+                    .source_rows = static_cast<std::int32_t>(v_slice->rows)});
+            } else {
+                projection.parts.push_back(GgufProjectionPartPlan{
+                    .weight = bind_gguf_weight(binder, prefix + "attention/gate", {6144, 5120}),
+                    .object_rows = 6144,
+                    .output      = 1,
+                    .row         = 0});
+                projection.parts.push_back(GgufProjectionPartPlan{
+                    .weight = bind_gguf_weight(binder, prefix + "attention/value", {1024, 5120}),
+                    .object_rows = 1024,
+                    .output      = 3,
+                    .row         = 0});
+            }
             target.attention.projection = std::move(projection);
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
