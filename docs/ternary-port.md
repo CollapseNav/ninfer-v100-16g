@@ -1499,9 +1499,18 @@ and disagreement would have meant the kernel was wrong.
 | `matrix_product` **with** `input_columns` | `gdn/output`, iq4_xs | worst absolute 7.87e-3 on the largest product (0.68%) |
 
 IQ1_M aborts the matrix arm by design (`has_matrix_kernel` is false), which is exactly why the model
-routes it to `dequantize_produkt` -- dequantize plus cuBLAS -- and that path was verified separately.
+routes it to `dequantized_product` -- dequantize plus cuBLAS -- and that path was verified separately.
 The residual percentages are the activation quantization's own error, largest where a product nearly
 cancels, and they are the same order in both kernels.
+
+**A cross-artifact check that turned out not to be one.** The obvious way to test "the artifact itself
+is wrong" without an external reference is to compare the same role across the repo's variants: iq2xs
+at ~2.31 bpw against iq3xxs at ~3.06 should agree closely but not exactly. Dequantizing
+`text/layers/0/mlp/up`, `.../mlp/gate` and `.../gdn/output` from both gives pearson **+1.0000**,
+cosine **+1.0000**, and identical RMS -- because the bytes are the same, not merely correlated. The
+GSQ-RCO recipe evidently reuses a role's quantization across presets, so this comparison cannot say
+anything about corruption and is recorded as a dead end rather than a result.
+
 
 **So every GGUF-specific stage is now measured**: the container, the binding, the materialization, the
 dequantizers, both kernels with and without the gather, the conv state, the explicit rmsnorm, the
