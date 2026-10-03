@@ -59,16 +59,38 @@ drafts:
 
 | workload | K = 1 | K = 5 | wider still |
 |---|---:|---:|---:|
-| prose | **62.3** (L 16.05) | 58.6 (17.06) | — |
-| ordinary task text | **64.45** (L 15.52) | 64.0 (15.63) | — |
-| code | 71.6 (L 13.97) | **77.1** (L 12.97) | — |
+| prose, thinking on | **62.3** (L 16.05) | 58.6 (17.06) | — |
+| prose, thinking off | 68.5 (L 14.60) | **80.1** (12.48) | — |
+| ordinary task text, thinking off | 66.4 (L 15.06) | **76.1** (13.14) | — |
+| code, thinking on | 71.6 (L 13.97) | **77.1** (12.97) | — |
 | repeated text (context lookup) | 171.8 (L 5.82) | 245.3 (L 4.08) | **256.7 at K = 7** (L 3.90) |
 
-So **K = 5** is the right single default for a code-heavy or mixed deployment (7% on code, 43% on
-repeated text, 6% on prose against K = 1), and **K = 1** remains right for a prose-only one.
-Repetition-heavy traffic (prompt echoing, extraction, long quotes) wants **K = 7**. K = 2, 3 and 4
-are dominated on every workload measured -- they verify at T = 3..5, below the QPN route's band edge
-at 6, and land on the SIMT tile, where K = 5's T = 6 does *more* work in *less* time.
+So **K = 5** is the right single default (never worse than K = 1 on any workload measured, and 4-17%
+better on most), with one real exception: **prose with thinking enabled**, where K = 1 is 6% better.
+`K = 1` remains the right choice for a prose-only, thinking-on deployment, and repetition-heavy traffic
+(prompt echoing, extraction, long quotes) wants **K = 7**. K = 2, 3 and 4 are dominated on every
+workload measured -- they verify at T = 3..5, below the QPN route's band edge at 6, and land on the
+SIMT tile, where K = 5's T = 6 does *more* work in *less* time.
+
+### Context length, which is the larger term
+
+Every rate above is at 45-20,000 prompt tokens with a 128-token generation. The server's own log for a
+real long turn reads `prompt 21,006 | output 34,766 | decode 47.9 tok/s`, and that is not a
+disagreement -- it is a different axis. Measured on the V100 ternary port (round 14 of
+`docs/decode-round-2026-10-01.md`), `--max-new 128`:
+
+| prompt tokens | no spec (T = 1) | K = 5 |
+|---:|---:|---:|
+| 5,120 | 51.7 | 80.1 |
+| 39,009 | **36.2** | 47.6 |
+| 81,397 | **28.6** | 43.1 |
+
+The T = 1 step goes 19.3 -> 27.6 -> 35.0 ms per token: **+43% at 39k and +81% at 81k**, and the loss
+is in the base step, not in speculation. **The draft window is worth approximately nothing at
+21k-56k context** (at 39k, K = 1 and K = 5 are level at 47.4 against 47.6 despite K = 5's acceptance
+being 68% higher), so a long-context deployment should size its window for what it costs, not for what
+it buys. Which kernel pays the per-token context cost is not yet known; no round of the port has
+measured it.
 
 Because the window is frozen at startup and the graph families and workspace are planned around it,
 there is no adaptive option today: an acceptance-driven window would need several window families

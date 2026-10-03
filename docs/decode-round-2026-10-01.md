@@ -1029,6 +1029,85 @@ had changed that arm's inline default from 4 to 1 and the dispatch's last branch
 `launch_shape<1, half>` -- an abbreviation that now resolves to NACC = 1. The dispatch names all three
 values explicitly. **Two arms that agree to the digit are not a result; they are a routing bug.**
 
+---
+
+## Round 14 — the context-length axis, which nothing in this document had measured
+
+This round did not start from a hypothesis. It started from the resident server's own request log,
+where a real long agent turn reads:
+
+```
+req#2 done | prompt 21,006 | output 34,766 | TTFT 21.0s | total 12m 27.7s |
+            prefill 1.08k tok/s | decode 47.9 tok/s | mtp accepted 21,818/65,878 (33.1%)
+```
+
+**47.9 t/s.** Every decode number in this document -- 51.5, 54.2, 55.3, 64.4, 77.1 -- was taken at
+45 to 20,000 tokens of context with a 128-token generation. A long agent turn is neither. So the two
+are not in disagreement; the tree had simply never measured the axis the traffic actually lives on.
+
+### Decode rate against context, with and without speculation
+
+`--max-new 128` throughout, so the number is a rate and not an average over a growing context.
+Fixtures are built from **distinct** source files: a fixture assembled by repeating one document would
+trigger `lookup_draft`'s 16-token verbatim suffix match and hand the workload the context-copy fast
+path, which is not what a conversation gets. Two repetitions each; the spread is under 1%.
+
+| prompt tokens | **no spec** (T = 1) | K = 1 | K = 5 | K = 5 acceptance |
+|---:|---:|---:|---:|---:|
+| 45 | -- | 66.4 | **76.1** | 3.00 |
+| 4,381 | -- | 66.8 | 69.2 | 2.82 |
+| 5,120 | 51.7 | 68.5 | **80.1** | 3.34 |
+| 11,276 | -- | 61.5 | 60.0 | 2.82 |
+| 15,592 | -- | 61.5 | 70.2 | 3.34 |
+| 19,930 | -- | 52.9 | 59.9 | 3.10 |
+| 39,009 | **36.2** | 47.4 | 47.6 | 2.86 |
+| 81,397 | **28.6** | 40.8 | 43.1 | 3.17 |
+
+Three readings:
+
+* **The loss is in the base step, not in speculation.** No-spec falls 51.7 -> 36.2 -> 28.6 t/s, i.e.
+  the T = 1 step goes 19.3 -> 27.6 -> 35.0 ms per token, **+43% at 39k and +81% at 81k**. Attention
+  compute and KV bytes do not obviously pay for that (+8.3 ms at 39k against an estimated ~1-3 ms of
+  KV traffic), so which kernel grows is **not yet known** -- that is the open question this round
+  hands to the next one. Nothing in rounds 1-13 touches it: every number there is a short-context
+  measurement, and the GEMV family that dominates the budget does not read the context at all.
+* **The draft window's advantage collapses at long context.** At 39k, K = 1 and K = 5 are equal
+  (47.4 against 47.6) despite K = 5's acceptance being 68% higher (2.86 against 1.70): the verify's
+  own cost grows with context faster than the extra accepted tokens pay for it. At 81k K = 5 is still
+  ahead (43.1 against 40.8). So **K = 5 is never worse, but at 21k-56k -- the range the harness
+  runs in -- it is worth approximately nothing**, and the deployment's value is concentrated at
+  short context and on repetition.
+* **Acceptance tracks the content, not the length.** Same acceptance 3.34 gives 80.1 t/s at 5k and
+  70.2 at 15.6k; acceptance 2.82 gives 69.2 at 4.4k and 60.0 at 11.3k. So the two effects are
+  separable and the context term is the smaller one until about 20k.
+
+### A caveat this round found in its own round-13 table
+
+Round 13's per-workload window comparison did **not** pass `--no-thinking`; the fixture sweep in this
+round does. The window comparison is sensitive to that:
+
+| workload | thinking on (round 13) K = 1 -> K = 5 | thinking off (round 14) K = 1 -> K = 5 |
+|---|---|---|
+| `prose4k` | 62.3 -> 58.6 (K = 1 wins 6%) | 68.5 -> **80.1** (K = 5 wins 17%) |
+| `real_task` | 64.45 -> 64.0 (tie) | 66.4 -> **76.1** (K = 5 wins 15%) |
+| `real_code` | 71.6 -> **77.1** (K = 5 wins 7%) | 66.8 -> 69.2 (K = 5 wins 3.6%) |
+| `prose16k` | -- | 52.9 -> 59.9 (K = 5 wins 13%) |
+
+So K = 5 wins in both modes on `real_task` and `real_code`, and the prose exception is
+**thinking-mode-specific** -- with thinking off, K = 5 wins there too, by 17%. The serving deployment
+runs thinking on by default, so the thinking-on column is the one that governs it, and the prose
+regression it was flagged for is real but narrow.
+
+### Reproduce
+
+```bash
+python3 /root/build_ctx.py /root/ninfer_ab/ctxlong   # distinct-source long fixtures
+bash /root/ctx_sweep.sh        # short-to-20k, K = 1 against K = 5, thinking off
+bash /root/ctx_long.sh         # 39k and 81k
+bash /root/ctx_nospec.sh       # the no-spec baseline that localises the loss
+```
+
+
 
 
 **A run-length artifact, recorded because it looked like a 24% win.** A probe at `--max-new 64` read
