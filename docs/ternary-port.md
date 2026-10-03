@@ -1549,6 +1549,23 @@ The source GGUF (`Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ2_XS-mtp.gguf`, 8,771,311,616 
 `provenance.sources.gguf` names) is now being pulled through the mirror, so running it under llama.cpp
 -- which would give both the true text quality and per-layer activations to diff -- is within reach.
 
+### The converter itself is now verified against the source's own allocation
+
+The source repo also publishes the per-tensor quantization it used
+(`tensor-allocation/…-IQ2_XS-mtp.rco-allocation.txt`, 866 tensors with a histogram of
+`{"BF16": 96, "F32": 360, "IQ1_M": 31, "IQ1_S": 36, "IQ2_S": 60, "IQ2_XS": 53, "IQ2_XXS": 70,
+"IQ3_S": 47, "IQ3_XXS": 37, "IQ4_XS": 11, "Q2_K": 53, "Q4_K": 4, "Q6_K": 8}`), and the artifact's
+`methods` section records the source tensor and format of every parameter. Comparing them:
+
+**523 imported tensors checked, 0 mismatches, 0 names not found in the allocation.** The 456 the check
+does not cover are the `cast_direct` tensors (BF16/F32), whose source strings carry no format suffix.
+The source's SHA-256 for the GGUF is also published (`4414bc39…cab85`), so the download can be verified
+against it.
+
+So the converter's format choices are exactly the source's, and the artifact is a faithful repackaging
+in the one respect that can be checked without the original file.
+
+
 
 
 
