@@ -301,18 +301,24 @@ void launch_ternary_volta_qpn(const Tensor& x, const Weight& w, Tensor& out,
     const int minb_env = qpn_minblocks_override();
     if (x.dtype == DType::FP16) {
         if (tiles <= 1) {
-            // Built-in default here is NACC = 1 and min-blocks = 4; both overrides reach it now.
+            // Built-in defaults here are NACC = 1 and min-blocks = 4; both overrides reach it now.
+            //
+            // The `nacc == 4` arm must pass kNaccOverride explicitly. It used to be spelled
+            // `launch_shape<1, half>` and rely on the inline default being 4; once that default became
+            // 1, the abbreviation silently resolved to NACC = 1, so `NINFER_TERNARY_QPN_NACC=4` ran the
+            // shipped value instead and an A/B against it read exactly zero. Bit-for-bit identical
+            // arms are the tell; the dispatch now names all three.
             const int nacc = qpn_nacc_for(1, nacc_env);
             if (nacc == 1 && minb_env == 6) {
                 launch_shape<1, half, 1, 6>(x, w, out, out_row_stride, stream);
             } else if (nacc == 1 && minb_env == 8) {
                 launch_shape<1, half, 1, 8>(x, w, out, out_row_stride, stream);
-            } else if (nacc == 1) {
-                launch_shape<1, half, 1>(x, w, out, out_row_stride, stream);
+            } else if (nacc == 4) {
+                launch_shape<1, half, 4>(x, w, out, out_row_stride, stream);
             } else if (nacc == 2) {
                 launch_shape<1, half, 2>(x, w, out, out_row_stride, stream);
             } else {
-                launch_shape<1, half>(x, w, out, out_row_stride, stream);
+                launch_shape<1, half, 1>(x, w, out, out_row_stride, stream);
             }
         } else if (tiles == 2) {
             const int nacc = qpn_nacc_for(2, nacc_env);

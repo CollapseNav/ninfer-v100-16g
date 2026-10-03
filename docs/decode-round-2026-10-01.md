@@ -979,6 +979,57 @@ The K = 4 -> K = 5 step reproduces exactly and for the same reason: round 50.27 
 while K = 4's T = 5 is below the edge and runs the SIMT tile. So `--draft-tokens` is a workload
 parameter -- high-acceptance workloads want the large window -- and K = 4 is wrong everywhere.
 
+### The K = 5 reversal, and why the record said the opposite
+
+The tree's recorded advice is that window 1 is the best choice, and that advice was correct on the
+build it was taken on. Re-running the two NACC values side by side on `real_code` -- where there is no
+repetition, so the lookup gate cannot interfere -- shows the whole difference:
+
+| `real_code` | K | NACC = 4 (pre-round-12) | NACC = 1 (shipped) | change |
+|---|---:|---:|---:|---:|
+| verify T = 2 (SIMT) | 1 | 71.4 | 71.6 | 0 |
+| verify T = 5 (SIMT, below the edge) | 4 | 64.2 | 64.4 | **0 -- the control** |
+| verify T = 6 (QPN, `tiles = 1`) | **5** | **63.9** | **77.1** | **+20.7%** |
+
+So **before round 12, K = 5 was 63.9 against K = 1's 71.4, i.e. 11.7% worse per token** -- a negative
+result, and the reason the window default was set to 1. Round 12's `kTiles = 1` NACC fix is what
+flipped it: K = 5's verify is the arm that bug lived on. K = 1 and K = 4 are bit-identical across the
+knob, which is what attributes the change to it rather than to batch drift.
+
+The same run corrects two other statements in this tree:
+
+* **`--spec mtp` on prose is not a wash.** Window 1 on `prose4k` is **62.3 t/s against 51.5 with no
+  spec at all (+21%)**. An earlier note in this round compared window 1 with the *no-spec* arm and
+  read it as a tie; that was the wrong pair.
+* **The lookup fast path does not want a small window.** `apps/cli/options.cpp` says "a small window
+  is what lets the fast path engage", because the lookup's third gate wants the MTP head's first K
+  drafts to agree with it exactly. Measured on `lookup10`: K = 1 **171.8 t/s** (acceptance 5.74),
+  K = 3 188.9 (8.46), K = 5 245.3 (10.90), **K = 7 256.7 (12.11)**. Window 1 is 49% *behind* window 7
+  on the workload the gate exists for.
+
+### Window 1 is a prose-tuned default
+
+With the shipped binary, every workload's own optimum:
+
+| workload | K = 1 | best wide window | verdict |
+|---|---:|---:|---|
+| `prose4k` | **62.3** (L 16.05) | K = 5: 58.6 (17.06) | **K = 1** |
+| `real_task` | **64.45** (L 15.52) | K = 5: 64.0 (15.63) | tie |
+| `real_code` | 71.6 (13.97) | **K = 5: 77.1 (12.97)** | **K = 5** |
+| `lookup10` (repeated text) | 171.8 (L 5.82) | **K = 7: 256.7 (3.90)** | **K = 7** |
+
+So the CLI default of 1 is right for prose and wrong by 7% on code and by 49% on repeated text. Since
+acceptance is observable at run time, an acceptance-driven adaptive window is the obvious follow-up --
+not a fixed constant. No default was changed here; the reading is recorded.
+
+**A self-inflicted bug found by this comparison, and worth recording as a method note.** The first
+attempt at the NACC A/B came back *bit-identical* on both arms (76.9 against 77.1, 64.2 against 64.3).
+That is the tell: `NINFER_TERNARY_QPN_NACC=4` no longer reached the kTiles = 1 arm, because round 12
+had changed that arm's inline default from 4 to 1 and the dispatch's last branch was still spelled
+`launch_shape<1, half>` -- an abbreviation that now resolves to NACC = 1. The dispatch names all three
+values explicitly. **Two arms that agree to the digit are not a result; they are a routing bug.**
+
+
 
 **A run-length artifact, recorded because it looked like a 24% win.** A probe at `--max-new 64` read
 K = 7 at 90.9 t/s and acceptance 3.94 against K = 1's 70.2 and 1.82, i.e. 11.0 against 14.5 ms/token.
