@@ -1277,6 +1277,87 @@ bash /root/trace_ctx_cost.sh
 python3 /root/nvp_phases.py /root/nvp_ctx/long.txt 400
 ```
 
+---
+
+## Round 17 — the long-context attention kernel: profiled, and the root cause is the tile's row count
+
+Round 16 named the kernel. This round profiled it with Nsight Compute (`ncu` 2025.1.1 needs
+`--privileged`; `nvprof` does not, which is why the tree had nvprof numbers but no occupancy data).
+
+### What ncu says
+
+| metric | value |
+|---|---|
+| Theoretical Occupancy | **12.50%** |
+| Block Limit Shared Mem | **2 blocks** |
+| Block Limit Registers | **2 blocks** |
+| No Eligible (scheduler had nothing to issue) | **93.3%** |
+| Eligible Warps Per Scheduler | 0.07 |
+| Compute (SM) / DRAM / L2 / L1-TEX Throughput | 0.44% / 0.22% / 0.42% / 6.1% |
+
+It is starved for warps: two blocks of four warps is 8 warps of the SM's 64, and 93% of cycles have no
+eligible warp. Every pipe is under 1% of its peak.
+
+(The achieved-occupancy figure in that report is 6.25%, but it comes from a 16-CTA launch -- grid
+`(4,4,1)`, an early decode step -- so it reflects an underfilled grid, not the 39k steady state. The
+*theoretical* 12.5% and the block limits are properties of the kernel and hold everywhere.)
+
+Roofline on the same call for scale: at 39,009 tokens of context the kernel reads
+`2 * kv_heads(4) * head_dim(256) * 39009` = **79.9 MB** of int8 KV in **623 us** = **128 GB/s, 14% of
+the card**, and does 24 heads x 39,009 x 256 = **0.48 GFLOP** at 0.77 TFLOP/s, 0.6% of peak. Both ends
+of the roofline are two orders of magnitude away, which is the signature of a warp-starved kernel and
+not of a machine limit.
+
+### The blocker, and it is not a tuning constant
+
+The shared-memory budget per CTA is **36.7 KB**:
+
+| buffer | bytes | note |
+|---|---:|---|
+| `q_s` | **16,896** | `Br=32` rows x `SmemStride=264` halves x 2 |
+| `q_tail_s` | 2,112 | read only by the `CompactTail` (5-warp) instantiation |
+| `k_s` / `v_s` | 8,448 each | `Bc=16` keys |
+| `p_tail_s` + `physical_pages_s` | 384 | |
+
+96 KB of SM shared memory divided by 36.7 KB is 2.6, i.e. **2 blocks**, and registers independently
+limit it to 2 as well. Three blocks needs <= 32 KB, so it needs 4.7 KB cut.
+
+**The obvious cut is not available.** `q_s` is 32 rows wide while the T = 1 decode shape has
+`row_count = tokens * GroupSize = 1 * 6 = 6` rows live, so it looks like 13.7 KB of waste -- and the
+first attempt here sized it by the live row count. It was wrong, and the source says why:
+`volta_load_qp` reads the row `volta_qp_get_i()` chooses, and the mma it feeds is documented as
+`QK^T: D[32x8] += Q[32x8] @ K[8x8]^T` -- **the A operand consumes the whole 32-row tile in one call**.
+Rows 6..31 are zero-filled and participate. So `q_s` cannot shrink without changing the tile topology,
+and the remaining trims (`q_tail_s` 2.1 KB, the two small arrays) leave 34.5 KB, still 2 blocks.
+
+**That single fact is the root cause of the long-context cost.** The tile is 32 rows because that is
+one Volta `m8n8k4` quadpair group; a 6-row problem pays for 32, and the topology additionally has all
+`DimSplit = 4` warps redundantly recompute the QK^T and online-softmax step (the file's own design
+note #1 says so). Together that is ~21x the useful QK^T issue work on the hot decode shape -- invisible
+at 5k tokens, where the whole call is 96 us, and the dominant term at 39k.
+
+### The three ways forward, with their costs
+
+1. **int8 `k_s`/`v_s` plus dequantize in the fragment loader.** 36.7 -> 28.3 KB, i.e. **3 blocks,
+   +50% warps**. But it moves the conversion into the mma feed: `volta_load_k`/`volta_load_v` run 64
+   times per warp per key tile, and each would grow from one `LDS.128` to a load plus ~10 conversion
+   instructions -- roughly +640 instructions per warp per key tile against a current ~384. The
+   arithmetic says this is a wash at best, and it should be measured before being believed either way.
+2. **Double `WarpsPerCta` to 8** (two key-range halves). Doubles the warps per CTA at the same shared
+   memory, i.e. 25% occupancy -- the only route that raises occupancy without touching the buffers.
+   It doubles the already-redundant QK^T, and `k_s`/`v_s` would have to be double-buffered for two
+   key ranges, which costs the 16.9 KB this is trying to save. Not obviously available.
+3. **A topology for the small shapes**: no 32-row Q tile (6 live rows), no 4x redundant QK^T, K/V
+   staged once per CTA rather than per row-pass. This is the change that actually addresses the root
+   cause, and it is a kernel rewrite rather than a constant.
+
+Nothing was changed. The first attempt -- sizing `q_s` by the live row count -- was written, found
+unsafe against `volta_qp_get_i`'s 32-row A operand, and reverted; the tree is byte-identical.
+Recommendation: (1) is a bounded experiment worth one round even though the instruction arithmetic
+pessimistic, because the occupancy estimate is the measured one and the instruction estimate is not;
+(3) is where the 20%+ lives and should be scoped as a project.
+
+
 
 
 
