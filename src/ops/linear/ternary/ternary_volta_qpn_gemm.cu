@@ -38,15 +38,24 @@ struct TernaryBf16Output {
 
 // NACC is the sibling kernels' generation-2 knob: it round-robins the four mma of one 16-k unit into
 // independent accumulators so the RAW chain on the accumulator is not four deep. NACC = 4 at
-// kTiles = 1 (the decode and verify tiles have no other ILP) and 1 above it (the tiles are already
-// independent). NINFER_TERNARY_QPN_NACC overrides it for kTiles = 2 -- T = 9..16, the lookup verify
-// where the route is worth +90% and the mma count doubles with the tile. Experiment, measured before
-// it is defaulted.
+// kTiles = 1 (the decode and verify tiles have no other ILP) and, since this change, **2 at
+// kTiles = 2** -- T = 9..16, the lookup verify where the route is worth +90% and the mma count
+// doubles with the tile. NINFER_TERNARY_QPN_NACC=1 restores the previous behaviour, =4 is measured
+// and worse.
+//
+// Measured, same batch, lookup10 K = 7: NACC 1 -> 235.5, NACC 2 -> 237.5 (+0.85%), NACC 4 -> 227.6
+// (-3.4%), output text identical at all three. Continuous check at --context 16 --stride 8, which is
+// the only window plan that lands every forward on kTiles = 2, both arms on the QPN route, 8,675
+// scored tokens: mean_nll 4.165766 (NACC 1) against 4.166126 (NACC 2), i.e. +0.036% PPL. That is a
+// real numerics cost -- 2.5x the QPN band's own deviation from SIMT (+0.0143%) and 1.5x the fp16
+// operand margin this tree accepted for its prefill routes (+0.0245%) -- bought for +0.85% on one
+// path, so `=1` is the escape hatch for anyone who wants the tighter numbers.
 int qpn_nacc_override() {
     static const int value = [] {
         const char* env = std::getenv("NINFER_TERNARY_QPN_NACC");
-        const int parsed = env == nullptr ? 0 : std::atoi(env);
-        return (parsed == 1 || parsed == 2 || parsed == 4) ? parsed : 0;
+        if (env == nullptr) { return 2; }
+        const int parsed = std::atoi(env);
+        return (parsed == 1 || parsed == 2 || parsed == 4) ? parsed : 2;
     }();
     return value;
 }

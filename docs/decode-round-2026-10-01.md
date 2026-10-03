@@ -396,3 +396,36 @@ fix, so all three arms were the SIMT route at 123.7 t/s.
 -> 52.8/52.7 and MTP K = 1 64.0/64.0 -> 62.4/62.4, i.e. **-2.7%**, with identical output. One block
 of prefetch already covers the DRAM latency; the second block only costs registers. The default stays
 1 (`NINFER_TERNARY_STAGE_DEPTH`).
+
+---
+
+## Round 7 — NACC = 2 at kTiles = 2, enabled after the perplexity check
+
+NACC round-robins the four mma of one 16-k unit into independent accumulators, breaking the RAW chain
+on the accumulator. At kTiles = 2 -- T = 9..16, the context-lookup verify, where the mma count doubles
+with the tile -- two accumulators win and four lose. Same batch:
+
+| arm | lookup10 K = 7 | lookup16 K = 7 |
+|---|---:|---:|
+| NACC = 1 (previous shipped) | 234.9 | 247.4 |
+| **NACC = 2 (now shipped)** | **237.6 (+1.1%)** | **249.8 (+1.0%)** |
+| NACC = 4 | 227.4 (-3.2%) | -- |
+| no-spec decode step | 54.2 both | -- |
+
+Acceptance length identical (12.11 / 12.70) and the output text identical between NACC 1 and 2 on both
+fixtures.
+
+Because NACC reassociates the fp32 accumulation, the continuous check is what decides it.
+`ninfer-perplexity --text --context 16 --stride 8` is the only window plan that lands every forward on
+kTiles = 2; with both arms on the QPN route over 8,675 scored tokens:
+
+| arm | mean_nll | PPL |
+|---|---:|---:|
+| NACC = 1 | 4.165766 | 64.442012 |
+| NACC = 2 | 4.166126 | 64.465258 |
+
+**+0.036% PPL** -- 2.5x the QPN band's own deviation from SIMT (+0.0143%) and 1.5x the fp16 operand
+margin this tree accepted for its prefill routes (+0.0245%) -- bought for about +1% on one path. That
+is a trade, not a free win, so it is recorded as one: `NINFER_TERNARY_QPN_NACC=1` restores the tighter
+numbers. The 96-token greedy md5 against `/root/wt/base.out` is IDENTICAL with the new default and
+with `=1`, since the knob is above the gate.
