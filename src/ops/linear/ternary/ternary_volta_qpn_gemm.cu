@@ -178,7 +178,27 @@ bool ternary_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t)
     // where the win clears the +/-4% batch drift of this workload (18% at T = 6, 30% at T = 8, and
     // 2.1x at the T = 16 lookup verify). T = 1 is far worse than all of them: the A tile is eight
     // tokens tall whatever T is, so one token runs the schedule with seven eighths of M dead.
-    if (t < 6) { return false; }
+    //
+    // NINFER_TERNARY_QPN_MIN_T moves the lower edge so that sweep can be re-run on a later build
+    // instead of trusted. RE-MEASURED on the current build (round 10 of
+    // docs/decode-round-2026-10-01.md), same batch, interleaved, two repetitions, round = acceptance
+    // / decode_speed:
+    //
+    //   arm      K=1 (T=2) round   K=2 (T=3)   K=3 (T=4)
+    //   min_t=6      25.62            33.67       40.97     <- shipped
+    //   min_t=4      25.62            33.73       43.49     (+6.2% at T=4)
+    //   min_t=2      36.18  (+41%)    39.92       43.13
+    //
+    // i.e. the table above still holds, so the edge stays at 6. The knob also changes the 96-token
+    // non-MTP greedy output at min_t = 2 (984 against 982 bytes, while min_t = 4 is identical), so
+    // some non-MTP launch does run in 2 <= T <= 32; not chased, because the arm loses on round time
+    // regardless.
+    static const std::int32_t min_t = [] {
+        const char* env    = std::getenv("NINFER_TERNARY_QPN_MIN_T");
+        const int parsed   = env == nullptr ? 0 : std::atoi(env);
+        return parsed >= 1 ? parsed : 6;
+    }();
+    if (t < min_t) { return false; }
     return t <= 4 * TernaryVoltaQpnSchedule::kRowsPerTile;
 #else
     (void)n;

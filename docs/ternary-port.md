@@ -96,6 +96,7 @@ Both fast prefill arms are selected automatically; `NINFER_TERNARY_CUTLASS=0` re
 | `NINFER_TERNARY_HADAMARD=0` | skip the folded-basis rotation. **Numerically meaningless** — diagnostic only |
 | `NINFER_TERNARY_GDN_PERM` | default off. `=1` restores llama.cpp's `.ssm_out.` permutation; leave it off, the runtime already emits grouped V |
 | `NINFER_TERNARY_FUSED_RESIDUAL` | **default on** (unset or any value except `0`). `0` restores the composed route (ternary GEMM into a scratch, then `ops::residual_add`) for the T = 1..5 decode/verify band. Bit-identical either way — it is the round-9 A/B arm and the rollback switch, not a numerical knob |
+| `NINFER_TERNARY_QPN_MIN_T` | lower edge of the QPN verify band, default **6** (the measured crossover). It exists to re-run that crossover on a later build, not to tune: `=2` costs the MTP K = 1 round **+41%** and `=4` costs the K = 3 round +6.2% (round 10). `=2` also changes the 96-token non-MTP greedy output, so some non-MTP launch runs at 2 <= T <= 32 |
 | `NINFER_TERNARY_TILE_STAGE` | default on. `0` disables the warp-staged T = 1..2 decode GEMV (costs 3.9%) and also takes the fused residual epilogue off that band, since the fused arm is the staged kernel |
 | `NINFER_TERNARY_STAGE_DEPTH` | staged kernel prefetch distance, default 1. `2` measured -2.7%, and also falls back to the composed route |
 | `NINFER_TERNARY_PROBE_SKIP_RESIDUAL` | do not launch `ops::residual_add` at all. **Numerically wrong by design**; this is how the fused epilogue's ceiling was priced (+1.9% on the T = 1 step) |

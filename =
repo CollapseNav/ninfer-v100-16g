@@ -1,0 +1,149 @@
+1:// PQ2 Volta tensor-core (QPN) launcher: shape gate, instantiation table and the output policy.
+2:// Fifth sibling of nvfp4/fp8/w8/q4_volta_qpn_gemm; see ternary_volta_qpn_gemm.cuh for the design.
+3:#include "ops/linear/ternary/ternary_volta_qpn_gemm.h"
+6:#include "ops/linear/ternary/ternary_dispatch.h"
+7:#include "ops/linear/ternary/ternary_volta_qpn_gemm.cuh"
+11:#include <cstdio>
+13:#include <cstdlib>
+14:#include <string>
+15:#include <unordered_set>
+17:namespace ninfer::ops::detail {
+23:// SPLITK. The sibling NVFP4 kernel calls 8 the production floor, and the reason is parallelism
+24:// rather than the K-split itself: one CTA covers only 32 output rows, so the grid is n/32 (160 CTAs
+25:// for n = 5120) and at SPLITK = 4 that is 8 warps per SM -- nowhere near enough to hide a weight
+26:// stream's latency. Every width in this model has a group count divisible by 8 (40, 48, 80, 136).
+27:constexpr int kTernaryQpnSplitk = 8;
+29:// [n, t] with n contiguous per token, bf16, honouring the caller's row stride.
+30:struct TernaryBf16Output {
+31:    __nv_bfloat16* data;
+32:    std::int32_t row_stride;
+34:    __device__ __forceinline__ void store(std::int32_t col, std::int32_t token, float value) const {
+35:        data[static_cast<std::int64_t>(token) * row_stride + col] = __float2bfloat16_rn(value);
+39:// NACC is the sibling kernels' generation-2 knob: it round-robins the four mma of one 16-k unit into
+40:// independent accumulators so the RAW chain on the accumulator is not four deep. NACC = 4 at
+41:// kTiles = 1 (the decode and verify tiles have no other ILP) and, since this change, **2 at
+42:// kTiles = 2** -- T = 9..16, the lookup verify where the route is worth +90% and the mma count
+43:// doubles with the tile. NINFER_TERNARY_QPN_NACC=1 restores the previous behaviour, =4 is measured
+46:// Measured, same batch, lookup10 K = 7: NACC 1 -> 235.5, NACC 2 -> 237.5 (+0.85%), NACC 4 -> 227.6
+47:// (-3.4%), output text identical at all three. Continuous check at --context 16 --stride 8, which is
+48:// the only window plan that lands every forward on kTiles = 2, both arms on the QPN route, 8,675
+49:// scored tokens: mean_nll 4.165766 (NACC 1) against 4.166126 (NACC 2), i.e. +0.036% PPL. That is a
+50:// real numerics cost -- 2.5x the QPN band's own deviation from SIMT (+0.0143%) and 1.5x the fp16
+51:// operand margin this tree accepted for its prefill routes (+0.0245%) -- bought for +0.85% on one
+52:// path, so `=1` is the escape hatch for anyone who wants the tighter numbers.
+53:int qpn_nacc_override() {
+54:    static const int value = [] {
+55:        const char* env = std::getenv("NINFER_TERNARY_QPN_NACC");
+56:        if (env == nullptr) { return 2; }
+57:        const int parsed = std::atoi(env);
+58:        return (parsed == 1 || parsed == 2 || parsed == 4) ? parsed : 2;
+60:    return value;
+63:template <int kTiles, class Activation, int kNaccOverride = 0>
+64:void launch_shape(const Tensor& x, const Weight& w, Tensor& out, std::int32_t out_row_stride,
+65:                   cudaStream_t stream) {
+66:    using S = TernaryVoltaQpnSchedule;
+67:    constexpr int kSplitk = kTernaryQpnSplitk;
+68:    // One accumulator per k-slice of a 16-k unit would break the mma RAW chain (the sibling kernels'
+69:    // NACC knob), but four accumulators per tile is 32 registers per live tile and kTiles goes to 4;
+70:    // with more than one tile the tiles are already independent, which is the same ILP for free.
+71:    constexpr int kNacc   = kNaccOverride != 0 ? kNaccOverride : (kTiles == 1 ? 4 : 1);
+72:    const int n = w.n;
+73:    const unsigned grid = static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta);
+74:    ternary_volta_qpn_gemm_kernel<kTiles, kSplitk, kNacc, TernaryBf16Output, Activation>
+75:        <<<grid, kSplitk * 32, 0, stream>>>(
+76:            static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
+77:            static_cast<const Activation*>(x.data), n, w.k, x.ne[1],
+78:            TernaryBf16Output{static_cast<__nv_bfloat16*>(out.data), out_row_stride});
+79:    CUDA_CHECK(cudaGetLastError());
+89:__global__ void pq2_prepack_tile_kernel(const std::uint8_t* __restrict__ src_codes,
+90:                                        const std::uint16_t* __restrict__ src_scales,
+91:                                        std::uint8_t* __restrict__ dst_codes,
+92:                                        std::uint16_t* __restrict__ dst_scales, int groups) {
+93:    const int lane = static_cast<int>(threadIdx.x) & 31;
+94:    const int tile = static_cast<int>(blockIdx.x);
+95:    const int qp   = (lane >> 2) & 3;
+96:    const int r    = (lane & 3) + ((lane & 16) != 0 ? 4 : 0);
+97:    const int row  = tile * 32 + qp * 8 + r;
+98:    const int stride = static_cast<int>(blockDim.x) >> 5;
+99:    for (int g = static_cast<int>(threadIdx.x) >> 5; g < groups; g += stride) {
+100:        const std::int64_t packed = (static_cast<std::int64_t>(tile) * groups + g) * 32 + lane;
+101:        const std::uint8_t* src = src_codes + (static_cast<std::int64_t>(row) * groups + g) * 32;
+102:        std::uint8_t* dst       = dst_codes + packed * 32;
+104:        for (int b = 0; b < 32; ++b) { dst[b] = src[b]; }
+105:        dst_scales[packed] = src_scales[static_cast<std::int64_t>(row) * groups + g];
+109:std::unordered_set<const void*>& prepacked_weights() {
+110:    static std::unordered_set<const void*> set;
+111:    return set;
+117:bool ternary_qpn_is_prepacked(const void* qdata) noexcept {
+118:    return qdata != nullptr && prepacked_weights().count(qdata) != 0;
+121:void ternary_prepack_qpn(Weight& w, cudaStream_t stream) {
+123:    const int groups = w.k / TernaryVoltaQpnSchedule::kGroupK;
+124:    const std::size_t code_bytes  = static_cast<std::size_t>(w.n) * groups * 32;
+125:    const std::size_t scale_bytes = static_cast<std::size_t>(w.n) * groups * sizeof(std::uint16_t);
+126:    void* scratch = nullptr;
+127:    CUDA_CHECK(cudaMalloc(&scratch, code_bytes + scale_bytes));
+128:    auto* packed_codes  = static_cast<std::uint8_t*>(scratch);
+129:    auto* packed_scales = reinterpret_cast<std::uint16_t*>(packed_codes + code_bytes);
+130:    pq2_prepack_tile_kernel<<<static_cast<unsigned>(w.n / 32), 256, 0, stream>>>(
+131:        static_cast<const std::uint8_t*>(w.qdata),
+132:        reinterpret_cast<const std::uint16_t*>(w.scales), packed_codes, packed_scales, groups);
+133:    CUDA_CHECK(cudaGetLastError());
+134:    CUDA_CHECK(cudaMemcpyAsync(const_cast<void*>(w.qdata), packed_codes, code_bytes,
+135:                               cudaMemcpyDeviceToDevice, stream));
+136:    CUDA_CHECK(cudaMemcpyAsync(const_cast<void*>(w.scales), packed_scales, scale_bytes,
+137:                               cudaMemcpyDeviceToDevice, stream));
+138:    CUDA_CHECK(cudaStreamSynchronize(stream));
+139:    CUDA_CHECK(cudaFree(scratch));
+140:    prepacked_weights().insert(w.qdata);
+143:    (void)stream;
+147:bool ternary_qpn_enabled() noexcept {
+148:    // Unset means enabled wherever the shape and the token count qualify; only "0" disables. This is
+149:    // what the header, the task that commissioned the route, and the docs all assume -- the port
+150:    // shipped the opposite test (`env != nullptr && env != "0"`), i.e. the route was OFF unless a
+151:    // value was passed, and every measurement in this tree happened to pass one explicitly (0 or 1),
+152:    // so the A/B was valid while the default was dead. Found by re-running the lookup arm with no
+153:    // NINFER_TERNARY_QPN at all: 123.8 t/s (SIMT) against 235.1 with the route on.
+154:    static const bool value = [] {
+155:        const char* env = std::getenv("NINFER_TERNARY_QPN");
+156:        return env == nullptr || std::string(env) != "0";
+158:    return value;
+161:bool ternary_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
+163:    if (n <= 0 || k <= 0 || t <= 0) { return false; }
+164:    if ((k % TernaryVoltaQpnSchedule::kGroupK) != 0) { return false; }
+165:    // SPLITK warps split K by whole groups, and every warp must get at least one.
+166:    if ((k / TernaryVoltaQpnSchedule::kGroupK) % kTernaryQpnSplitk != 0) { return false; }
+167:    // The band. The kernel reads the whole weight once per forward whatever T is, and the tensor
+168:    // cores then absorb the extra tokens almost free -- so its cost is flat in T, while the SIMT
+169:    // tile kernel's grows by ~a third of a T=1 step per verified token. Measured round times on
+170:    // real_task (ms, NINFER_TERNARY_QPN=0 against =1, same batch, 128 tokens each):
+173:    //   19.5   26.6  33.9  41.2  48.6  58.0  74.1   98.1   SIMT tile
+176:    // i.e. the two lines cross at T ~ 4.3. Below 6 the route loses (T = 2 by 47%, T = 3 by 21%),
+177:    // which is the whole MTP band a real task uses -- K = 1 and K = 2 -- and 6 is the first width
+178:    // where the win clears the +/-4% batch drift of this workload (18% at T = 6, 30% at T = 8, and
+179:    // 2.1x at the T = 16 lookup verify). T = 1 is far worse than all of them: the A tile is eight
+180:    // tokens tall whatever T is, so one token runs the schedule with seven eighths of M dead.
+181:    if (t < 6) { return false; }
+182:    return t <= 4 * TernaryVoltaQpnSchedule::kRowsPerTile;
+186:    (void)t;
+187:    return false;
+191:void launch_ternary_volta_qpn(const Tensor& x, const Weight& w, Tensor& out,
+192:                              std::int32_t out_row_stride, cudaStream_t stream) {
+194:    const int tiles = (x.ne[1] + TernaryVoltaQpnSchedule::kRowsPerTile - 1) /
+195:                      TernaryVoltaQpnSchedule::kRowsPerTile;
+196:    if (x.dtype == DType::FP16) {
+197:        if (tiles <= 1)      { launch_shape<1, half>(x, w, out, out_row_stride, stream); }
+198:        else if (tiles == 2) {
+199:            const int nacc = qpn_nacc_override();
+200:            if (nacc == 2)      { launch_shape<2, half, 2>(x, w, out, out_row_stride, stream); }
+201:            else if (nacc == 4) { launch_shape<2, half, 4>(x, w, out, out_row_stride, stream); }
+202:            else                { launch_shape<2, half>(x, w, out, out_row_stride, stream); }
+204:        else if (tiles == 3) { launch_shape<3, half>(x, w, out, out_row_stride, stream); }
+205:        else                 { launch_shape<4, half>(x, w, out, out_row_stride, stream); }
+207:        if (tiles <= 1)      { launch_shape<1, __nv_bfloat16>(x, w, out, out_row_stride, stream); }
+208:        else if (tiles == 2) { launch_shape<2, __nv_bfloat16>(x, w, out, out_row_stride, stream); }
+209:        else if (tiles == 3) { launch_shape<3, __nv_bfloat16>(x, w, out, out_row_stride, stream); }
+210:        else                 { launch_shape<4, __nv_bfloat16>(x, w, out, out_row_stride, stream); }
+215:    (void)out;
+216:    (void)out_row_stride;
+217:    (void)stream;
+221:} // namespace ninfer::ops::detail

@@ -587,4 +587,116 @@ bash /root/fused_final.sh            # -> /root/ninfer_ab/fused9f
 bash /root/fused_check.sh            # -> /root/nvp_t1/fused_{on,off}.txt
 ```
 
+---
+
+## Round 10 — where a speculative round goes, and the QPN band edge re-measured (negative)
+
+The question this round started from was the round, not the token: at the shipped defaults an MTP
+K = 1 round is 25.6 ms and yields 1.65 tokens, so cutting the round is worth about as much as cutting
+the step. Nothing in this tree had ever priced one.
+
+### The round budget, measured
+
+`nvprof --print-gpu-trace` on an MTP K = 1 decode and on an MTP K = 3 decode, differenced per kernel
+family. The traces are all decode: the capture's pre-decode rows are the 8.7 s weight upload, and the
+first decode launch is the only thing between them.
+
+| family | K = 1 ms/round | K = 3 ms/round | launches/rd at K = 1 |
+|---|---:|---:|---:|
+| **ternary GEMV** (staged + tile) | **22.1** | **35.7** | 434 |
+| ternary_rotation | 1.70 | 1.93 | 295 |
+| rmsnorm (cta + warp) | 1.28 | 1.44 | 246 |
+| lm_head class (Q4 + W8 rowsplit) | 1.64 | 3.53 | 6.6 |
+| ternary_volta_qpn_gemm | 1.25 | 1.71 | 11.4 |
+| causal attention | 0.80 | 1.02 | 37 |
+| GDN family | ~1.0 | ~1.2 | 163 |
+| silu / rope / sigmoid / rest | ~1.2 | ~1.4 | 130 |
+| total | ~30.4 | ~48.0 | ~1400 |
+
+**A trap worth recording.** `ternary_volta_mma_gemm` reads 5.50 ms/round at K = 1, which looks like a
+seventh of the round. It is not in the round at all: its *absolute* total is 193 ms in one trace and
+181 ms in the other, i.e. constant in the round count -- it is the 85-token prefill running the fp16
+mma route. Normalising a capture "per round" silently converts a fixed cost into apparent per-round
+work, and the only way to see it is to compare absolute totals across two captures with different
+round counts. A per-round table must be read with that filter applied.
+
+The same caveat bounds the totals: ~30.4 ms of summed decode kernels for a 25.6 ms round, because
+nvprof charges something per launch and a round issues ~1400 of them. Use the table to attribute
+*changes*, not to audit the wall clock.
+
+### Where the K-slope actually comes from
+
+Fitting the GEMV family on the two points, T = 2 (22.1) and T = 4 (35.7):
+
+    GEMV(T) ~= 8.5 + 6.8*T   ms
+
+so one pass over all the weights is **8.5 ms** and each additional verified token costs **6.8 ms**,
+i.e. **0.80 of a weight pass per token**. That is the structural cost of the tile GEMV reading the
+whole k-wide activation once per output warp: the activation side carries `(n/8) * k * 2` bytes per
+token against `n * k / 4` bytes of 2-bit weights, which is the same number. Round 2's "+a third of a
+T = 1 step per verified token" and this fit agree.
+
+But the GEMV is not the whole slope. Differencing the two traces, K = 1 -> K = 3 costs +21.2 ms for
+two extra draft tokens:
+
+| source | ms (two K steps) | share |
+|---|---:|---:|
+| ternary GEMV (main-model verify) | +13.6 | **64%** |
+| lm_head class (Q4 +1.24, W8 +0.65/+1.23) | +3.1 | 15% |
+| the MTP head's own projections and the rest | +4.5 | 21% |
+
+The lm_head result is the surprise: `q4_rowsplit_gemv` runs **1.1 times per round at K = 1 and 3.5
+times at K = 3** -- it is invoked per *draft token*, not per round, so a third of the round's K-slope
+is the draft head looping over tokens calling a forward-shaped kernel each time.
+
+### L1a: the QPN band edge, re-measured — still 6
+
+The QPN route tiles the activation through shared memory and has no per-warp re-read, so lowering its
+band edge is the obvious way to flatten the 6.8 ms/token. The crossover was already recorded in
+`ternary_volta_qpn_gemm.cu` (QPN loses at T = 2 by 47%, T = 3 by 21%, crosses at T ~ 4.3), but it
+predates the staged code plane, the fused residual epilogue and NACC = 2 -- so it was re-run rather
+than trusted, by making the edge an env knob (`NINFER_TERNARY_QPN_MIN_T`, default 6, no behaviour
+change). Same batch, interleaved, two repetitions, round = acceptance / decode_speed:
+
+| arm | K = 1 (T = 2) | K = 2 (T = 3) | K = 3 (T = 4) |
+|---|---:|---:|---:|
+| min_t = 6 (shipped) | **25.62 ms** | **33.67 ms** | **40.97 ms** |
+| min_t = 4 | 25.62 | 33.73 | 43.49 (+6.2%) |
+| min_t = 2 | 36.18 (**+41%**) | 39.92 (+18.6%) | 43.13 (+5.3%) |
+
+**Negative, and the old table holds.** The knob stays at 6. Two details worth keeping:
+
+* **The acceptance drifts, and that is the trap.** Opening the band raises it -- 1.85 -> 1.98 at
+  K = 2, 2.03 -> 2.17 at K = 3 -- because the QPN verify reassociates the accumulation, not because
+  the draft got better. At K = 3 the `min_t = 4` arm measures **49.9 against 49.6 t/s**, which reads
+  as a +0.6% win in the headline metric while its *round* is 6.2% slower. The tree's own rule
+  (compare `acceptance / decode_speed`) is what catches it; comparing t/s across arms with different
+  numerics would have shipped a latency regression as a throughput gain.
+* **At T = 1 and T = 2 the QPN arm and the SIMT arm are not comparable shapes.** The QPN schedule's A
+  tile is eight tokens tall whatever T is (`kRowsPerTile = 8`), so T = 1 and T = 2 run the *same*
+  QPN kernel -- and that kernel costs about twice what the staged SIMT GEMV costs for the same work
+  (which is why the T = 1 row of the old table reads 19.4/19.5: with the edge at 2, neither arm
+  enters QPN there at all). QPN only wins once the SIMT activation re-read dominates, at T >= 5.
+  That also means **QPN is not the answer to the activation re-read**: it avoids the re-read by
+  paying about 2x on the weight side. A SIMT kernel that stages the activation across the warps of a
+  block -- same fast weight path, the re-read removed -- is the shape that would actually collect it,
+  and that is where this round's remaining work is.
+* `min_t = 2` changes the 96-token non-MTP greedy output (984 against 982 bytes; `min_t = 4` is
+  identical). Some non-MTP launch therefore runs in 2 <= T <= 32. Not chased, because the arm loses on
+  round time regardless; recorded because it is a launch nobody has accounted for.
+
+### Reproduce
+
+```bash
+# the round budget at two draft counts (nvprof; ~90 s each)
+bash /root/trace_mtp.sh              # K = 1 -> /root/nvp_mtp/k1.txt
+bash /root/trace_mtp3.sh             # K = 3 -> /root/nvp_mtp/k3.txt
+python3 /root/nvp_roundslope.py /root/nvp_mtp/k1.txt /root/nvp_mtp/k3.txt 35.165 22.695
+
+# the band edge
+bash /root/qpn_min_t.sh              # -> /root/ninfer_ab/qpnmin
+python3 /root/qpn_round.py /root/ninfer_ab/qpnmin
+```
+
+
 
