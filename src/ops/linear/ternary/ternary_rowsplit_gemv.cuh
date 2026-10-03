@@ -682,6 +682,156 @@ void ternary_pq2_gemv_stage_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+// CTA-staged activation variant of the staged decode kernel -- MEASURED, REJECTED, KEPT AS THE
+// RECORD. NINFER_TERNARY_STAGE_ACT=1 selects it; default off, and it should stay off.
+//
+// The shipped staged kernel gives each warp a PRIVATE 256-byte code buffer -- deliberately, so that
+// no block barrier is ever needed -- but it reads the ACTIVATION straight from global once per
+// output warp, and all eight warps of a block read exactly the same bytes, because the k walk does
+// not depend on the warp. This variant stages one eight-group span of the activation per token in
+// shared memory once for the whole block:
+//
+//   shipped : per warp per block per token   8 x LDG.64 (the same 2 KB, eight times over)
+//   this one: per thread per block per token 1 x LDG.64 + 1 x STS.64, then 8 x LDS.64 per warp
+//
+// WHY IT WAS WORTH BUILDING. Fitting the shipped kernel's own per-call time at T = 1 and T = 2
+// gives call(T) ~= 60.1 + 35.0*T us on the 34816x5120 shape, i.e. the activation side is 37% of a
+// T = 1 call and 0.5-0.6 of a weight pass per token. The two mechanisms that could pay for that
+// without a barrier had both been tried and rejected: widening the lane (TILE_WIDE1, -1.3%) does not
+// reduce the BYTES, and blocking rows (kR per warp) does reduce them but costs registers. Shared
+// memory is the third way and the only one that leaves the lane mapping, the register budget and the
+// arithmetic alone.
+//
+// MEASURED, same batch, interleaved arms, two repetitions (NINFER_TERNARY_STAGE_ACT=1 against unset):
+//
+//   T = 1 real_task   55.2/55.2 -> 49.7/49.6   (-10.0%)
+//   T = 1 real_code   53.3/53.3 -> 48.1/48.1   ( -9.8%)
+//   T = 1 prose4k     51.5/51.5 -> 46.7/46.7   ( -9.3%)
+//   MTP K = 1 (T=2)   64.4/64.4 -> 58.2/58.2   ( -9.6%)
+//   MTP K = 2 (T=3)   54.9/54.8 -> 54.9/54.8   (  0.0% -- outside the band, the control)
+//   lookup10 (T=16)  237.4/237.7 -> 237.7/237.8 ( 0.0% -- outside the band, the control)
+//
+// WHAT THE NEGATIVE PROVES. The two untouched arms pin the gate, and the ~10% loss says the eight
+// duplicate reads were already being served: the warps of a block walk the same lines within a few
+// hundred cycles of each other, so they were L1 hits, and this variant traded an L1 hit for an ST S
+// plus a barrier while the LDS throughput is no better than L1's. The activation side of this kernel
+// is therefore L1-served and latency/issue-bound, NOT L2 or DRAM traffic -- which is exactly the
+// case where staging cannot help. It also means the third and last barrier-free mechanism for the
+// per-token activation cost is now closed: widening (TILE_WIDE1) does not cut bytes, row blocking
+// (kR) cuts bytes but costs registers, and staging cuts bytes but costs instructions and a barrier.
+//
+// BIT-IDENTICAL, and that held: the 96-token greedy md5 against /root/wt/base.out is IDENTICAL with
+// the arm on and off, and the generated text is byte-identical on all twelve run pairs across
+// real_task / real_code / prose4k / MTP K=1 / MTP K=2 / lookup10. 26,466 launches of this kernel in
+// the tracing run and zero of the shipped one, so the arm really was the one running.
+//
+// Every warp must reach both barriers, so the shipped kernel's early return for `warp >= rows`
+// becomes a predicate here.
+template <int kT, int kMinBlocks = 1, bool kAddResidual = false>
+__global__ __launch_bounds__(kGemvWarpsPerBlock * 32, kMinBlocks)
+void ternary_pq2_gemv_stage_act_kernel(const __nv_bfloat16* __restrict__ x,
+                                       const std::uint8_t* __restrict__ codes,
+                                       const std::uint8_t* __restrict__ scales,
+                                       __nv_bfloat16* __restrict__ out, std::int32_t rows,
+                                       std::int32_t groups_per_row, std::int32_t tokens,
+                                       std::int32_t out_row_stride,
+                                       const __nv_bfloat16* residual = nullptr) {
+    static_assert(kT >= 1 && kT <= 2, "the CTA-staged variant serves the decode band only");
+    constexpr int kBlockGroups = 8;
+    constexpr int kBlockK      = kBlockGroups * kGemvGroupK;
+    constexpr int kBlockBytes  = kBlockK * 2; // fp16 activation bytes, per token per block
+    __shared__ std::uint8_t stage[kGemvWarpsPerBlock][kBlockGroups * kGemvCodeBytesPerGroup];
+    __shared__ __align__(16) std::uint8_t act[kT][kBlockBytes];
+
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int warp_local = static_cast<int>(threadIdx.x) >> 5;
+    const int warp       = static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + warp_local;
+    const bool live      = warp < rows; // dead warps still take part in both barriers below
+
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(warp) * groups_per_row * kGemvCodeBytesPerGroup;
+    const std::uint8_t* scale_row =
+        scales + static_cast<std::int64_t>(warp) * groups_per_row * kGemvScaleBytesPerGroup;
+    const std::int64_t token_stride =
+        static_cast<std::int64_t>(groups_per_row) * kGemvGroupK;
+    const __nv_bfloat16* token_x[kT];
+#pragma unroll
+    for (int t = 0; t < kT; ++t) { token_x[t] = x + static_cast<std::int64_t>(t) * token_stride; }
+
+    float accumulator[kT];
+#pragma unroll
+    for (int t = 0; t < kT; ++t) { accumulator[t] = 0.0f; }
+
+    const int steps             = groups_per_row >> 3;
+    const std::uint8_t* blk_ptr = code_row;
+    uint2 cw                    = make_uint2(0u, 0u);
+    if (live) { cw = *reinterpret_cast<const uint2*>(blk_ptr + lane * 8); }
+
+    for (int blk = 0; blk < steps; ++blk) {
+        // Fill this block's activation span for every live token, once for the whole block. Thread
+        // tid owns bytes [tid*8, tid*8+8) of the span; that byte range is exactly the uint2 the
+        // shipped kernel loads for group (tid>>5), lane (tid&31), which is what makes this a copy.
+#pragma unroll
+        for (int t = 0; t < kT; ++t) {
+            if (t < tokens) {
+                *reinterpret_cast<uint2*>(&act[t][threadIdx.x * 8]) =
+                    *reinterpret_cast<const uint2*>(token_x[t] + blk * kBlockK +
+                                                    threadIdx.x * 4);
+            }
+        }
+        __syncthreads();
+        *reinterpret_cast<uint2*>(&stage[warp_local][lane * 8]) = cw;
+        uint4 sc = make_uint4(0u, 0u, 0u, 0u);
+        if (live) { sc = *reinterpret_cast<const uint4*>(scale_row + blk * 16); }
+        blk_ptr += kGemvWarpsPerBlock * kGemvCodeBytesPerGroup;
+        uint2 cw_next = cw;
+        if (live && blk + 1 < steps) {
+            cw_next = *reinterpret_cast<const uint2*>(blk_ptr + lane * 8);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int i = 0; i < kBlockGroups; ++i) {
+            const std::uint32_t raw = stage[warp_local][i * kGemvCodeBytesPerGroup + lane];
+            const float scale = __half2float(
+                __ushort_as_half(reinterpret_cast<const std::uint16_t*>(&sc)[i]));
+            const std::uint32_t lo_bits =
+                0x64006400u | (raw & 0x03u) | ((raw & 0x0Cu) << 14);
+            const std::uint32_t hi_bits =
+                0x64006400u | ((raw >> 4) & 0x03u) | ((raw & 0xC0u) << 10);
+            const half2 k1025 = __float2half2_rn(1025.0F);
+            const __half2 w01 = __hsub2(*reinterpret_cast<const half2*>(&lo_bits), k1025);
+            const __half2 w23 = __hsub2(*reinterpret_cast<const half2*>(&hi_bits), k1025);
+#pragma unroll
+            for (int t = 0; t < kT; ++t) {
+                if (t < tokens) {
+                    const uint2 packed =
+                        *reinterpret_cast<const uint2*>(&act[t][i * 256 + lane * 8]);
+                    const __half2 a01 = *reinterpret_cast<const __half2*>(&packed.x);
+                    const __half2 a23 = *reinterpret_cast<const __half2*>(&packed.y);
+                    const float2 p = __half22float2(__hfma2(w01, a01, __hmul2(w23, a23)));
+                    accumulator[t] = fmaf(scale, p.x + p.y, accumulator[t]);
+                }
+            }
+        }
+        cw = cw_next;
+        // Stronger than the shipped kernel's trailing __syncwarp(): the next iteration's fill must
+        // not overwrite `act` while any warp is still reading it.
+        __syncthreads();
+    }
+#pragma unroll
+    for (int t = 0; t < kT; ++t) {
+        float value = accumulator[t];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (live && lane == 0 && t < tokens) {
+            gemv_store<kAddResidual>(out, residual,
+                                     static_cast<std::int64_t>(t) * out_row_stride + warp, value);
+        }
+    }
+}
+
 // Token-blocked variant, for PREFILL: the prefill chunk.
 //
 // The verify kernel above takes the whole T at once and is capped at kT <= 8 by register

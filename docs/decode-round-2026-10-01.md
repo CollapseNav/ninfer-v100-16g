@@ -698,5 +698,87 @@ bash /root/qpn_min_t.sh              # -> /root/ninfer_ab/qpnmin
 python3 /root/qpn_round.py /root/ninfer_ab/qpnmin
 ```
 
+---
+
+## Round 11 — the CTA-staged activation: **bit-identical, and −10%**. The activation side is L1-served
+
+Round 10 left one structural question: the tile GEMV spends 37% of a T = 1 call on the activation
+side, costing 0.5-0.6 of a weight pass per verified token, and QPN is not the answer because it pays
+about 2x on the weight side at small T. The one mechanism for that cost that had never been built is
+**cross-warp reuse inside a block**.
+
+### What was built
+
+The shipped staged kernel gives each warp a **private** code buffer, deliberately, so that no block
+barrier is ever needed -- but it reads the activation straight from global once per output warp, and
+all eight warps of a block read exactly the same bytes, because the k walk does not depend on the
+warp. `ternary_pq2_gemv_stage_act_kernel` (`NINFER_TERNARY_STAGE_ACT=1`, a separate kernel so the
+shipped instantiation stays byte-identical) stages one eight-group activation span per token in
+shared memory once:
+
+| | per block, per token |
+|---|---|
+| shipped | 8 warps x 8 x LDG.64 -- the same 2 KB, eight times over |
+| staged | 1 LDG.64 + 1 STS.64 **per thread**, then 8 LDS.64 per warp, plus one `__syncthreads()` |
+
+It is bit-identical by construction (same bytes, same lane -> k mapping, same accumulation order;
+only where the byte is read from changes), so the md5 gate is the whole correctness argument. Every
+warp must reach both barriers, so the shipped kernel's early return for `warp >= rows` became a
+predicate.
+
+### Result: −10%, uniformly
+
+Same batch, interleaved arms, two repetitions:
+
+| load | shipped | `STAGE_ACT=1` | delta |
+|---|---:|---:|---:|
+| T = 1, `real_task` | 55.2 / 55.2 | 49.7 / 49.6 | **−10.0%** |
+| T = 1, `real_code` | 53.3 / 53.3 | 48.1 / 48.1 | −9.8% |
+| T = 1, `prose4k` | 51.5 / 51.5 | 46.7 / 46.7 | −9.3% |
+| MTP K = 1 (T = 2) | 64.4 / 64.4 | 58.2 / 58.2 | −9.6% |
+| MTP K = 2 (T = 3) | 54.9 / 54.8 | 54.9 / 54.8 | 0.0% |
+| lookup10 (T = 16) | 237.4 / 237.7 | 237.8 / 237.7 | 0.0% |
+
+Verification, against the round-9 lesson that a route which is never taken is trivially
+bit-identical: the 96-token greedy md5 against `/root/wt/base.out` is IDENTICAL with the arm on and
+off, the generated text is byte-identical on all twelve run pairs, and the tracing run shows
+**26,466 launches of the new kernel and zero of the shipped one**. The two untouched arms (T = 3 and
+T = 16, both outside the band) read identically to the digit, which pins the gate.
+
+### Why the negative is the informative part
+
+The loss says the eight duplicate reads **were already being served**. The warps of a block walk the
+same cache lines within a few hundred cycles of each other, so they were L1 hits; staging traded an
+L1 hit for an STS, a barrier and eight LDS whose throughput is no better than L1's. So the
+activation side of this kernel is **L1-served and latency/issue-bound, not L2 or DRAM traffic** --
+which is exactly the regime in which staging cannot help.
+
+That closes the third and last barrier-free mechanism for the per-token activation cost:
+
+| mechanism | reduces bytes? | cost | measured |
+|---|---|---|---|
+| wide lane (`TILE_WIDE1`) | no | lane remap, reassociation | −1.3% best |
+| row block (kR rows/warp) | yes, 2.5x at kR=4 | registers -> occupancy | loses (Ada 43.0 -> 32.8 t/s; `T2BLOCK` off) |
+| CTA staging (`STAGE_ACT`) | yes, 8x on the load side | +STS +LDS +barrier | **−10.0%** |
+
+The 0.80-weight-passes-per-token K-slope is therefore a property of this SIMT shape, not an
+oversight, and the reachable levers on round latency are now:
+
+1. **make the tensor-core route cheap at small T** -- QPN already avoids the re-read, so its 2x
+   weight-side penalty in the T = 1..2 regime is the only thing between the MTP band and a flat
+   verify;
+2. **the MTP head's per-draft-token projections** -- 15% of the K-slope, and `q4_rowsplit_gemv` was
+   measured running 1.1 times per round at K = 1 and 3.5 times at K = 3, i.e. per draft token rather
+   than per round;
+3. acceptance, which divides the same round latency over more tokens (K = 1 is 15.5 ms/token against
+   4.2 ms/token on the lookup path).
+
+### Reproduce
+
+```bash
+bash /root/stage_act.sh              # -> /root/ninfer_ab/stageact  (+ /root/nvp_t1/stageact.txt)
+```
+
+
 
 

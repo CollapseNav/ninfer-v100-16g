@@ -228,6 +228,20 @@ int tile_stage_depth() {
     return value;
 }
 
+// NINFER_TERNARY_STAGE_ACT=1 selects the CTA-staged ACTIVATION variant of the staged decode kernel
+// (ternary_pq2_gemv_stage_act_kernel): the block's activation span goes to shared memory once
+// instead of being read from global once per warp. MEASURED AND REJECTED -- -10.0% at T = 1,
+// -9.6% at the MTP K = 1 verify, bit-identical, with the T >= 3 arms untouched. The knob and the
+// kernel are kept as the record; see the kernel header for why the negative is the informative part.
+// Default off.
+bool tile_stage_act_enabled() {
+    static const bool value = [] {
+        const char* env = std::getenv("NINFER_TERNARY_STAGE_ACT");
+        return env != nullptr && std::string(env) != "0";
+    }();
+    return value;
+}
+
 // NINFER_TERNARY_TILE_WIDE1=1 selects the wide-lane T = 1 decode GEMV (two code bytes and sixteen
 // activation bytes per lane per iteration) instead of the tile kernel at kT = 1. See the kernel for
 // why: the shipped decode shape is latency-bound, and doubling the bytes per load instruction is the
@@ -424,6 +438,27 @@ void launch_pq2_gemv_tile(const Tensor& x, const Weight& w, Tensor& out,
     // extra shared-memory hop and registers cost more than the code load saves.
     if (tokens >= 1 && tokens <= 2 && x.dtype == DType::FP16 && (groups_per_row % 8) == 0 &&
         tile_stage_enabled()) {
+        // CTA-staged activation variant (NINFER_TERNARY_STAGE_ACT): same schedule, bit-identical,
+        // with the block's activation span fetched once instead of once per warp.
+        if (tile_stage_act_enabled()) {
+            if (tokens == 1) {
+                ternary_pq2_gemv_stage_act_kernel<1><<<grid, block, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const std::uint8_t*>(w.qdata),
+                    static_cast<const std::uint8_t*>(w.scales),
+                    static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                    out_row_stride);
+            } else {
+                ternary_pq2_gemv_stage_act_kernel<2><<<grid, block, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const std::uint8_t*>(w.qdata),
+                    static_cast<const std::uint8_t*>(w.scales),
+                    static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row, tokens,
+                    out_row_stride);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         if (tokens == 1) {
             if (tile_stage_depth() == 2) {
                 ternary_pq2_gemv_stage_kernel<1, 1, 2><<<grid, block, 0, stream>>>(
@@ -852,9 +887,16 @@ void launch_ternary_pq2_gemv_add(const Tensor& x, const Weight& w, Tensor& out,
     const __nv_bfloat16* residual = static_cast<const __nv_bfloat16*>(out.data);
     const auto fire_stage = [&](auto token_tag) {
         constexpr int kTokens = decltype(token_tag)::value;
-        ternary_pq2_gemv_stage_kernel<kTokens, 1, 1, true>
-            <<<grid, block, 0, stream>>>(x_ptr, codes, scales, out_ptr, w.n, groups_per_row,
-                                         tokens, out_row_stride, residual);
+        if (tile_stage_act_enabled()) {
+            // CTA-staged activation + fused residual epilogue. Bit-identical to the arm below.
+            ternary_pq2_gemv_stage_act_kernel<kTokens, 1, true>
+                <<<grid, block, 0, stream>>>(x_ptr, codes, scales, out_ptr, w.n, groups_per_row,
+                                             tokens, out_row_stride, residual);
+        } else {
+            ternary_pq2_gemv_stage_kernel<kTokens, 1, 1, true>
+                <<<grid, block, 0, stream>>>(x_ptr, codes, scales, out_ptr, w.n, groups_per_row,
+                                             tokens, out_row_stride, residual);
+        }
     };
     const auto fire_tile = [&](auto token_tag) {
         constexpr int kTokens = decltype(token_tag)::value;
