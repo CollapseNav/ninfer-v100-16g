@@ -1187,6 +1187,55 @@ state *silently* rather than failing. So both leaves refuse with a named error r
 approximate, and that is the next unit of work. After it, the decode path's GGUF GEMV still has to be
 verified end to end against the CLI's own numbers.
 
+### It runs now -- and the numbers are still wrong
+
+Both of those landed. `ninfer /models/swift15_iq2xs_mtp.ninfer` generates: **prefill 152.8 tok/s,
+decode 50.5 tok/s** on the V100, with 7.83 GiB resident. The conv leaves compose as the NVFP4 batched
+path does (project q|k|v into one `[10240, W, B]` plane and z into its own output, then hand the plane
+to `gdn_projected_conv_*_launch`).
+
+**The GDN output permutation is what stopped it being NaN.** That matrix's stored columns are a
+permutation of its input's, and the artifact ships the INT32 [6144] gather ONCE as `auxiliary/000000`
+for all 48 GDN layers:
+
+| | result |
+|---|---|
+| without the permutation | `error: causal scoring returned a non-finite logprob` |
+| with it | `mean NLL 10.255982, PPL 28452.225828` over 8675 scored tokens |
+
+so it is both required and applied in the right direction. The reader now keeps objects a `uses`
+auxiliary names reachable (the remap dropped `auxiliary/000000` before any binder could see it).
+
+**But the path is still numerically wrong**, and the failure mode is worth recording: it does not
+crash and does not obviously garble -- it emits fluent-looking fragments
+(`We ... includeres incluiderederederedered...`) at a PPL that is merely too high. Only the number
+catches it. Same text, 8675 scored tokens, `--stride 4`:
+
+| artifact | context 8 (forward width 7) | context 16 (width 15) |
+|---|---:|---:|
+| this tree's ternary artifact (working) | **4.836** | **4.015** |
+| the IQ2_XS artifact | 10.256 | 10.480 |
+
+**Verified negatives, so the next session does not repeat them:**
+
+* block geometry: every one of the fifteen block types' `static_assert(sizeof(block_*))` in the
+  vendored `ggml-common.h` equals the geometry table the bridge and the reader use (IQ1_M is 56, not
+  58 -- it carries no `d` field);
+* row slices: the artifact's own declared byte counts match `rows * (K / block_elements) * block_bytes`
+  for all 401 gguf tensors, including every object a slice is taken from;
+* the permutation's direction: the table differs from the identity in 95.8% of entries, so the two
+  readings are genuinely different, and rewriting the artifact's auxiliary with its INVERSE returns
+  to non-finite -- the shipped direction is the correct one;
+* kernel path: PPL is wrong by a similar factor at width 7 (vector kernel only) and width 15 (integer
+  matrix kernel), so this is not a vector-versus-matrix selection problem;
+* the vendored `dispatch_dequantize` covers all fifteen types including IQ1_M and IQ4_XS.
+
+**What that leaves**: the dequantized VALUES themselves. Every structural check above passes, so the
+next step is a reference implementation -- dequantize one GGUF row in Python the way llama.cpp does,
+read back what the bridge produces for the same bytes, and compare. That needs a small device
+readback harness, which is why it is a fresh unit of work rather than a fix.
+
+
 
 
 
