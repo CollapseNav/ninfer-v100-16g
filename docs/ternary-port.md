@@ -1522,6 +1522,34 @@ README documents a v3 release whose ternary core was corrupted with PPL stuck ne
 also declares `architectures: ["Qwen3_5ForCausalLM"]` while this tree implements the 3.6/3.8 lineage.
 Testing that needs the source GGUF under llama.cpp, which is not in this tree.
 
+### The artifact is NOT the problem -- the source repo says so quantitatively
+
+The `.ninfer` repo's README names its source: `ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF`, and it says
+the repackaging is **format conversion only** -- "tensor payloads are imported verbatim from the source
+GGUF blocks... no re-quantization of the text tower, no retraining". The published SHA-256 for
+`swift15_iq2xs_mtp.ninfer` (`aee68debfecb…d34e84`) matches the file on this machine, so the artifact is
+intact. (It also explains the identical bytes found across tiers last round: "all four tiers carry the
+identical component set -- only the source GGUF's per-tensor quantization allocation differs".)
+
+That source repo is reachable through `hf-mirror.com`, and it carries its own evaluation. The relevant
+number is KLD against the Swift-1.5 BF16 model:
+
+| tier | KLD vs BF16 (nats/token) |
+|---|---:|
+| IQ2_XS | 0.1616 (prose), 0.1209 (code), 0.1175 (math), 0.2071 (zh) |
+| IQ2_S | 0.1074 (prose) |
+
+**0.16 nats/token multiplies perplexity by `e^0.16 = 1.17`.** So a correct IQ2_XS run should score
+about 1.17x its own BF16 model -- and this port measures 10.256, which is **2.1x** the tree's ternary
+artifact, a different model. A factor of 2.1 is nowhere near 1.17, so the gap is this port's, not the
+artifact's. That also retires the "artifact is corrupt" hypothesis that the previous section had
+arrived at, and it is the first same-model quality reference this investigation has had.
+
+The source GGUF (`Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ2_XS-mtp.gguf`, 8,771,311,616 B, the exact file
+`provenance.sources.gguf` names) is now being pulled through the mirror, so running it under llama.cpp
+-- which would give both the true text quality and per-layer activations to diff -- is within reach.
+
+
 
 
 
