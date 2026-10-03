@@ -1624,6 +1624,38 @@ lives, and it is a separate fault from the scoring error.
 arena throws rather than overrunning, so this is a GGUF-profile workspace sizing bug in this port --
 reproducible in one command, and independent of the text-quality problem.
 
+### Byte-level: the artifact IS the source, verbatim
+
+Now that the source GGUF is here, the strongest converter check is possible: parse its tensor table and
+compare the bytes the artifact claims to have imported (`method: import_encoded`). One correction and
+two confirmations came out of it.
+
+**A correction.** An earlier version of this check reported the layer-0 GDN parent as differing from the
+source. That was a bug in the check itself, not a finding. Re-run properly:
+
+```
+artifact weight/000000, 16384 rows, row_bytes 2200
+  row 0     == source blk.0.attn_qkv.weight row 0    True
+  row 10240 == source blk.0.attn_gate.weight row 0   True
+  first 256 rows vs attn_qkv: same set True, same position 256/256
+```
+
+so the object is exactly `[attn_qkv | attn_gate]`, row for row, and its size is exactly the sum of the
+two source tensors (22528000 + 13516800 = 36044800).
+
+**The embedding is not permuted.** `token_embd.weight` against `text/token_embedding`: first row
+identical, first 4096 rows the same set AND the same position (4096 of 4096), and the artifact's row 0
+is the source's row 0. So the RCO ranking did not reorder the vocabulary and no remap table is needed.
+
+**The source's own table confirms the shapes this port binds**: `blk.0.attn_qkv.weight` is
+`(5120, 10240)` IQ3_S, `blk.0.attn_gate.weight` `(5120, 6144)` IQ3_S, and `blk.3.attn_q.weight`
+`(5120, 12288)` IQ2_XXS -- that last being q and gate fused, which is why layer 3's query and gate sit
+in two separate artifact objects.
+
+**So the artifact is byte-identical to its source, llama.cpp runs that source coherently, and this port
+does not.** The remaining fault is entirely inside this port, and the argmax is what is wrong rather
+than the average: PPL is only 1.27x off while greedy output loops.
+
 **Its threshold is between context 320 and 384.** Bisecting:
 
 | context | scored width | result |
