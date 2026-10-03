@@ -982,6 +982,100 @@ code bytes + 2 scale bytes as this tree's `PQ2_0_G128`, but the dialect name dec
 dictionary and they differ: T2 is two's-complement signed 2-bit (00->0, 01->+1, 11->-1), PQ2 is
 `code - 1` over {0,1,2}. Same container geometry, different dictionary.
 
+### What the v3 port actually costs, measured against `fyb423/Swift-1.5-Qwen3.8-27B-GSQ-RCO-NInfer`
+
+A local v3 reference tree exists at `/root/ninfer-all` (it rejects v2 outright and ships
+`tools/upgrade_ninfer_v2_to_v3.py`). Measured against it and against a downloaded v3 artifact
+(`swift15_iq2xs_mtp.ninfer`, 9,420,962,560 B):
+
+**Framing** (`src/artifact/framing.h` upstream): entry magic `NINFER\0\x03`, `kHeaderBytes = 32`
+(8 magic + u64 json_len + **16-byte artifact id**), JSON at 32, payload at
+`align_up(32 + json_len, 4096)`. Continuation files use `NINPRT\0\x03`. The artifact here is
+single-file (`files: [{"path": null, "payload_bytes": 9420610304}]`), so the multi-file path is not
+exercised.
+
+**The schema differs in one way that reaches past the reader.** In v2 the object `name` IS the
+parameter path (`text/layers/0/gdn/query_key`), so `binder.cpp` matches on names. In v3 objects carry
+opaque ids (`weight/000000`) and the semantic names live in a separate `bindings` map, which
+additionally allows **one parameter to be assembled from several objects by byte range**:
+
+```json
+"text/layers/0/gdn/query": {"parts": [{"object": "weight/000000", "range": [0, 10485760]}]}
+```
+
+This artifact has 1422 bindings against 1126 v2-style objects (752 names in common), so the port is
+three pieces, not one: (1) framing + `id`-instead-of-`name` + snake_case format/layout/encoding
+spellings + the extra top-level keys, (2) a bindings layer with `parts`/`range` assembly, which
+`materializer.cpp` must then honour, (3) the model config moving from `identity` to
+`components.<name>.config`.
+
+**And it is necessary but not sufficient for the artifact that prompted it.** The IQ2_XS artifact's
+tensor formats, counted from its own JSON:
+
+| format | tensors | format | tensors |
+|---|---:|---|---:|
+| `bf16` | 582 | `gguf_iq2_xxs` | 73 |
+| `fp32` | 96 | `gguf_iq2_s` | 58 |
+| `q4_g64_fp16` | 54 | `gguf_q2_k` | 58 |
+| `q5_g64_fp16` | 54 | `gguf_iq2_xs` | 49 |
+| `gguf_iq3_s` | 46 | `gguf_iq3_xxs` | 36 |
+| `gguf_iq1_s` | 32 | `gguf_iq1_m` | 28 |
+| `gguf_iq4_xs` | 12 | `gguf_q6_k` | 5 |
+| `gguf_q4_k` | 4 | `q8_g32_fp16` | 2 |
+| `q6_g64_fp16` | 1 | `int32` | 2 |
+
+**401 of 1192 tensors are `gguf_blocks_v1`**, and this tree has no GGUF support at all (the only
+matches for "gguf" in `src/` and `include/` are two comments about llama.cpp). The upstream tree that
+does have those kernels excludes Volta by construction: its CMake requires
+`CMAKE_CUDA_ARCHITECTURES` to match `^(80|86|89|120a)$` and `find src -iname '*volta*'` returns zero
+files. So running this artifact on the V100 would additionally need eleven GGUF dequant kernel
+families ported to sm_70 — IQ2_XS alone is a 512-entry codebook with 8-bit indices, and IQ1_S/IQ1_M/
+IQ2_S/IQ2_XXS/IQ3_S/IQ3_XXS/Q2_K/Q4_K/Q6_K/IQ4_XS each have their own block structure. That is a
+project of the same order as the whole ternary port, which covered one format.
+
+**What the v3 port does buy**: the v3 ternary artifacts (`t2_g128_fp16`, the sanbanfu spliced one) become
+reachable, needing only a T2 dictionary addition on top of the v3 reader — this tree's PQ2 kernels have
+the identical container geometry and differ only in the 2-bit code dictionary.
+
+### Where the v3 implementation actually lives: two sibling V100 trees, not the public upstream
+
+`Neroued/ninfer` (the root upstream) is **sm_120a only** — its `CMakeLists.txt` rejects anything but
+`120a` and it has no Volta sources at all — so it cannot be the reference for a v3 port to this card.
+The v3 work for sm_70 exists in two *sibling* V100 trees, both of which this tree should be read
+against:
+
+| tree | arch | reads | formats | notes |
+|---|---|---|---|---|
+| `/root/duo` (local checkout; the `duo` remote was `fetch /root/duo`) | `70\|86\|89` | v2 + v3 | nvfp4, fp8, **`GGML_K`** (`weights_id == "gguf-q4-k-m"`) | v3 via `Qwen38Nvfp4V3Adapter`, a v3->v2 projection |
+| `ww485000/ninfer-windows-v100`, branch `v100-sm70` | `sm_70` only | **v2 + v3** | the nine v2 formats only (nvfp4 line) | README: "Official `.ninfer` v2 and v3 containers are supported; arbitrary GGUF/Safetensors files are not", and it reports a **verified v3 run on a V100** (Qwen3.8-27B NVFP4 v3, pp2048 1,135.88 tok/s, pp2048+tg256 228.14) |
+
+Both are the same lineage as this tree — the artifact-layer file list is *identical*
+(`binder`, `materializer`, `reader`, `storage_layouts`, `typed_binding`), not the refactored 23-file
+layer of the sm_120a tree — so their v3 code is portable. Against the shared merge base `b37d0dd3`,
+this tree has changed the artifact layer by only **+31 lines across 6 files** (adding
+`PTQ1_0_G128`/`PQ2_0_G128` and their layouts), while `duo` added ~370 lines of v3 adapter inside
+`src/artifact/reader.cpp` (`class Qwen38Nvfp4V3Adapter`, ~lines 281-633, plus `V3CompatibilityDirectory`
+and the version dispatch in `Impl`). `ww485000`'s `reader.cpp` is 43,026 bytes against this tree's
+16,483, and is the larger and better-qualified of the two references.
+
+**Neither documents v3.** Both trees' `docs/maintainer/artifact-container.md` is still titled "NInfer
+Artifact Container Version 2" and specifies only the v2 framing; v3 is a code-only compatibility
+adapter in both, not a published contract.
+
+**And neither has the IQ family.** `duo` has exactly one GGUF format, `GGML_K`, for
+`weights_id == "gguf-q4-k-m"`; a grep for `iq1|iq2|iq3|iq4` across `duo/src` and `duo/include`
+returns **zero**. `ww485000` declares only the nine v2 formats. So the eleven `gguf_*` formats in the
+fyb423 IQ2_XS artifact have no kernel in any V100 tree.
+
+**Consequence for this card.** Reading v3 is worth doing (it aligns this tree with both siblings and
+is a bounded port), but no currently available v3 artifact is runnable here: the v3 NVFP4 artifact is
+22.09 GiB against 16 GB of VRAM (`ww485000`'s own README says "V100 16GB is not a qualified
+Qwen3.8-27B NVFP4 target"), the v3 ternary repository returns `record not found` on ModelScope, and
+the IQ2_XS artifact needs the eleven missing IQ kernels. The v3 port is infrastructure, not a new
+runnable model.
+
+
+
 ## Perplexity
 
 `ninfer-perplexity` is not in the default build target. Corpus:
