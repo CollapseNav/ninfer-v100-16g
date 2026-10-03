@@ -429,3 +429,39 @@ margin this tree accepted for its prefill routes (+0.0245%) -- bought for about 
 is a trade, not a free win, so it is recorded as one: `NINFER_TERNARY_QPN_NACC=1` restores the tighter
 numbers. The 96-token greedy md5 against `/root/wt/base.out` is IDENTICAL with the new default and
 with `=1`, since the knob is above the gate.
+
+---
+
+## Round 8 — the tail's epilogue fusion: reconnaissance, real ceiling, and why it was not attempted
+
+Item ② was the last open direction: fold the tail's elementwise consumers into their producers'
+epilogues, which the launch-count arithmetic priced at 5-8% of the step. Reconnaissance on the
+ternary path changes that estimate and shows the work is not a wrapper change.
+
+* The two biggest elementwise consumers are `residual_add` (130 launches/token, 3.42 us each) and
+  `silu_and_mul` (65/token, 5.36 us).
+* `ops::linear_add` **looks** like the fused producer+add, and it is not: on the ternary path
+  `src/ops/wrapper/linear_add.cpp` composes `ternary_dispatch` into a scratch tensor and then calls
+  `residual_add`, with the comment "There is no fused ternary residual kernel, so compose it from the
+  shared ternary GEMM and the existing elementwise add". The model impl's one adjacent call site
+  (`variant.cpp`: `ops::linear(down_proj)` then `ops::residual_add`) therefore cannot be redirected
+  to it for any gain.
+* So the fusion has to be an epilogue inside the kernels. Concretely:
+  1. a second ternary entry point taking the residual tensor (`ternary_dispatch_add`), with the same
+     shape gate and the same staged / tile / QPN / CUTLASS cascade;
+  2. one bf16 load and one add per output element in the epilogue of the kernels that serve the
+     decode and verify band (the staged kernel at T = 1..2, the tile kernel at T = 3..5) -- free
+     against the ~39 us of weight streaming each call already pays;
+  3. `linear_add`'s ternary branch rewritten to call it.
+* **Real ceiling: +0.8-1%, not 5-8%.** Only the ~130 residual adds sit next to a producer; the
+  tail's other ~760 launches are rotations, norms and GDN stages with no producer to fold into. At
+  the measured fixed cost of 1-1.5 us per removed launch that is 0.15-0.2 ms of a 19.4 ms step.
+* **Numerics: not bit-identical.** Today the linear's bf16 output is rounded once and then added to
+  the residual; a fused epilogue would add in fp32 before the single bf16 rounding. That is strictly
+  more accurate, but it moves greedy ids, so it needs the md5/PPL discipline and either a re-recorded
+  baseline or a gate.
+
+Not attempted. Four files plus two validation runs for a measured ceiling an order of magnitude below
+the two changes that did move this session (the staged code plane, +6% decode; the QPN default fix,
++90% on the lookup path). Recorded with its cost so the next session can decide on numbers rather
+than on the 5-8% estimate that the launch-count arithmetic suggested.
