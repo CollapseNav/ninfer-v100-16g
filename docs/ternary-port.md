@@ -1565,6 +1565,34 @@ against it.
 So the converter's format choices are exactly the source's, and the artifact is a faithful repackaging
 in the one respect that can be checked without the original file.
 
+### llama.cpp on the source GGUF: coherent, and PPL 8.14
+
+The source GGUF is now downloaded and verified (`SHA-256 4414bc39…cab85`, the value the source repo
+publishes), and llama.cpp is built from the current tree. That gives the reference this investigation
+has been missing: **the same model, the same quantization, a second engine.**
+
+Same raw prompt, both engines:
+
+| engine | output |
+|---|---|
+| **llama.cpp on the source GGUF** | `[Start thinking] The user is asking me to complete the equation "2 + 2 = ". This is a simple arithmetic problem.` |
+| this port on the `.ninfer` repackaging | `User sent instruction requesting completion likely meaning complete identity requesting requesting … Strec Strec Strec` |
+
+**So the port is wrong, and it is not the artifact.** The two openings are even semantically alike --
+"the user is asking me to complete the equation" against "user sent instruction requesting completion"
+-- which says the first few tokens are right and something drifts after them.
+
+Perplexity on the same 4000-character slice, context 512: **llama.cpp 8.1403 +/- 1.22866** against this
+port's 10.256 on the long text. 8.14 is itself high for a 27B, so the model/text pair is genuinely an
+8-ish proposition and the gap is smaller than the earlier cross-model comparison suggested -- but the
+text comparison above is not ambiguous, and the port's own run on this slice currently fails with
+`std::bad_alloc` at window 0, which needs its own look.
+
+**What this unlocks**: a working second engine on the identical weights. Diffing the two engines'
+per-layer activations or logits for one prompt will localize the fault directly, instead of continuing
+to verify stages that already agree.
+
+
 
 
 
