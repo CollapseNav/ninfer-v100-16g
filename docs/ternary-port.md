@@ -1074,6 +1074,76 @@ Qwen3.8-27B NVFP4 target"), the v3 ternary repository returns `record not found`
 the IQ2_XS artifact needs the eleven missing IQ kernels. The v3 port is infrastructure, not a new
 runnable model.
 
+### Running the IQ2_XS artifact: what was built, and the one structural gap that is left
+
+Four commits so far, each verified:
+
+| commit | what | verification |
+|---|---|---|
+| `da02a7d7` | reads v3 containers (32-byte header, `id`->`name`, snake_case vocabulary, the logical alias layer, GGUF formats in the container) | the artifact now parses completely; v2 bit-identical (`REGRESSION_OK_md5_identical`) |
+| `ebdbf57f` | vendors llama.cpp's ggml-cuda (`third_party/ggml-quants`) and compiles the GGUF block kernels for **sm_70** | 0 errors; `libninfer_ggml_quants.a` 81 MB with `iq2_xs` symbols; v2 bit-identical |
+| `adcc04af` | routes GGUF qtypes in `linear`, `linear_swiglu`, `linear_add` to the vendored kernels | 0 errors; v2 bit-identical |
+
+**The vendoring is the reason this is tractable at all.** The upstream GGUF path is not hand-written:
+it vendors llama.cpp's ggml-cuda behind a thin bridge, and ggml-cuda already carries sm_70 paths
+(`GGML_CUDA_CC_VOLTA 700`, `#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA` in `mmq.cuh`). So Volta needed
+no new kernel work -- 18,845 vendored lines instead of eleven kernel families written from scratch.
+Its block table is ggml's own and was validated against the artifact before any C++ was written: all
+401 gguf tensors satisfy `rows * (K / block_elements) * block_bytes` exactly.
+
+**What the artifact actually contains** (from its own `bindings`), which is what the remaining binder
+work has to match:
+
+| role | format |
+|---|---|
+| `text/token_embedding` | `gguf_iq1_m` (248320, 5120) |
+| `text/output_head` | `gguf_iq4_xs` (248320, 5120) |
+| `proposal/head` | `gguf_iq4_xs` (131072, 5120) |
+| MLP gate / up / down | `gguf_iq1_s` / `gguf_iq1_m` / `gguf_iq2_xxs` |
+| attention query / key / gate / value | `gguf_iq2_xxs` / `gguf_iq2_xxs` / `gguf_iq2_xxs` / `gguf_iq2_s` |
+| GDN query / key / value / z / output | `gguf_iq3_s` / `gguf_iq3_s` / `gguf_iq3_s` / `gguf_iq3_s` / `gguf_iq4_xs` |
+| MTP layer (all projections) | `gguf_q6_k` |
+| every norm, GDN convolution, GDN a/b projection | `bf16` |
+
+So `text/layers/N/*` is 960 bindings = 64 layers x 15 roles, the same layer structure as the v2
+contract, and the proposal head exists -- it is named `proposal/head` rather than `text/draft_head`,
+which the v3 logical layer's `fork_rename` already maps.
+
+**THE GAP. The fork's contract is FUSED; this artifact stores every projection SEPARATELY.** The fork
+binds one `attention/query_key_gate_value` weight and its op is
+`attn_input_proj(x, query_key_gate_value_weight, ...)`; the artifact has four separate objects, and
+they do not even share a format (`iq2_xxs` query/key/gate against `iq2_s` value), so they cannot be
+concatenated into one fused tensor either. The same holds for `query_key_value_z`, `a_b_projection`
+and `gate_up`.
+
+The upstream tree has already solved exactly this, and the mechanism is small: it adds a
+`GgufProjectionWeights` overload carrying a list of parts (`{Weight, output, row}`) and projects them
+all in ONE call, because `gguf_project` already takes a `std::span<const GgufProduct>`:
+
+```cpp
+struct GgufProjectionWeights { struct Part { Weight weight; int output; int row; }; std::vector<Part> parts; };
+// ... build one GgufProduct per part, then:
+detail::gguf_project(x, products, workspace, stream);
+```
+
+`gguf_linear.h` in this tree already declares that span-taking entry point, so the remaining work is
+plumbing rather than new kernels:
+
+1. `WeightsProfile::Qwen38GgufMixed` in `qwen3_6_27b/export/.../package.h`, accepted by
+   `Package::resolve_weights` for `qwen3.8-27b` + `gguf-mixed`;
+2. a `bind_gguf_text_layers` that binds the artifact's real inventory -- per-projection objects,
+   `endpoint_format` resolved from the DECLARED format per role rather than one profile-wide format
+   (the embedding is `iq1_m` while the head is `iq4_xs`), and `Weight::input_columns` populated for
+   the GDN output projection whose stored columns are permuted;
+3. `GgufProjectionWeights` overloads on `attn_input_proj` / `gdn_input_proj` / `linear_swiglu`, and
+   the `BindingPlan`/program plumbing to call them when the profile is GGUF;
+4. cases for the new profile in `variant.cpp`'s policy switches (28 sites).
+
+That is a multi-file, multi-hour change and it is the next unit of work; it is not started here
+rather than half-landed, because a partially plumbed binding cannot load and would leave the tree
+worse than the four verified commits above.
+
+
 
 
 ## Perplexity
