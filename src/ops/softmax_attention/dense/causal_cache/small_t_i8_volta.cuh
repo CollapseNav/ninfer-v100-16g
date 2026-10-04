@@ -89,31 +89,9 @@ __device__ __forceinline__ int4 causal_kv_dequant_i8x8_f16_from(
     return *reinterpret_cast<const int4*>(packed);
 }
 
-// Widens this thread's four-half2 V window out of the int8 codes. The arithmetic is the staging loop's,
-// verbatim -- __floats2half2_rn((float)code * (float)scale, ...) with the scale read through fp16 -- so
-// the mma receives bit-identical operands. One scale covers the whole four-half window because an 8-wide
-// staging chunk sits inside one G64 group (see the static_assert on kKVCacheInt8Group).
-__device__ __forceinline__ void load_v_i8_window(half2 (&dst)[4], const std::int8_t* base, int stride,
-                                                 const half* scales, int scale_stride, int group) {
-    const int lane = threadIdx.x & 31;
-    const int j    = (lane / 16) * 2;
-#pragma unroll
-    for (int l = 0; l < 4; ++l) {
-        const int row        = ((l / 2) * 4) + (lane % 4);
-        const std::int8_t* c = base + row * stride + (j + (l % 2)) * 2;
-        const float scale    = __half2float(scales[row * scale_stride + group]);
-        dst[l] = __floats2half2_rn(static_cast<float>(c[0]) * scale,
-                                   static_cast<float>(c[1]) * scale);
-    }
-}
-
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput>
-// minBlocks 3: with V held as int8 the block is 29,952 B, so three CTAs fit and the register budget
-// becomes 65536/(128*3) = 170. That is the point of the change -- ncu measured 12.5% theoretical
-// occupancy at two CTAs, limited by both registers (213) and shared memory, with 64.8% of cycles having
-// no eligible warp.
-__launch_bounds__(WarpsPerCta * 32, 3) __global__
+__launch_bounds__(WarpsPerCta * 32, 2) __global__
     void causal_attention_small_t_tc_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
     std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
@@ -163,18 +141,7 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
     __shared__ __align__(16) half q_tail_s[4 * SmemStride];
     __shared__ __align__(16) half p_tail_s[8 * 8];
     __shared__ __align__(16) half k_s[Bc * SmemStride];
-    // V is held as its int8 codes plus one fp16 scale per G64 group, not as fp16. The mma needs fp16
-    // operands, so the widening happens in the load path rather than in the staging loop -- and since
-    // the four dim-split warps partition the head dim, every V value is read exactly once either way,
-    // so this relocates the same arithmetic instead of adding any. It costs 4,096 B less than the fp16
-    // tile (8,448 -> 4,224 + 128 of scales), which is what takes the block from 34,048 B to 29,952 B
-    // and makes the third CTA per SM reachable (98,304 / 29,952 = 3.28). The pad is in bytes here: a
-    // 256-byte row stride would put the mma feed's four-lane column read on one bank, while 264 is 66
-    // words and 66 % 32 = 2.
-    constexpr int VStride = D + 8;
-    constexpr int VGroups = D / kKVCacheInt8Group;
-    __shared__ __align__(16) std::int8_t v_i8_s[Bc * VStride];
-    __shared__ __align__(16) half v_scale_s[Bc * VGroups];
+    __shared__ __align__(16) half v_s[Bc * SmemStride];
     __shared__ std::int32_t physical_pages_s[PageIds];
 
     const int kv_head     = static_cast<int>(blockIdx.x);
@@ -430,6 +397,7 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
                 const int d     = (chunk - key_l * (D / 8)) * 8;
                 const int key   = k0 + key_l;
                 half* k_dst     = &k_s[key_l * SmemStride + d];
+                half* v_dst     = &v_s[key_l * SmemStride + d];
                 if (key >= split_start && key < split_end) {
                     const int page_offset = key & kPagedKVPageMask;
                     const std::int64_t code_off =
@@ -437,16 +405,12 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
                     const std::int64_t scale_off = kv_cache_int8_quant_scale_index<Geometry>(
                         physical_page, kv_head, d / kKVCacheInt8Group, page_offset);
                     const float ks = __half2float(cache_k_scale[scale_off]);
+                    const float vs = __half2float(cache_v_scale[scale_off]);
                     store_vec(k_dst, causal_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
-                    // V's codes are copied through unchanged and its scale goes to its own array. Every
-                    // 8-wide chunk inside a group writes the same scale value, so the redundant stores
-                    // need no guard.
-                    store_vec(&v_i8_s[key_l * VStride + d], load_vec<int2>(&cache_v_i8[code_off]));
-                    v_scale_s[key_l * VGroups + (d / kKVCacheInt8Group)] = cache_v_scale[scale_off];
+                    store_vec(v_dst, causal_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
                 } else {
                     store_vec(k_dst, make_int4(0, 0, 0, 0));
-                    store_vec(&v_i8_s[key_l * VStride + d], make_int2(0, 0));
-                    v_scale_s[key_l * VGroups + (d / kKVCacheInt8Group)] = __ushort_as_half(0);
+                    store_vec(v_dst, make_int4(0, 0, 0, 0));
                 }
             }
             __syncthreads();
@@ -561,10 +525,10 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
 #pragma unroll
                     for (int c = 0; c < DChunksLocal; ++c) {
                         half2 vf[4];
-                        // c*8 stays inside one G64 group for c < 8, and DChunksLocal is 8, so the
-                        // window's group index is exactly this warp's dim slice.
-                        load_v_i8_window(vf, &v_i8_s[(sub * 8) * VStride + dim_warp * DSlice + c * 8],
-                                         VStride, &v_scale_s[(sub * 8) * VGroups], VGroups, dim_warp);
+                        volta_load_v(vf,
+                                     reinterpret_cast<const half2*>(
+                                         &v_s[sub * 8 * SmemStride + dim_warp * DSlice + c * 8]),
+                                     SmemStride / 2);
                         half2 pv[4] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
                         volta_mma_pv(pv, p, vf);
 #pragma unroll
@@ -623,13 +587,9 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
                             half2 vf[4];
 #pragma unroll
                             for (int l = 0; l < 4; ++l) {
-                                const int r0 = sub * 8 + 2 * l;
-                                const int g  = d / kKVCacheInt8Group;
-                                vf[l]        = __floats2half2_rn(
-                                    static_cast<float>(v_i8_s[r0 * VStride + d]) *
-                                        __half2float(v_scale_s[r0 * VGroups + g]),
-                                    static_cast<float>(v_i8_s[(r0 + 1) * VStride + d]) *
-                                        __half2float(v_scale_s[(r0 + 1) * VGroups + g]));
+                                vf[l] = __halves2half2(
+                                    v_s[(sub * 8 + 2 * l) * SmemStride + d],
+                                    v_s[(sub * 8 + 2 * l + 1) * SmemStride + d]);
                             }
                             const unsigned* V = reinterpret_cast<const unsigned*>(vf);
                             volta_mma_qp_n(acc_f[c], P[0], P[1], V[0], V[1]);

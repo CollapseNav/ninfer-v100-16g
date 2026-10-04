@@ -4138,3 +4138,51 @@ next step, exactly as the attention was measured before it was touched. And the 
 occupancy route (`v_s` staged as int8, -4,224 B at unchanged `Bc`, three CTAs without touching the
 softmax recurrence) now targets 36% of the round instead of the 40.6% it targeted on the old artifact --
 still the largest lever that does not require inventing a new kernel.
+### The third CTA, attempted and rejected: int8 V in shared (2026-10-04)
+
+The attention runs at two CTAs per SM, limited by **both** registers (213/thread) and shared memory
+(34,048 B against a 32,768 B three-CTA budget), at 12.5% theoretical occupancy with 64.8% of cycles
+having no eligible warp. Of the 1,280 B that three CTAs need, `q_s` is mma-shaped and cannot shrink
+(attempt 1), `k_s`/`v_s` only shrink by changing `Bc` (which moves the online-softmax rescale interval --
+that is what rejected `Bc 16 -> 8`), and the bank-conflict pad is documented as the fix for 724M
+conflicts. That leaves the V *representation*, which is free to change because the dequantization is
+exact: the same codes and the same scale produce the same fp16 bits.
+
+**What was built.** `v_i8_s[Bc * (D + 8)]` of int8 codes plus `v_scale_s[Bc * 4]` of fp16 group scales,
+in place of `v_s[Bc * SmemStride]` of fp16; a `load_v_i8_window` helper that widens a thread's four-half2
+window with the staging loop's own arithmetic, verbatim
+(`__floats2half2_rn((float)code * (float)scale, ...)`); and `__launch_bounds__(128, 3)`. The byte stride
+is 264 rather than 256 so the mma feed's four-lane column read stays off one bank (264 is 66 words,
+66 % 32 = 2).
+
+`cuobjdump` confirms the intent exactly: **SHARED 29,952 B and REG 168 for every instantiation** (from
+34,048 and 213), `LOCAL:0` -- no spills at the 170-register cap -- so **three CTAs by both limits**, and
+the CompactTail instantiation lands at 128 registers with 32,192 B.
+
+**Bit-identity holds.** The v3's outputs are byte-identical to the pre-change runs: `4539edd6` on the
+31.2k and 62.4k thinking-off arms and `a7c72fd7` on the thinking-on arm, and the CompactTail path
+(`TokenTile 6`, `WarpsPerCta 5`) still runs and produces the same bytes.
+
+**It is 3.9% slower, so it was reverted.**
+
+| context | fp16 V | int8 V |
+|---|---:|---:|
+| 15.6k | 88.2 | 86.2 |
+| 31.2k | 69.0 / 69.1 | **66.4 / 66.4** |
+| 62.4k | 54.4 | **52.3** |
+| 31.2k, thinking on | 63.3 | 60.9 |
+
+The occupancy gain does not pay for the conversion. `volta_load_v`'s four vectorized `half2` loads
+become four int8-pair loads, four scale loads and the same number of converts, and that lands in the PV
+inner loop, which runs `DChunksLocal = 8` times per key sub-group per warp. The kernel turns out to be
+instruction- and L1TEX-bound rather than occupancy-bound: more resident warps cannot help a loop that
+got three times as long. This is the second time this file has measured that the attention's problem is
+not simply "not enough warps" -- the first was `Bc 16 -> 8`, which bought the same third CTA and lost
+4.5-6% to a different cost.
+
+**The variant worth trying next**, same footprint saving and *no* arithmetic change: stage one 8-key
+sub-group at a time instead of the whole `Bc = 16` tile. Both `k_s` and `v_s` halve to 4,224 B
+(25,600 B total, three CTAs with room) and the mma feed keeps its vectorized loads, at the price of
+three extra `__syncthreads()` per `Bc` tile. It is bit-identical by construction -- the same 8-key
+sub-groups in the same order, just staged later -- which is what makes it a strictly smaller risk than
+this attempt.
