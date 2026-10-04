@@ -391,7 +391,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
-        scratch(layout, Variant::mtp_q_gate_projection_workspace_capacity_bytes(1, 1));
+        // Sized past the vector band on purpose: a query of (1,1) takes the vector branch, which needs
+        // no stream-k fixup plane, while the execution at a draft window of 2+ takes the matrix
+        // branch, which needs one (80 SMs x 64 KiB = 5 MiB). That mismatch was the std::bad_alloc
+        // that blocked --spec mtp.
+        scratch(layout, Variant::mtp_q_gate_projection_workspace_capacity_bytes(
+                           1, std::max<std::int32_t>(last, 16)));
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         matrix(layout, DType::I32, 3, 1);
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
@@ -400,7 +405,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             plan.kv_storage, text_envelope, 1, 1, 1));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
-        scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
+        scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(
+                           1, std::max<std::int32_t>(last, 16)));
         proposal_scratch(layout, 1);
     };
 
