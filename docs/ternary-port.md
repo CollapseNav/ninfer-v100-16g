@@ -4342,3 +4342,41 @@ optimum. Registers stay at 64 with `LOCAL:0`.
 The shape is odd for a per-launch overhead: 4.2-4.6% at 62.4k against 0.3-0.5% at short context. The
 likely reason is that at long context the attention is also streaming its KV through L2, so halving the
 table's L2 traffic is worth more exactly where the other term is busiest.
+### Where the vec kernel's time actually goes: every decode launch underfills the GPU (2026-10-04)
+
+The earlier trace could not answer this. It was taken with CUDA graphs on, and nvprof does not see kernels
+inside graphs, so its 2,659 vec launches were the *prefill*'s -- a prefill-only table that would have
+pointed the work in the wrong direction. Redone with `--no-cuda-graph`, splitting the decode (everything
+after the first `causal_attention_small_t` launch, since the prefill's attention is the prompt kernel) by
+grid size:
+
+| grid.x | launches | total ms | share | avg us |
+|---|---:|---:|---:|---:|
+| 64 | 97 | 1.65 | 2.1% | 17.0 |
+| 128 | 282 | 4.39 | 5.7% | 15.6 |
+| 160 | 250 | 14.60 | 18.9% | 58.4 |
+| **240** | **678** | **40.08** | **52.0%** | 59.1 |
+| 320 | 208 | 10.50 | 13.6% | 50.5 |
+| 400 | 7 | 5.90 | 7.7% | 843.0 |
+
+**grid >= 640: none. Zero of 77.1 ms**, which is 62.9% of the decode's GPU-busy time. The register-limited
+maximum is `resident * sm_count` = 8 x 80 = 640 blocks, and every launch in the decode falls short of it;
+the most common grid, at 52% of the vec time, fills 37.5% of the machine. The ncu per-grid readings line
+up exactly -- grid 256 reaches 8-14% of DRAM and grid 640 reaches 26% -- so the dominant grid sits in the
+10% band.
+
+So the narrow projections are not a corner case: **they are the whole vec kernel.** The kernel's 62.9%
+share of the decode runs at a third to a half of the machine's block capacity, and the grid is
+`min(groups, resident * sm_count)` with `groups = ceil(rows / per_block)`, so it is the *row count* of
+these projections rather than the cap that leaves the machine empty.
+
+(Caveat on this trace: with `--no-cuda-graph` the GPU is busy only 122.6 ms of a 0.53 s decode wall time,
+because the launch gaps are exposed. The per-launch durations are valid; the gaps are an artefact of the
+tracing mode, not of the production path, which runs under graphs.)
+
+Two directions follow. The larger upside is to raise the fill by splitting the K range across more blocks,
+which adds parallelism without adding activation traffic -- each block still reads only its own K range --
+at the price of a reduction pass and a changed summation order, i.e. it would no longer be bit-identical.
+The cheaper direction is to identify which projections those 240-block launches are, which a one-line
+print of `args.rows` in `launch` answers, and then see whether a different `per_block` assignment covers
+them without the activation cost that made `kRows = 1` lose 2%.
