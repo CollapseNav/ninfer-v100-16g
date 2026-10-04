@@ -1881,6 +1881,28 @@ thinking disabled, answers `2 + 2 = 4`, and this port on the same weights produc
 `**Answer:** \`$\` Or wait--but hold aufortuguementant demu sourceMappingement Ouver...`. Every stage
 has been measured; the fault is inside this port and no longer has a named suspect.
 
+### The prefix finding, confirmed against the same model
+
+The caveat above is answered: llama.cpp's perplexity on the same 4000-character slice at the same
+contexts.
+
+| context | llama.cpp (same model) | ternary (same tool) | this port |
+|---:|---:|---:|---:|
+| 64 | **22.99** | 3.303 | 10.691 |
+| 256 | **12.31** | 2.630 | 10.556 |
+| improvement | **-46%** | **-46%** | **-1%** |
+
+Two different models, two different engines, the same **-46%** from four times the context. The
+measurement is sound, and this port's -1% is the anomaly. (The level differs because the two tools score
+different token subsets -- llama.cpp scores a whole chunk, this port scores `context - stride` -- but
+the *slope* is what the finding rests on, and the slope agrees across both references.)
+
+So this port's model does not use its context. The only mechanism that can carry arbitrary-distance
+context is the attention, in the 16 full layers; the other 48 are GDN, whose recurrent state is a
+fixed-size memory. The K and V that attention caches come from this port's own GGUF projections, and
+that is the path to examine.
+
+
 
 
 
