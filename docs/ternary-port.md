@@ -3787,9 +3787,21 @@ identical output, and 16 otherwise. This is the same conclusion the window reach
 already was one and this makes the set self-describing. It takes them positionally and recreates the
 container:
 
-    bash /root/serve_start.sh          # window 2, lookup suffix 16  (the resident setting)
-    bash /root/serve_start.sh 1        # window 1
-    bash /root/serve_start.sh 2 6      # window 2, suffix 6 -- copying/re-emission heavy traffic
+    bash /root/serve_start.sh                  # window 2, suffix 16, ternary  (the v2 resident setting)
+    bash /root/serve_start.sh 1                # window 1
+    bash /root/serve_start.sh 2 6              # window 2, suffix 6 -- copying/re-emission heavy traffic
+    bash /root/serve_start.sh 1 16 iq2xs       # the v3 IQ2_XS artifact: window 1, chunk 2048
+
+The third argument selects the artifact, and each carries its own measured settings. `iq2xs` is the v3
+container (`/root/ms/swift15_iq2xs_mtp.ninfer`, IQ2_XS, multimodal, weights 8.49 GiB) and it needs
+`--prefill-chunk 2048` to plan at 131072 at all: the GGUF route's per-projection FP32 plane is
+`rows * T * 4` and `text_prefill` is sized by the chunk, so chunk 4096 gives it a 1.72 GB prefill layout
+against the ternary's 1.21 GB and the runtime reservation comes out 0.43 GiB over what is free after
+weights. Chunk 2048 halves that plane (1.05 GB) and 131072 plans again, at a measured prefill cost of
+about 4-5% (31.2k: 942 against 997 tok/s; 62.4k: 773 against 806). It also wants window 1 -- 35.7/40.3/31.9
+against 31.5/34.0/27.6 on window 2 -- and its MTP acceptance length is only 1.02-1.25 at these contexts,
+so it decodes 24-44% slower than the ternary. Both artifacts serve under the runtime name
+`qwen3.8-27b`, so a client does not have to know which one is resident.
 
 **A rebuilt binary needs the container restarted -- any restart.** The executable is bind-mounted from
 `/root/ninfer-v100`, so a running process keeps the old image of the file until it is re-exec'd; a
