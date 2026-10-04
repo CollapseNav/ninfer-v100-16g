@@ -4516,3 +4516,46 @@ that was a per-launch overhead, not the inner loop.
 The probe puts the inner loop's own ceiling at 509-580 GB/s and the kernel achieves about 285 in situ.
 Nothing that can be reproduced in isolation accounts for the difference, which leaves the per-launch
 structure and the interleaving with the attention -- both system-level, not inner-loop.
+### Draft quality: the proposal head measured, and three traps found (2026-10-04)
+
+`--lm-head-draft` selects the artifact's own `proposal/head` (a 131072 x 5120 `gguf_iq4_xs` draft head
+plus a 131072-entry int32 id map) instead of the LM-head argmax. On this artifact it was known to be
+worse; it had never been measured at long context, because it cannot be: materialising the head adds
+356 MB and at `--max-context 131072 --prefill-chunk 3072` the runtime reservation then exceeds what is
+free after weights --
+
+```
+error: minimum Engine runtime reservation requires 6436194560 bytes in addition to 1073741824 bytes of
+       automatic headroom, but only 7450729472 bytes are available after weights
+```
+
+which is the same memory ceiling this file has been fighting since the v3 work started. Dropping the
+prefill chunk to 2048 makes room, and the comparison on one long prompt is unambiguous:
+
+| drafter | 31.2k decode | 31.2k accept | 62.4k decode | 62.4k accept |
+|---|---:|---:|---:|---:|
+| **LM-head argmax (deployed)** | **69.4** | **2.50** | -- | -- |
+| `proposal/head` | 35.5 | 1.25 | 28.9 | 1.25 |
+
+So the proposal head's drafts are about 12.5% accurate against the LM head's ~75%, at both contexts.
+The plumbing was checked end to end first and is correct: the head binds as `text/draft_head` at
+`{131072, 5120}`, the argmax runs over the 131072 slots, and `proposal_remap_token_ids` maps the winning
+slot through the id table. What is left is that the head expects a different input than the engine feeds
+it -- `proposal_argmax` hands it the same `final_hidden` (the normalized MTP hidden) that the LM head
+gets -- which is a one-line experiment.
+
+**Three traps found on the way, worth recording.**
+
+The v3 container's object offsets are relative to the **data section at `32 + json_len`**, not to the
+start of the file. Read file-absolute, `proposal/token_ids` looks like noise -- values spanning the whole
+int32 range, with duplicates -- and a real map read at the right base is `min 0, max 248076,
+distinct 131072`. The artifact's vocab is 248,320 (`weight/000117 [248320, 5120]`, the output head), so
+the proposal head proposes a 131072-entry subset of it.
+
+`NINFER_DUMP_LOGITS` is incompatible with CUDA graphs: it copies back and syncs, which invalidates the
+capture (`cudaErrorStreamCaptureInvalidated` at `argmax.cu:70`). The hook is already called on the
+non-proposal path, so this is pre-existing; any use of it needs `--no-cuda-graph`.
+
+And a check that came back negative: `gguf_iq4_xs` is not an untested corner. The artifact uses it for
+twelve tensors including the output head and several MLP projections, so its decode path is exercised on
+every token and cannot be the reason the proposal head drafts badly.
