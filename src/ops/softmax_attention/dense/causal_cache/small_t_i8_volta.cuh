@@ -91,7 +91,10 @@ __device__ __forceinline__ int4 causal_kv_dequant_i8x8_f16_from(
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput>
-__launch_bounds__(WarpsPerCta * 32, 2) __global__
+// minBlocks 3: with one sub-group staged at a time the block is 25,600 B, so three CTAs fit and the
+// register budget becomes 65536/(128*3) = 170. ncu measured 12.5% theoretical occupancy at two CTAs,
+// limited by both registers (213) and shared memory, with 64.8% of cycles having no eligible warp.
+__launch_bounds__(WarpsPerCta * 32, 3) __global__
     void causal_attention_small_t_tc_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
     std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
@@ -140,8 +143,17 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     __shared__ __align__(16) half q_s[Br * SmemStride];
     __shared__ __align__(16) half q_tail_s[4 * SmemStride];
     __shared__ __align__(16) half p_tail_s[8 * 8];
-    __shared__ __align__(16) half k_s[Bc * SmemStride];
-    __shared__ __align__(16) half v_s[Bc * SmemStride];
+    // One 8-key sub-group is staged at a time rather than the whole Bc = 16 tile. The mma's N dimension
+    // is 8 keys and the online-softmax recurrence is per 8-key sub-group, so this changes no arithmetic
+    // -- same sub-groups, same values, same order, staged later -- and the mma feed keeps its vectorized
+    // half2 loads. It halves k_s and v_s (8,448 -> 4,224 B each) and takes the block from 34,048 B to
+    // 25,600 B, which is the third CTA per SM this kernel cannot otherwise reach (98,304 / 25,600 = 3.8).
+    // The price is two __syncthreads() per sub-group instead of one per tile.
+    constexpr int StageKeys = 8;
+    static_assert(StageKeys == 8, "the mma N dimension is 8 keys");
+    static_assert(Bc % StageKeys == 0, "a Bc tile must be whole sub-groups");
+    __shared__ __align__(16) half k_s[StageKeys * SmemStride];
+    __shared__ __align__(16) half v_s[StageKeys * SmemStride];
     __shared__ std::int32_t physical_pages_s[PageIds];
 
     const int kv_head     = static_cast<int>(blockIdx.x);
@@ -380,22 +392,20 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         float m_lo = -CUDART_INF_F, m_hi = -CUDART_INF_F;
         float l_lo = 0.0f, l_hi = 0.0f;
 
-        for (int kb = 0; kb < key_blocks; ++kb) {
-            const int k0 = first_tile + kb * Bc;
-            if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
-                physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
-            }
-
+        // Stage one 8-key sub-group of K and V, dequantizing int8 -> fp16 on the way in. Every
+        // key in range is read from the cache, including this tile's own new tokens -- the append
+        // block above has already written and __syncthreads()'d them.
+        const auto stage_keys = [&](int key_begin) {
             // Stage K/V for this key tile, dequantizing int8 -> fp16 on the way in. Unlike the
             // bf16 sibling there is no second in-place conversion pass: the codes are half the
             // width of the fp16 destination, so they are widened in registers between the load
             // and the store. Every key in range is read from the cache, including this tile's
             // own new tokens -- the append block above has already written and __syncthreads()'d
             // them, so there is no need for the bf16 kernel's separate "from_new" source.
-            for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
+            for (int chunk = tid; chunk < StageKeys * (D / 8); chunk += Threads) {
                 const int key_l = chunk / (D / 8);
                 const int d     = (chunk - key_l * (D / 8)) * 8;
-                const int key   = k0 + key_l;
+                const int key   = key_begin + key_l;
                 half* k_dst     = &k_s[key_l * SmemStride + d];
                 half* v_dst     = &v_s[key_l * SmemStride + d];
                 if (key >= split_start && key < split_end) {
@@ -413,7 +423,14 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                     store_vec(v_dst, make_int4(0, 0, 0, 0));
                 }
             }
-            __syncthreads();
+        };
+
+        for (int kb = 0; kb < key_blocks; ++kb) {
+            const int k0 = first_tile + kb * Bc;
+            if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
+                physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+            }
+
 
             // Bc=16 keys are staged together, but QK^T/softmax/PV operate on 8-key
             // sub-groups within that stage: each mma.sync.m8n8k4 call only covers an
@@ -424,6 +441,11 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
 #pragma unroll
             for (int sub = 0; sub < PVChunks; ++sub) {
                 const int sub_k0 = k0 + sub * 8;
+                // The first barrier protects the previous sub-group's readers, the second
+                // publishes these keys to every warp.
+                __syncthreads();
+                stage_keys(sub_k0);
+                __syncthreads();
 
                 // --- QK^T: accumulate over the full D=256 head dim, 8 real k-elements/call. ---
                 float d_score[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -450,7 +472,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                     }
                     half2 kf[4];
                     volta_load_k(
-                        kf, reinterpret_cast<const half2*>(&k_s[sub * 8 * SmemStride + c * 8]),
+                        kf, reinterpret_cast<const half2*>(&k_s[c * 8]),
                         SmemStride / 2);
                     volta_mma_qk(d_score, qf, kf);
                 }
@@ -527,7 +549,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                         half2 vf[4];
                         volta_load_v(vf,
                                      reinterpret_cast<const half2*>(
-                                         &v_s[sub * 8 * SmemStride + dim_warp * DSlice + c * 8]),
+                                         &v_s[dim_warp * DSlice + c * 8]),
                                      SmemStride / 2);
                         half2 pv[4] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
                         volta_mma_pv(pv, p, vf);
@@ -588,8 +610,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
 #pragma unroll
                             for (int l = 0; l < 4; ++l) {
                                 vf[l] = __halves2half2(
-                                    v_s[(sub * 8 + 2 * l) * SmemStride + d],
-                                    v_s[(sub * 8 + 2 * l + 1) * SmemStride + d]);
+                                    v_s[(2 * l) * SmemStride + d],
+                                    v_s[(2 * l + 1) * SmemStride + d]);
                             }
                             const unsigned* V = reinterpret_cast<const unsigned*>(vf);
                             volta_mma_qp_n(acc_f[c], P[0], P[1], V[0], V[1]);

@@ -4186,3 +4186,51 @@ sub-group at a time instead of the whole `Bc = 16` tile. Both `k_s` and `v_s` ha
 three extra `__syncthreads()` per `Bc` tile. It is bit-identical by construction -- the same 8-key
 sub-groups in the same order, just staged later -- which is what makes it a strictly smaller risk than
 this attempt.
+### The third CTA, second attempt: one 8-key sub-group staged at a time (kept)
+
+The first attempt (int8 V in shared) reached three CTAs per SM, stayed bit-identical, and was 3.9%
+slower, because it had to give up the mma feed's vectorized `half2` loads to convert V in the load path.
+This attempt reaches the same three CTAs without touching any arithmetic.
+
+**Why it is free.** The mma's N dimension is 8 keys (`mma.sync.m8n8k4`) and the online-softmax
+recurrence is per 8-key sub-group, so a `Bc = 16` tile is already processed as two independent
+sub-groups. Staging one sub-group at a time therefore changes no arithmetic at all -- the same
+sub-groups, the same values, in the same order, merely staged later -- and the mma feed keeps its
+vectorized loads. `k_s` and `v_s` each halve (8,448 -> 4,224 B), taking the block from 34,048 B to
+**25,600 B**, which is three CTAs per SM (98,304 / 25,600 = 3.8). The price is two `__syncthreads()` per
+sub-group instead of one per tile, i.e. three extra barriers per 16-key tile.
+
+`cuobjdump`: **SHARED 25,600 B and REG 164-166 for every instantiation** (from 34,048 and 213),
+`LOCAL:0` -- no spills at the 170-register cap -- so three CTAs by both limits. The CompactTail
+instantiation is 27,840 B at 128 registers, also three CTAs.
+
+**Bit-identity holds**: the outputs are byte-identical to the pre-change runs -- `500e3b3c` on the 15.6k
+arm, `4539edd6` on both 62.4k arms and the thinking-off 31.2k arm, `a7c72fd7` on the thinking-on arm.
+
+**Speed**, clean A/B on one suffix (`NINFER_MTP_LOOKUP_MATCH=6`) and one chunk (3072), thinking off:
+
+| context | fp16 V, whole tile | sub-group staging | delta |
+|---|---:|---:|---:|
+| 15.6k, window 2 | 109.4 | 109.3 | 0% |
+| 31.2k, window 2 | 69.0 | 69.1 | 0% |
+| 62.4k, window 2 | 54.5 | **56.4** | **+3.5%** |
+| 62.4k, window 6 | 55.9 | **58.1** | **+3.9%** |
+
+Kept: bit-identical, never worse, and worth 3.5-3.9% exactly where the attention's share of the round is
+largest. At 15.6k the round is weight-dominated and 50% more resident warps change nothing -- the
+opposite of what the occupancy number alone would predict, and consistent with the two earlier results
+in this file (int8 V, and `Bc 16 -> 8`) that more warps are not what this kernel is short of at short
+context.
+
+**Two corrections this measurement forced, both recorded rather than quietly fixed.**
+
+First, the *first* reading of this change looked like **+27% at 15.6k** (86.2 -> 109.3). The arm carried
+`NINFER_MTP_LOOKUP_MATCH=6` while its baseline had been taken at the engine default 16, and the suffix
+alone is worth that much on this fixture -- the clean baseline is 109.4, not 86.2. Every arm here is now
+compared at one suffix and one chunk.
+
+Second, an earlier claim in this file that the decode ceiling is about 103 tok/s was wrong. It was
+computed as "8.15 GiB of weights per token at 900 GB/s", but the verify reads the weights **once per
+round, not once per token**: `vec::kernel<ggml_type=16, int=3, ...>` handles all three verified tokens in
+one call, which is the whole point of speculative decoding. The ceiling is therefore far higher, and
+109.4 tok/s at 15.6k already exceeds the figure that was quoted as a ceiling.
