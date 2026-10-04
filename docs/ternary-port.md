@@ -1902,6 +1902,26 @@ context is the attention, in the 16 full layers; the other 48 are GDN, whose rec
 fixed-size memory. The K and V that attention caches come from this port's own GGUF projections, and
 that is the path to examine.
 
+**And the attention projection is correct.** The parts overload this port added builds
+
+```cpp
+    Tensor* outputs[] = {&q, &gate, &k, &v};
+    ...
+    product.out = outputs[part.output];
+    product.row = part.row;
+```
+
+with coverage limits `output < 2 ? kQRows : kKvRows`, so output 0 is `q`, 1 is `gate`, 2 is `k` and 3 is
+`v` -- exactly the mapping the binder uses (query to 0, gate to 1, key to 2, value to 3). The signature
+is `(x, weights, q, gate, k, v, ...)`, matching the split overload's `(x, query_key, gate_value, q,
+gate, k, v, ...)`, and each part's rows are bounds-checked against its output. So the projection that
+fills the attention's q/gate/k/v, and therefore the KV cache, is right.
+
+That leaves the attention's *use* of the cache -- the append, the positions, the rope phases, the
+softmax -- all of which is shared code that drives the ternary artifact correctly, and none of which
+has been instrumented yet.
+
+
 
 
 
