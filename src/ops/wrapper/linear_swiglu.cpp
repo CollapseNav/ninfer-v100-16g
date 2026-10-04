@@ -121,7 +121,18 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     // and applies silu to the gate half itself, so it neither reads the policy nor the row-split
     // contract the checks below describe.
     if (is_gguf(gate_up_weight.qtype)) {
-        detail::gguf_swiglu(x, gate_up_weight, nullptr, out, ws, stream);
+        // The plain-norm branch the other formats use, reproduced here: the input rmsnorm moved down
+        // into post_mixer -> linear_swiglu, so a GGUF gate/up parent that ignored in_norm would drop
+        // post_attention_norm for the whole layer. Every layer whose artifact stores gate and up in one
+        // object takes this path, so the omission is not cosmetic.
+        Tensor norm_buf;
+        const Tensor* use = &x;
+        if (in_norm != nullptr) {
+            norm_buf = ws.alloc(DType::BF16, {x.ne[0], x.ne[1]});
+            rmsnorm(x, *in_norm, norm_eps, true, norm_buf, stream);
+            use = &norm_buf;
+        }
+        detail::gguf_swiglu(*use, gate_up_weight, nullptr, out, ws, stream);
         return;
     }
     const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4G64_F16S &&
