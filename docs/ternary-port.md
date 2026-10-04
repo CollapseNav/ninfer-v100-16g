@@ -4652,3 +4652,33 @@ gate conditions (non-binding), and the two kernels themselves (sub-group staging
 applied). What is left is not a knob: the vector kernel streams the weights at about 285 GB/s in situ
 while the standalone probe reaches 509-580 with the same access pattern, the same decode and the same
 activation loads, and nothing reproducible in isolation accounts for the difference.
+### The 1.8x chased to ground: it is the attention's KV stream, not the vec kernel (2026-10-04)
+
+The vec kernel streams weights at ~264 GB/s in situ while a standalone probe of its own inner loop reaches
+509-580, and nothing reproducible in isolation explained the gap. The probe was extended to reproduce the
+two conditions it had been missing -- many short launches over many separate tensors, and an
+attention-like KV stream interleaved between them -- using the real per-tensor row counts
+(17408/14336/6144/2048/1024), the real launch rule `min(groups, resident * sm_count)`, the real split
+count at 62.4k, and the kernel's own decode and activation loads:
+
+| variant | time | weight rate |
+|---|---:|---:|
+| H: 80 short launches over 10 tensors | 2.7 ms | **456.8 GB/s** |
+| I: H plus a KV stream (0.26 GB) | 5.1 ms | 243.3 GB/s |
+
+Separating them: the vec launches move 1.25 GB in 2.7 ms (**457 GB/s**), and the KV stream moves 0.26 GB
+in the remaining 2.4 ms (**108 GB/s**). Two conclusions.
+
+**The short-launch and many-tensor penalty is about 10%** -- 457 against 509-580 for one long stream --
+which is real but not the gap.
+
+**The interleaving does not slow the vec kernel down.** Because the launches serialize on one stream, each
+kernel keeps its own rate and the round's aggregate is just the weighted sum. So the KV stream is not
+displacing the weight stream; it is simply four times slower per byte.
+
+**And that is the decode's real inefficiency.** The attention's KV stream runs at 108 GB/s, 12% of DRAM
+peak, which matches both the ncu reading taken earlier (DRAM 16%) and the arithmetic from the deployment
+(2.04 GB of KV in 18.9 ms at 62.4k = 108 GB/s). The weight stream, under equally faithful conditions,
+does 457. So the largest single decode inefficiency is the attention's memory behaviour -- 36% of the
+round at 62.4k -- not the vec kernel, and the sub-group staging change that bought 3.5-3.9% there is
+unlikely to be the end of it.
