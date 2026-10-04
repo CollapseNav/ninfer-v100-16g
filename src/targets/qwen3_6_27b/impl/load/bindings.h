@@ -151,14 +151,17 @@ struct TextLayerPlan {
 };
 
 struct MtpPlan {
-    artifact::ObjectHandle input_projection;
+    // The three linear roles carry their format, like every other weight plan in this tree. They used
+    // to be bare ObjectHandles, which forced the materializer to name one format for both artifacts;
+    // the GGUF profile stores all three as gguf_q6_k and got read as W8G32_F16S.
+    WeightPlan input_projection;
     artifact::ObjectHandle embedding_norm;
     artifact::ObjectHandle hidden_norm;
     artifact::ObjectHandle input_norm;
-    artifact::ObjectHandle query_key_gate_value;
+    WeightPlan query_key_gate_value;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle output;
+    WeightPlan output;
     artifact::ObjectHandle post_attention_norm;
     MlpPlan mlp;
     artifact::ObjectHandle final_norm;
