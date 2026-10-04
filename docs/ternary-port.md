@@ -1779,6 +1779,33 @@ hypothesis is dead. What has not been compared is the delta-net update itself --
 `build_recurrent_attn` against this tree's `gated_delta_net` -- which is now the narrowest open question
 and can be read directly, because the reference is on this machine.
 
+### Correcting the context finding, and what survives of it
+
+The round-20 table compared llama.cpp at `-c 64 --chunks 1` with this port at `--context 64 --stride
+32`, and read the difference as "llama.cpp improves 7x with context, this port does not". **That
+comparison was invalid**: `-c 64 --chunks 1` scores only the first ~63 tokens of the text, the hardest
+part of it with no prefix at all, while `-c 512` scores ~511 tokens with real prefixes. Two different
+measurements of two different spans, not two engines on the same one. The cross-engine claim is
+withdrawn.
+
+**What survives is the within-port comparison**, which needs no other engine:
+
+| context / stride | prefix available | scored per window | PPL |
+|---:|---:|---:|---:|
+| 8 / 4 | 4 tokens | 4 | 10.256 |
+| 64 / 32 | 32 | 32 | 10.691 |
+| 256 / 128 | 128 | 128 | 10.556 |
+
+A 32x longer prefix moves this port's perplexity by 0.3%. The tree's ternary artifact, measured the
+same way, moves from 4.836 to 4.015 -- 17% -- between a 4-token and an 8-token prefix. So within one
+engine, with identical settings, the ternary path uses its prefix and the GGUF path does not.
+
+**And the recurrent update itself is exonerated by construction**: `gated_delta_net` is shared code and
+the ternary artifact drives it correctly. Whatever is wrong is in what this port feeds it -- `q`, `k`,
+`v` and `z` from its own GGUF projections, since `g` and `beta` come from the shared bf16 control
+projections.
+
+
 
 
 
