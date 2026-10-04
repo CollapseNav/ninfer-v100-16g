@@ -2306,7 +2306,8 @@ window would matter, which is what this looks like.
 
 
 
-**Its threshold is between context 320 and 384.** Bisecting:
+**Its threshold was between context 320 and 384, and it is now fixed -- but the table that used to be
+here was wrong twice over.** It recorded
 
 | context | scored width | result |
 |---:|---:|---|
@@ -2316,12 +2317,31 @@ window would matter, which is what this looks like.
 | 384 | 192 | `std::bad_alloc` |
 | 512 | 256 | `std::bad_alloc` |
 
-and the ternary artifact completes 512 with PPL 2.459, so the GPU has the room and the shortfall is in
-one of this port's GGUF profile cases. Every one of those cases delegates to the op's own query
-(`gguf_project_workspace_bytes`, `linear_add_workspace_capacity_bytes`) with the shape the op will see,
-so the shortfall is either a shape this port reports that the op does not actually use, or an
-allocation the op makes beyond its own query. `--log-level trace` names the stage (`scoring … window
-0`) but not the allocation.
+and the 10.5s are not this artifact's perplexity: they are the *before* column of the
+`post_attention_norm` table higher up in this same file, i.e. they were taken before that fix and never
+re-measured. The artifact's real curve is monotone in context and sits **below** the ternary
+artifact's, which is the control that says the ternary path is untouched (its 512 cell is 2.458853
+against the 2.459 this file already recorded):
+
+| context | stride | IQ2_XS | ternary PQ2 |
+|---:|---:|---:|---:|
+| 128 | 64 | 2.741 | -- |
+| 256 | 128 | 2.507 | 2.630 |
+| 288 | 144 | 2.485 | -- |
+| 320 | 160 | 2.454 | 2.570 |
+| 384 | 192 | 2.462 | -- |
+| 512 | 256 | 2.317 | 2.459 |
+| 1024 | 512 | 2.184 | -- |
+| 2048 | 1024 | 2.114 | -- |
+
+`--text ppl_short.txt --stride ctx/2`, int8 KV, one process per point.
+
+The `bad_alloc` cells were a second, independent under-count, and it was in the **causal-score layout**
+rather than in any profile-level query. The analysis that stood here was close but could not land it
+for that reason: every profile-level query was right, and the plan was not calling one of them at all.
+`--log-level trace` naming the stage and not the allocation was the whole difficulty; the arena
+diagnostic that now prints the request, the offset and the capacity is what closed it. See "The
+causal-score layout, and the second under-count" at the end of this file.
 
 
 
@@ -3406,3 +3426,118 @@ already showed.
 
 Prefill is untouched by construction and measured so: 3412 tokens at 1.20k tok/s with the flag off and
 1.21k with it on.
+## The GGUF artifact's MTP: six blockers, and the two that were hiding the payoff (2026-10-04)
+
+`--spec mtp` had never run on the IQ2_XS artifact. It runs now, and the six blockers it took are worth
+recording because five of them are the same disagreement in different clothes: a workspace query, or a
+weight's format, answered for the groupwise artifacts while the execution took the GGUF route.
+
+| # | what broke | how it showed | fix |
+|---|---|---|---|
+| 1 | the MTP/proposal projections called the convenience `ops::linear` overload, which has no workspace | `linear: a GGUF weight needs the workspace overload` | `0e165d8d` |
+| 2 | three MTP workspace queries returned 0 -- written for the groupwise profile | `bad_alloc` while preparing graphs | `83d838c6` |
+| 3 | the MTP queries sized for the vector band (T <= 8, no stream-k fixup plane) while the execution left it | `requested 5242880 B ... > capacity 639552` | `35bd3a04`, and `4ad4cb50` for the lambda that actually produced the 639552 |
+| 4 | the GDN input-projection *leaves* sized for the conv composition only, while the ggml projection runs inside the leaf | the same 5 MiB fixup plane, but against a **stack** arena | `4ad4cb50` |
+| 5 | the MTP block was materialized at a hard-coded `NumericFormat::W8G32_F16S` | ran, and accepted **0 of 126** drafts | `a8cb75e0` |
+| 6 | `mtp_kv_projection` used `ops::linear_pair`, which is W8-only and validates the weights it is handed | `linear_pair: invalid first weight` | `631afd30` |
+
+**The lesson is in where the fixing stopped being about running.** After blockers 1-4, `--spec mtp`
+*worked*: it loaded, it built its graphs, it generated, and its summary printed a draft window and a
+round count. It also accepted nothing and ran 20% slower than not speculating at all (50.6 -> 40.3
+tok/s). "It runs" and "it is worth running" were two separate facts, and the first one hid the second
+for a whole session.
+
+**Blocker 4 needed the diagnostic read differently, not more carefully.** The arena reported
+
+    requested 5242880 B at aligned offset 393216, end 5636096 > capacity 639552, peak 393216
+
+and 639552 matches neither arena the program owns (369 MiB persistent, 1.6 GiB workspace). Printing
+every arena's identity and capacity at construction is what answered it: the failing address was a
+**stack** address, and the only stack `DeviceArena`s on this path are the GDN leaves in
+`qwen3_6_27b/impl/variant.cpp`, built over
+`workspace.alloc_bytes(gdn_{snapshot,record}_workspace_bytes(...))`. Those two helpers sized the leaf
+for the conv composition and stopped there, while the plan-time queries
+`Variant::gdn_input_projection_{snapshot,record}_workspace_capacity_bytes` already add
+`gguf_projection_bytes` for the projection the leaf then runs. The arithmetic names the caller:
+393216 = 12288 x 16 x 2 is the leaf's own projected `[2*key_dim + value_dim, cols]` plane at the MTP
+lookup width of 16, and 639552 is the shape-keyed conv-record query at that width.
+
+**Blocker 5 is the one that cost the session its payoff, and it was invisible because it ran.**
+`MtpPlan` kept bare `ObjectHandle`s for its three linear roles while every other weight plan in this
+tree carries a `WeightPlan` with the artifact's declared `NumericFormat`; the materializer therefore
+had to name one format for both artifacts and named `W8G32_F16S`, which is what the groupwise
+artifacts store. The IQ2_XS artifact declares, per its own v3 bindings:
+
+| binding | object | format | shape |
+|---|---|---|---|
+| `mtp/input_projection` | `weight/000900` | `gguf_q6_k` | [5120, 10240] |
+| `mtp/layer/attention/query_key_gate_value` | `weight/000058` | `gguf_q6_k` | [14336, 5120] |
+| `mtp/layer/attention/output` | `weight/000907` | `gguf_q6_k` | [5120, 6144] |
+
+Reading q6_k blocks as W8G32 row-split is not a small numeric error: the row stride differs (20 blocks
+of 256 values against 160 groups of 32) and so does the scale plane, so every MTP projection returned
+noise. The MTP MLP was unaffected because `MlpPlan` already carried `WeightPlan`s -- which is the shape
+of the bug: the one struct that had been written for a single profile.
+
+### What MTP is worth on this artifact, measured
+
+Same binary, same fixture (`real_task.json`, greedy, `--raw-output`, `--max-context 4096`,
+`--prefill-chunk 4096`, int8 KV), 128 generated tokens:
+
+| arm | IQ2_XS decode | acceptance length | ternary PQ2 decode | acceptance length |
+|---|---:|---:|---:|---:|
+| no speculation | 50.6 | -- | 55.2 | -- |
+| `--spec mtp --draft-tokens 1` | **81.0** (+60%) | 2.10 (89.2%) | 61.0 | 1.57 (57.5%) |
+| `--spec mtp --draft-tokens 3` | **77.5** (+53%) | 2.86 (57.7%) | 49.7 | 2.07 (35.9%) |
+
+The ternary column is unchanged by all six fixes (it measured 55.2 / 61.0 / 49.8 before them), so the
+pair op still carries the PQ2 profile and nothing here traded one artifact for the other.
+
+Two entries in that table are worth stating rather than leaving to be noticed:
+
+* **Window 3 loses to window 1 on the GGUF artifact** (77.5 against 81.0) even though it accepts a
+  longer run (2.86 against 2.10). The verify batch at T = 4 costs more than the extra accepted token
+  returns, the same shape this file already records for the ternary artifact's window sweep. Window 1
+  is the setting here.
+* **The GGUF artifact's acceptance is higher than the ternary artifact's**, and that is not a property
+  of the model: it is the long-verification "lookup" path opting in. `use_lookup` needs a prompt
+  continuation that agrees with the learned MTP proposal for `mtp_draft_count` tokens, and
+  `real_task.json` contains a long repeated passage, so the batch verifies up to
+  `kMtpLookupMaximumDrafts = 15` drafts instead of 1. That is why the summary prints
+  `drafted tokens 74` against `rounds 60` at draft window 1 -- it is not a counter bug. 51 rounds
+  accepted 1 draft each, one round accepted all 15, and 8 rounds accepted none: 15 + 51 = 66 accepted
+  and 15 + 51 + 8 = 74 drafted. `accepted by pos` for that run reads
+  `52,1,1,1,1,1,1,1,1,1,1,1,1,1,1`, which is exactly one 15-accept round plus 51 single-accept rounds.
+
+### The causal-score layout, and the second under-count
+
+The perplexity tool's `bad_alloc` above context 320 was not the arena being too small for the plan --
+the arena *was* the plan, 524,300,800 bytes. It was the **causal-score layout** being sized for the
+wrong output head:
+
+    BF16 [248320, 1024] logits        508,559,360
+    I32  [1024]                             4,096
+    FP32 [1024]                             4,096
+    ternary rotation [5120, 1024]        15,733,248
+                                       -----------
+                                       524,300,800   <- exactly the observed capacity
+
+That is the folded-ternary head's needs and nothing else. On a GGUF artifact `ops::linear` runs the ggml
+route inside that same scope, and the flush scope asks for, in order:
+
+    T = 384   requested 380,426,240 B   the FP32 [248320, 383] plane (362 MiB)
+    T = 320   requested 134,217,728 B   the fp16 route's double-buffered dequantize scratch (128 MiB)
+
+The second is why the threshold moved from 384 to 320 without anyone touching this code: the fp16
+prefill route's gate opens at T >= 256 and `scratch_allocation_bytes()` doubles from 64 MiB to 128 MiB
+there (`e451af46`). So the failure this file recorded as "context >= 384" had quietly become ">= 320".
+
+The fix asks the op's own question instead of adding two terms by hand: a new profile-keyed
+`Variant::output_head_workspace_capacity_bytes`, asked for the width the scoring purpose actually uses
+(`kCausalScoreTile`). It subsumes the rotation buffer the ternary port had reserved by hand, so both
+profiles now go through one path, and the 35B target gets the same method -- its head is a fixed
+`Q6G64_F16S` object and its query returns the zero that format needs.
+
+The pattern is three for three in this port. Every one of these failures was a query that answered for
+one profile while the execution took another, and in every case the op's own
+`*_workspace_capacity_bytes` was already right -- the plan simply was not calling it.
