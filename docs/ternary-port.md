@@ -3727,3 +3727,58 @@ Two consequences worth stating plainly. First, DFlash2 is a **port project, not 
 the weights is a few minutes, and then every stub above has to become a real Volta kernel. Second, it
 is the same class of work as the long-context attention lever at the end of this file, and for the same
 reason -- Volta has no `cp.async` and no bf16 MMA, so each one is a rewrite rather than a recompile.
+## The lookup gate: a workload parameter, and where an agent turn's time actually goes (2026-10-04)
+
+The lead was that the long-verification lookup path is worth 1.9x over plain prose when it fires, and
+that the deployment's agent traffic is repetitive, so loosening its gate might convert ordinary traffic
+into that regime. The gate is three conditions in `mtp_batch` (`program_impl.h`):
+
+* `lookup_draft(sequence.ledger)` finds an **exact verbatim repeat of the last 16 tokens** earlier in
+  the ledger (preferring the nearest occurrence), and returns the 15 tokens that followed it;
+* the lookup's first `mtp_draft_count` tokens equal the MTP drafts;
+* the remaining budget/context allows more than `draft_window` drafts.
+
+`NINFER_MTP_LOOKUP_TRACE=1` now logs that decision per round, and it named the binding condition
+immediately: on explain/summarise traffic the failure is **`found=0` in every round at every match
+length** -- the generated tail contains no verbatim repeat of anything earlier, and no match length can
+fix that. The MTP-agreement half never rejected a found continuation in any run, so relaxing it would
+buy nothing. That falsifies the hypothesis above for explain traffic: an agent turn's *explaining* is
+not repetitive at the token level even when its *prompt* is.
+
+### Where it does fire, and what the suffix length is worth
+
+Controlled: the greedy output is byte-identical in every cell, so only the draft structure moves.
+Ternary artifact, window 2, `--lm-head-draft`, 128 greedy tokens:
+
+| fixture | m=16 | m=12 | m=8 | m=6 | m=5 | m=4 | m=3 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| re-emit the CUDA source verbatim | 174.9 | -- | 208.8 | 210.0 | 210.8 | -- | 187.3 |
+| medium (water cycle, repeated) | 79.2 | 85.1 | 88.0 | 91.8 | 91.9 | 91.6 | 89.3 |
+| prose4k (port notes, repeated) | 69.3 | 69.9 | 71.0 | 75.4 | 75.5 | 74.0 | 79.4 |
+| real_long (summarise kernels) | 60.7 | 60.7 | 60.8 | 60.6 | 60.7 | 60.8 | 60.7 |
+| real_code (explain a kernel) | 62.2 | 62.1 | 62.1 | 62.1 | 61.8 | 61.3 | 61.3 |
+
+Repeat runs of the contested cells agree to 0.5-0.8% (`medium` 79.2/78.4 and 91.8/91.2, `prose4k`
+69.3/69.2 and 75.4/75.3, copying 210.0/210.8), and the acceptance length on the copying fixture goes
+9.07 -> 12.70. So: **+9 to +20% wherever the generated tail re-emits the prompt, plateau at 5-8, and
+exactly flat on explain traffic.**
+
+The absolute numbers are the more interesting result. On the *same* 10k-token CUDA source, "summarise
+these kernels" decodes at 60-62 tok/s and "re-emit the first kernel verbatim" decodes at **175-211** --
+a 3x gap inside one workload, decided entirely by whether the model is copying or explaining. That is
+where an agent turn's time goes, and it is the reason the lookup path is worth caring about at all.
+
+### Why the default stays 16
+
+On a reasoning-heavy request -- 10k-token prompt, 640 generated tokens, every one of them a reasoning
+token, through the resident server, one match value per start -- the same binary gives **90.9 (m=16),
+60.3 (m=12) and 68.5 (m=6) tok/s**. Repeats are exact within an arm (91.0/90.9 and 68.5/68.3), so it is
+not noise, and three values that do not order are not a gate effect either: changing the match sends the
+request down a **different token trajectory**, because a lookup hit changes the verify batch width and
+this file already records that the verify path is not bit-exact against T=1 ("Bit-exactness: an in-tree
+claim that does not hold here"). That workload is the deployment's dominant one, so taking the lottery
+is not worth +20% on the copying phases.
+
+The knob and the trace are kept, because the value is a workload parameter in exactly the way the draft
+window is: `NINFER_MTP_LOOKUP_MATCH=6` for copying-dominated traffic, where the gain is measured with
+identical output, and 16 otherwise. This is the same conclusion the window reached, from the other side.

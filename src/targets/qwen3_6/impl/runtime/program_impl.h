@@ -602,11 +602,57 @@ schedule::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32
     return out;
 }
 
+// The suffix length the ledger lookup demands before it will call an earlier occurrence evidence.
+// 16 is the shipped value. It is a WORKLOAD PARAMETER, like the draft window, and the measurement that
+// says so has two halves.
+//
+// Controlled -- the greedy output is byte-identical in every cell, so only the draft structure moves.
+// Ternary artifact, window 2, --lm-head-draft, 128 greedy tokens:
+//
+//   fixture                           m=16   m=12   m=8    m=6    m=5    m=4    m=3
+//   re-emit the CUDA source verbatim  174.9   --   208.8  210.0  210.8   --   187.3   (accept 9.07 -> 12.70)
+//   medium (water cycle, repeated)     79.2  85.1   88.0   91.8   91.9  91.6   89.3
+//   prose4k (port notes, repeated)     69.3  69.9   71.0   75.4   75.5  74.0   79.4
+//   real_long (summarise kernels)      60.7  60.7   60.8   60.6   60.7  60.8   60.7
+//   real_code (explain a kernel)       62.2  62.1   62.1   62.1   61.8  61.3   61.3
+//
+// So a shorter match is worth +9 to +20% wherever the generated tail re-emits the prompt, the plateau is
+// 5-8, and it is exactly flat on explain/summarise traffic -- there the binding condition is `found=0`,
+// no verbatim repeat at all, which no match length can fix. The MTP-agreement half of the gate never
+// rejected a found continuation in any run, so relaxing it would buy nothing.
+//
+// NOT controlled, and the reason 16 stays the default: on a reasoning-heavy request (10k-token prompt,
+// 640 generated tokens, every one of them a reasoning token) the same resident server, one value per
+// start, gives 90.9 (m=16), 60.3 (m=12) and 68.5 (m=6) tok/s. Repeats are exact within an arm (91.0/90.9,
+// 68.5/68.3), so it is not noise -- it is that changing the match sends the request down a different
+// token trajectory, because the lookup changes the verify batch width and this tree's verify path is not
+// bit-exact against T=1 (see "Bit-exactness: an in-tree claim that does not hold here"). Three values
+// that do not order are trajectory selection, not a gate effect, and that workload is the deployment's
+// dominant one. `NINFER_MTP_LOOKUP_MATCH=6` is there for copying-dominated traffic, where the +20% is
+// measured with identical output.
+//
+// `NINFER_MTP_LOOKUP_TRACE=1` logs the per-round gate decision (found / agree / extent), which is what
+// named the binding condition.
+std::size_t lookup_match_tokens() {
+    static const std::size_t value = [] {
+        const char* env = std::getenv("NINFER_MTP_LOOKUP_MATCH");
+        if (env == nullptr) { return std::size_t(16); }
+        const long n = std::strtol(env, nullptr, 10);
+        return (n >= 2 && n <= 64) ? static_cast<std::size_t>(n) : std::size_t(16);
+    }();
+    return value;
+}
+
+bool lookup_trace_enabled() {
+    static const bool value = std::getenv("NINFER_MTP_LOOKUP_TRACE") != nullptr;
+    return value;
+}
+
 std::optional<std::array<TokenId, qwen3_6::kMtpLookupMaximumDrafts>>
 lookup_draft(const std::vector<TokenId>& history) {
     // A fixed long suffix avoids treating incidental short repetitions as evidence. Prefer the
     // nearest prior occurrence so repeated edits and quotations follow the freshest context.
-    constexpr std::size_t match  = 16;
+    const std::size_t match  = lookup_match_tokens();
     constexpr std::size_t extent = qwen3_6::kMtpLookupMaximumDrafts;
     if (history.size() <= match) { return std::nullopt; }
 
@@ -12012,6 +12058,14 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                        found->begin() +
                            static_cast<std::ptrdiff_t>(sequence.mtp_draft_count),
                        sequence.mtp_drafts.begin());
+        if (lookup_trace_enabled()) {
+            std::fprintf(stderr,
+                         "[LK] row=%zu ledger=%zu found=%d mtp_count=%u extent=%u draft_window=%u "
+                         "agree=%d fire=%d\n",
+                         row, sequence.ledger.size(), found ? 1 : 0, sequence.mtp_draft_count,
+                         max_lookup_extent, draft_window, agrees_with_mtp ? 1 : 0,
+                         (agrees_with_mtp && max_lookup_extent > draft_window) ? 1 : 0);
+        }
         if (!agrees_with_mtp || max_lookup_extent <= draft_window) {
             use_lookup = false;
         } else {
