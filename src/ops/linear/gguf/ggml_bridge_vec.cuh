@@ -22,7 +22,11 @@ inline constexpr bool kVecStaticK =
     type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XS ||
     type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K;
 
-inline constexpr int kVecWarps = 4;
+// Warps per block. Every block copies the whole grid table into shared before it starts, so the block
+// count sets that overhead: at 4 warps a 640-block launch reads 2.6 MB of table against the 7.6 MB of
+// weights the same launch streams. Resident blocks scale inversely with block size at a fixed register
+// count, so 8 warps keeps the same warps per SM while halving the table traffic and the barriers.
+inline constexpr int kVecWarps = 8;
 
 namespace vec {
 

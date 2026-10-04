@@ -4317,3 +4317,28 @@ on bandwidth, and the inner loop currently issues four small scattered loads (2 
 the grid index, 4 and 4 for the two quant words) and cannot start its table lookup until all four land.
 Doing it without adding register pressure is the difficulty, and it is an inner-loop rewrite rather than
 a constant.
+### The vec kernel's block size: 8 warps halves the grid table's overhead (2026-10-04, kept)
+
+Every block copies the whole IQ2_XS grid table -- 1024 words, 4 KB -- into shared memory before it
+starts. At `kVecWarps = 4` a 640-block launch therefore reads **2.6 MB of table against the 7.6 MB of
+weights** that same launch streams: a third again on the memory side, plus one barrier per block. It is
+L2-resident, so it is not DRAM traffic, but it is L1/L2 traffic and it is issued by every block.
+
+Resident blocks scale inversely with block size at a fixed register count -- at 64 registers per thread
+the SM holds either 8 blocks of 4 warps or 4 blocks of 8 warps, both 32 warps -- so doubling the warps
+per block halves the table traffic and the barrier count at unchanged occupancy.
+
+Measured, bit-identical in every arm (same md5s):
+
+| context | `kVecWarps = 4` | **`kVecWarps = 8`** | `kVecWarps = 16` |
+|---|---:|---:|---:|
+| 15.6k | 109.4 | **109.7** | -- |
+| 31.2k | 69.0 | **69.3 / 69.4** | 66.4 |
+| 62.4k | 54.5 | **57.0 / 56.8 / 56.8** | 54.7 |
+
+Sixteen warps is 3.7-3.8% *worse* -- two blocks per SM is too few to fill the machine -- so eight is the
+optimum. Registers stay at 64 with `LOCAL:0`.
+
+The shape is odd for a per-launch overhead: 4.2-4.6% at 62.4k against 0.3-0.5% at short context. The
+likely reason is that at long context the attention is also streaming its KV through L2, so halving the
+table's L2 traffic is worth more exactly where the other term is busiest.
