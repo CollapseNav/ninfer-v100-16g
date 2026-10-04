@@ -125,4 +125,25 @@ void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, 
                      const std::int32_t* row_ids, int rows, float* out,
                      std::int64_t out_row_stride, cudaStream_t stream);
 
+// And in FP16, because that is the only 16-bit type Volta has tensor cores for: measured on this card,
+// a cuBLAS BF16 GEMM at this model's projection shapes runs at ~10 TFLOP/s while the same call in FP16
+// reaches 83-104. The dequantizer was already templated on its destination type, so this is only a new
+// entry point.
+void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
+                     const std::int32_t* row_ids, int rows, __nv_half* out,
+                     std::int64_t out_row_stride, cudaStream_t stream);
+
+// dst[i] = float(src[i]) as FP16. Needed because the activation arrives in BF16 and cuBLAS wants both
+// GEMM operands in the same type, and because converting once per call is far cheaper than per product.
+void convert_bf16_to_f16(const __nv_bfloat16* src, __nv_half* dst, std::size_t count,
+                         cudaStream_t stream);
+
+// The same dequantize-and-GEMM as dequantized_product, but into FP16 so the GEMM lands on Volta's
+// tensor cores. This is the arm that measured faster than the integer mmq path on all ten of this
+// artifact's block formats (1.15x to 3.76x at T = 512), including the ones mmq is good at.
+void dequantized_product_f16(GgmlType type, const void* weight, std::int64_t row_bytes, int rows,
+                             int k, const __nv_half* x, int columns, float* out,
+                             std::int64_t out_column_stride, void* scratch,
+                             std::size_t scratch_bytes, cudaStream_t stream);
+
 } // namespace ninfer::ops::gguf

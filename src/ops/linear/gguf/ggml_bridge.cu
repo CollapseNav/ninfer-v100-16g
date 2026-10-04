@@ -508,4 +508,56 @@ void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, 
                                 stream);
 }
 
+void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
+                     const std::int32_t* row_ids, int rows, __nv_half* out,
+                     std::int64_t out_row_stride, cudaStream_t stream) {
+    detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
+                                stream);
+}
+
+namespace {
+
+__global__ void convert_bf16_to_f16_kernel(const __nv_bfloat16* __restrict__ src,
+                                           __nv_half* __restrict__ dst, std::size_t count) {
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) { dst[i] = __float2half(static_cast<float>(src[i])); }
+}
+
+} // namespace
+
+void convert_bf16_to_f16(const __nv_bfloat16* src, __nv_half* dst, std::size_t count,
+                         cudaStream_t stream) {
+    if (count == 0) { return; }
+    constexpr int kThreads = 256;
+    const auto blocks = static_cast<unsigned>((count + kThreads - 1) / kThreads);
+    convert_bf16_to_f16_kernel<<<blocks, kThreads, 0, stream>>>(src, dst, count);
+}
+
+void dequantized_product_f16(GgmlType type, const void* weight, std::int64_t row_bytes, int rows,
+                             int k, const __nv_half* x, int columns, float* out,
+                             std::int64_t out_column_stride, void* scratch,
+                             std::size_t scratch_bytes, cudaStream_t stream) {
+    const int pass = dequantized_rows_per_pass(k, scratch_bytes);
+    if (pass <= 0) { throw std::invalid_argument("gguf fp16 product: scratch too small"); }
+    cublasHandle_t blas = detail::blas_handle();
+    if (cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("gguf: cublasSetStream failed");
+    }
+    auto* rows_h      = static_cast<__nv_half*>(scratch);
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    for (int first = 0; first < rows; first += pass) {
+        const int count = std::min(pass, rows - first);
+        dequantize_rows(type, static_cast<const char*>(weight) + first * row_bytes, row_bytes, k,
+                        nullptr, count, rows_h, k, stream);
+        const cublasStatus_t status = cublasGemmEx(
+            blas, CUBLAS_OP_T, CUBLAS_OP_N, count, columns, k, &alpha, rows_h, CUDA_R_16F, k, x,
+            CUDA_R_16F, k, &beta, out + first, CUDA_R_32F, static_cast<int>(out_column_stride),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            throw std::runtime_error("gguf fp16 product: cublasGemmEx failed");
+        }
+    }
+}
+
 } // namespace ninfer::ops::gguf
