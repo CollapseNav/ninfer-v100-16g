@@ -4598,3 +4598,57 @@ non-proposal path, so both dump files begin with the same main-logits lines.
 deployed LM-head drafter is twice as good anyway (2.50 against 1.25), so this avenue is closed.** It is
 recorded as unresolved rather than guessed at. The `uses` table is the fastest way to check a projection's
 contract and is worth reaching for first next time.
+### Decode/MTP: the knob surface measured to the end (2026-10-04)
+
+Following the prefill's roofline result, the focus went back to decode and MTP, and the remaining knobs
+were swept to completion. Three of them were new.
+
+**The draft window is capped at 7, so the matrix route is unreachable.** `--draft-tokens` is validated to
+`1..7`, and the GGUF route switches from the vector kernel to `mmq` above `kMaxVectorColumns = 8` columns.
+The decode's verify is `draft_tokens + 1`, so every window the CLI accepts stays inside the vector
+kernel, and the only way to reach `mmq` is the lookup's 16-wide verify. The window curve is monotone and
+steep:
+
+| window | 31.2k decode | acceptance |
+|---:|---:|---:|
+| **2 (shipped)** | **69.3** | 2.50 |
+| 4 | 52.7 | 3.50 |
+| 6 | 36.1 | 4.50 |
+| 8, 12 | rejected by validation | -- |
+
+Each extra draft token costs about 13% of the rate and buys only 0.5 of acceptance.
+
+**The lookup suffix's lower end is worse.** The gate admits 2..64 and only 6 and 16 had been measured:
+
+| suffix | 31.2k decode | acceptance | copying fixture |
+|---:|---:|---:|---:|
+| 2 | 34.5 | 3.50 | 133.4 |
+| 3 | 34.5 | 3.50 | -- |
+| 4 | 69.3 | 2.50 | 157.2 |
+| **6 (shipped)** | **69.3** | 2.50 | **166.9** |
+| 16 | 69.0 | 2.50 | 166.9 |
+
+Suffixes 2 and 3 do fire the lookup on prose and do raise the acceptance to 3.50 -- and halve the rate,
+because a lookup round verifies 16 columns through `mmq` and costs about 2.5x an ordinary round. It only
+pays when the repeat is long: on the copying fixture, where the acceptance reaches 12.7, suffix 6 is the
+best of the set. Suffix 6 is confirmed.
+
+**The matrix route is not a lever.** Lowering `kMaxVectorColumns` from 8 to 2 puts the decode's T=3
+verify on `mmq`, which is the regime that had never been measured:
+
+| context | vector route (shipped) | matrix route |
+|---|---:|---:|
+| 15.6k | 109.7 | **59.7** |
+| 31.2k | 69.3 | **32.5** |
+| 62.4k | 57.0 | **29.3** |
+
+About twice as slow, with byte-identical output -- so this is a pure kernel-cost difference and the
+vector kernel is the right route for the decode. Reverted.
+
+**Where that leaves decode and MTP.** Every knob is now measured: the draft window (2), the lookup
+suffix (6), the drafter (the LM head; the proposal head is broken and does not fit), the route
+threshold (vector), the KV dtype (int8), the prefill chunk (3072, memory-capped), the lookup's other
+gate conditions (non-binding), and the two kernels themselves (sub-group staging and 8 warps, both
+applied). What is left is not a knob: the vector kernel streams the weights at about 285 GB/s in situ
+while the standalone probe reaches 509-580 with the same access pattern, the same decode and the same
+activation loads, and nothing reproducible in isolation accounts for the difference.
