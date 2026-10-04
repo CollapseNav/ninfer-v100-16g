@@ -1761,6 +1761,25 @@ exonerated because int8 and bf16 produced identical text. That test only ruled o
 So the fault is in the GGUF attention path -- and the K and V that path caches are written by this
 port's own GGUF projections, which is where to look next.
 
+### llama.cpp's own Qwen3.5 GDN source is now the reference
+
+Building llama.cpp from source also brought its `src/models/qwen35.cpp` onto this machine, which is a
+line-by-line reference for exactly the layer type under suspicion. Checking this port against it:
+
+| | llama.cpp | this tree | |
+|---|---|---|---|
+| q/k/v layout | `ggml_view_4d(..., head_k_dim, num_k_heads, tokens, seqs)` = `[dim][head]` | `{gdn_k_dim, gdn_k_heads, T}` | agree |
+| qkv row order | q at 0, k at `head_k_dim*num_k_heads`, v at `row_size(2*head_k_dim*num_k_heads)` = `[q\|k\|v]` | `[q\|k\|v]` | agree |
+| beta | `sigmoid(ssm_beta . x)` | the shared gating op | agree |
+| gate | `softplus(alpha + ssm_dt) * ssm_a`, `ssm_a = -exp(a_log)` | same | agree |
+| q/k normalisation | `build_gdn_l2_norm` | `normalize_qk = true` | agree |
+
+so the layout, the row order and the gating arithmetic all match, and the "GDN q/k/v are transposed"
+hypothesis is dead. What has not been compared is the delta-net update itself -- llama.cpp's
+`build_recurrent_attn` against this tree's `gated_delta_net` -- which is now the narrowest open question
+and can be read directly, because the reference is on this machine.
+
+
 
 
 
