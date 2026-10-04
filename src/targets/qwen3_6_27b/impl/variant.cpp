@@ -765,6 +765,35 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
 }
 
+std::size_t Variant::output_head_workspace_capacity_bytes(WeightsProfile weights_profile,
+                                                          std::int32_t first,
+                                                          std::int32_t last) {
+    validate_token_interval(first, last);
+    switch (weights_profile) {
+    case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseInt:
+        // The folded (rotated-basis) output head maps the activation into the rotated basis from the
+        // caller's workspace, and the wide ternary route may also dequantize a weight chunk. Both are
+        // in this query; the plan used to reserve only the rotation buffer by hand.
+        return ops::linear_workspace_capacity_bytes(QType::PQ2_0_G128, TextConfig::output_rows,
+                                                    TextConfig::hidden,
+                                                    ops::LinearPolicy::A16Only, first, last);
+    case WeightsProfile::Qwen36Nvfp4:
+        return ops::linear_workspace_capacity_bytes(QType::NVFP4, TextConfig::output_rows,
+                                                    TextConfig::hidden, kNvfp4TextPolicy, first,
+                                                    last);
+    case WeightsProfile::Qwen38Nvfp4:
+        return ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
+                                                    TextConfig::output_rows, TextConfig::hidden,
+                                                    kFp8TextPolicy, first, last);
+    case WeightsProfile::Qwen38GgufMixed:
+        // One part: the artifact stores the head as a single gguf_iq4_xs object, and the ggml route
+        // needs an FP32 [248320, T] plane because this leaf hands it a BF16 destination.
+        return gguf_projection_bytes(TextConfig::output_rows, first, last, 1);
+    }
+    throw std::logic_error("invalid 27B weights profile");
+}
+
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                              std::int32_t last) {
     validate_token_interval(first, last);

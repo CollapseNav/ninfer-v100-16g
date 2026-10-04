@@ -424,12 +424,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
-        // Ternary port: the folded output-head linear maps the activation through the Hadamard
-        // basis from the same workspace (ternary_rotation_workspace_bytes). Without this the
-        // first scored window dies with bad_alloc out of DeviceArena::alloc, because the
-        // output-head linear now needs a [hidden, tile] rotation buffer it cannot get.
-        scratch(causal_score, ops::detail::ternary_rotation_workspace_bytes(
-                                  TextConfig::hidden, static_cast<std::int32_t>(kCausalScoreTile)));
+        // The output head is projected over the whole tile in one call here, so this scope owns the
+        // projection's transient -- and on a GGUF artifact that is not the folded-ternary rotation
+        // buffer the ternary port reserved by hand: it is an FP32 [248320, T] plane (362 MiB at
+        // T = 384), the 128 MiB fp16-route double-buffer scratch, the stream-k fixup plane and the
+        // quantized activation. Asking the profile-keyed query is what keeps this from drifting out
+        // of step with the op again; it also covers the rotation buffer, for every profile.
+        scratch(causal_score, Variant::output_head_workspace_capacity_bytes(
+                                  plan.weights_profile, 1,
+                                  static_cast<std::int32_t>(kCausalScoreTile)));
         out.causal_score = finish(causal_score);
     }
 

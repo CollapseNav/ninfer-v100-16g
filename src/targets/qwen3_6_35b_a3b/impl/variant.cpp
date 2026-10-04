@@ -340,6 +340,15 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
                                                               TextConfig::hidden, first, last);
 }
 
+std::size_t Variant::output_head_workspace_capacity_bytes(WeightsProfile, std::int32_t first,
+                                                          std::int32_t last) {
+    // One fixed format on this target: text/output_head is Q6G64_F16S over a 2048-wide hidden, and
+    // that route decodes inside its kernel and asks for no workspace. The query is still the op's.
+    return ops::linear_workspace_capacity_bytes(QType::Q6G64_F16S, TextConfig::output_rows,
+                                                TextConfig::hidden, ops::LinearPolicy::A16Only,
+                                                first, last);
+}
+
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6::TextPhase,
                                                          std::int32_t first, std::int32_t last) {
     return std::max(
