@@ -3679,3 +3679,50 @@ numbers and neither is a constant to sweep: raise the resident CTA count (the sh
 what limits it), or stop re-reading the whole window per verify column. The second is the same idea
 this file's verify-band section already identified for the weights -- "how the weight is shared across
 the token dimension inside the kernel is the difference" -- applied to the KV.
+## DFlash2: the drafter exists, the sm_70 port does not (2026-10-04)
+
+Asked whether a DFlash drafter is available for this model, since the artifact in hand is MTP-only.
+Two separate answers, and it is worth keeping them apart.
+
+**The weights exist, in this family, in this container format.** Neither local artifact carries a
+DFlash2 bundle (`swift15_iq2xs_mtp.ninfer`: 0 dflash bindings; `bonsai2_27b_swift_pq2.ninfer`: 0
+occurrences of the string), and neither does the 39.8 GB Flash-Next GGUF, whose separate
+`mtp-q2_0.gguf` head is MTP with hyper-connections. But upstream:
+
+| what | where | notes |
+|---|---|---|
+| DFlash2 drafter GGUF, Qwen3.8-27B | [`z-lab/Qwen3.8-27B-DFlash2-GGUF`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) | BF16 / Q4_K_M / Q8_0, 503k downloads, tagged `draft-model` |
+| **ninfer-v3 container with dflash2** | `WaveCut/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-DFlash2-ninfer-v3.ninfer` | tagged `ninfer`, `groupwise-int`, `dflash2`, rtx-3090/4090/5090 -- i.e. the profile this tree's ternary artifact runs, in the v3 container this tree reads |
+| ninfer-v3 + dflash2, NVFP4 | `kaushikvira/Qwen3.8-27B-swift15-nvfp4full-dflash2-NInfer-v3` | tagged `blackwell`, `w4a4` |
+| DFlash2 drafter for the Ternary-Bonsai family | `ProCreations/Ternary-Bonsai-2-27B-DFlash2` | plain GGUF (Q8_0), not a `.ninfer` |
+
+So "there is no DFlash model" is not the blocker. (HuggingFace is not reachable from this host; the
+listing above came from `hf-mirror.com`'s API, which is.)
+
+**The blocker is the Volta port, and it is already scoped in this tree.** `src/ops/dflash2_sm70_stub.cu`
+exists precisely because upstream's DFlash2 kernels are sm_80+ (cp.async, bf16 mma, `__reduce_*_sync`),
+and its comment names the remaining work "plan P2-P4". What is compiled for sm_70 today:
+
+* `dynamic_grouped_conv/volta/dflash2_dynamic_conv_volta.cu`
+* `attn_input_proj/w8/w8_dflash2_attn_input_volta.cu`
+* `linear_topk/dflash2_linear_topk_volta.cu`
+* `candidate_selector/bf16/dflash2_selector_volta.cu`
+* `common/dflash2_rmsnorm_rope_volta.cu`
+
+and what still throws if reached:
+
+* `dynamic_grouped_conv_prepare_partial` / `_reduce`, `w8_dynamic_grouped_conv_add_materialized`
+* `context_kv_materialize`
+* `w8_feature_small_t` / `w8_feature_r16_c64` / `w8_feature_r32_c64`
+* `rmsnorm_rope_pair` / `rmsnorm_rope_single`
+
+The probe that was written for this (`dflash2_probe.sh`, 2026-10-03) never got past the first gate --
+`--spec dflash2` on the ternary artifact stops at *"DFlash2 was selected but the artifact has no DFlash2
+weight bundle"*, and `--spec dflash` (v1) at *"selected masked draft backend is not supported by this
+target"*, because this target's masked-draft backend is DFlash2. So the port's completeness is still
+unmeasured: nothing has ever executed a DFlash2 kernel here.
+
+Two consequences worth stating plainly. First, DFlash2 is a **port project, not a download**: getting
+the weights is a few minutes, and then every stub above has to become a real Volta kernel. Second, it
+is the same class of work as the long-context attention lever at the end of this file, and for the same
+reason -- Volta has no `cp.async` and no bf16 MMA, so each one is a rewrite rather than a recompile.
