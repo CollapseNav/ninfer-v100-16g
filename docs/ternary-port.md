@@ -3791,9 +3791,13 @@ container:
     bash /root/serve_start.sh 1        # window 1
     bash /root/serve_start.sh 2 6      # window 2, suffix 6 -- copying/re-emission heavy traffic
 
-**A rebuilt binary needs that script, not `docker restart`.** The executable is bind-mounted from
-`/root/ninfer-v100`, so a running process keeps the old image of the file until it is re-exec'd, and a
-container that predates the build will happily keep serving the old one. The reliable check is to compare
-the process start against the binary's mtime, and the reliable proof is behavioural: this deployment's
-11,348-token copying request is deterministic per configuration, `mtp accepted 466/604` at suffix 16 and
-`402/688` at 6, so the counters say which build is actually serving.
+**A rebuilt binary needs the container restarted -- any restart.** The executable is bind-mounted from
+`/root/ninfer-v100`, so a running process keeps the old image of the file until it is re-exec'd; a
+container that predates the build will happily keep serving the old one, which is a real way to spend an
+afternoon on a fix that is already on disk. `docker restart ninfer-serve` is enough to pick the new build
+up; this script recreates the container, which additionally guarantees the parameters match the script
+rather than whatever the container was born with.
+
+The check is the process start against the binary's mtime, and the proof is behavioural: this
+deployment's 11,348-token copying request is deterministic per configuration, `mtp accepted 466/604` at
+suffix 16 and `402/688` at 6, so the counters say which build is actually serving.
