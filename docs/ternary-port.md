@@ -4559,3 +4559,42 @@ non-proposal path, so this is pre-existing; any use of it needs `--no-cuda-graph
 And a check that came back negative: `gguf_iq4_xs` is not an untested corner. The artifact uses it for
 twelve tensors including the output head and several MLP projections, so its decode path is exercised on
 every token and cannot be the reason the proposal head drafts badly.
+### Draft quality: the proposal head is broken on this artifact, and the artifact says the engine calls it right (2026-10-04)
+
+The v3 container carries a `uses` table that declares, per parameter, which tensor feeds it and which
+activation policy it wants. For the proposal head it reads:
+
+```
+{"parameter": "proposal/head", "input": "mtp/final_hidden", "activation_policy": "A16Only"}
+```
+
+which is exactly what `proposal_argmax` does -- the same normalized MTP hidden the LM head gets, and the
+same `A16Only` policy. Everything else about the path checks out too: the tensor is a real
+131072 x 5120 `gguf_iq4_xs` object, the id map is 131072 distinct entries in [0, 248076] read at the
+correct (data-section-relative) offset, the argmax covers all 131072 slots, and `proposal_remap_token_ids`
+maps the winner through the table. `gguf_iq4_xs` is not an untested corner either: twelve tensors use it,
+including the output head, so its decode path runs on every token.
+
+**Its logits are nonetheless degenerate.** Dumping the proposal logits' own argmax shows the winning
+value at 1e6 to 5e7 on ten of fourteen calls, against the LM head's ~20-26, with four calls landing in
+the sane range. The huge slots differ between two different prompts, so this is not stale scratch
+repeating the same addresses. Two experiments then came back empty:
+
+* **Changing the input changes nothing.** Three candidates were wired to the same call site -- the final
+  norm output (what it gets now), the residual stream before that norm, and the post-attention norm
+  output -- and all three gave an acceptance of 1.25 to three significant figures, which is itself
+  consistent with logits that barely depend on the hidden.
+* **Reserving the linear's transient changes nothing.** `proposal_scratch` reserved only the 131072 x 1
+  logits matrix and not the `ops::linear` transient, which is the missing-reservation pattern that has
+  bitten this file twice already (the GDN leaf and the causal-score layout), so that was added -- the
+  draft head is 131072 rows against the output head's 248320 on the same route, which bounds it. No
+  change.
+
+One reading of an earlier dump suggested the proposal buffer was holding the LM head's values, which
+would have meant aliasing. That was a misreading: `dump_logits_argmax` is also called on the
+non-proposal path, so both dump files begin with the same main-logits lines.
+
+**Conclusion: the head is unusable on this requantized artifact, the mechanism was not found, and the
+deployed LM-head drafter is twice as good anyway (2.50 against 1.25), so this avenue is closed.** It is
+recorded as unresolved rather than guessed at. The `uses` table is the fastest way to check a projection's
+contract and is worth reaching for first next time.
