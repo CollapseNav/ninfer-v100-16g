@@ -1088,6 +1088,11 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    // NINFER_DUMP_RECURRENT: sampled AFTER the update, on the two quantities the layer actually hands
+    // downstream -- `o`, the recurrent output the gated norm consumes, and `on`, what it produces.
+    // If `on` does not move from step to step, the layer is not using its state at all, which is what
+    // "the model does not use its prefix" would look like at the source.
+    dump_recurrent_state(gidx, -2, -2, o, on, s);
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }

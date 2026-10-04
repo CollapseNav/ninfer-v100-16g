@@ -1856,6 +1856,32 @@ gating arithmetic match llama.cpp. What is still unexplained is why the prefix d
 output -- and the probe cannot settle it, because it never sees the post-update state or the value the
 layer hands downstream.
 
+### The layer's downstream output moves too
+
+The probe was extended to sample, after the update, the two quantities the layer actually hands on:
+`o`, the recurrent output the gated norm consumes, and `on`, what it produces. Both move every step:
+
+```
+layer=0  o  : 27.8  65.2  50.3  52.2  57.0  55.0  54.4  58.1  57.9
+layer=0  on : 3.79  22.4 -7.77 -5.56 -2.88  6.09 -0.62 -3.35 -5.67
+```
+
+So the GDN layer responds to its input, its state evolves, its decay is right, and its layout, row
+order and gating arithmetic match llama.cpp's. **The GDN path looks healthy end to end**, which leaves
+the prefix result unexplained rather than localized.
+
+Worth recording as a caveat on that result: this port's perplexity report describes itself as
+"fixed-window **truncated-context** causal perplexity", so the windows may be more independent than the
+name `--context` suggests. The ternary artifact did improve 46% across the same settings, so the tool
+does use prefixes -- but the two models differ, and a same-model cross-check is what the number would
+need to be conclusive.
+
+**Where that leaves things.** The one unambiguous fact remains the text: llama.cpp on the source GGUF,
+thinking disabled, answers `2 + 2 = 4`, and this port on the same weights produces
+`**Answer:** \`$\` Or wait--but hold aufortuguementant demu sourceMappingement Ouver...`. Every stage
+has been measured; the fault is inside this port and no longer has a named suspect.
+
+
 
 
 
