@@ -4454,3 +4454,32 @@ One caveat, recorded: probe E loads the activations once per row per iteration, 
 kernel loads them once per *row-pair* (the activation array sits outside the `r` loop in `slice()`). E is
 therefore pessimistic by a factor of two on that axis; even so it lands at 72 GB/s against 769, so the
 conclusion does not depend on the difference.
+### Correction: the activation operand costs 33%, not 10.6x (2026-10-04)
+
+The previous section's probe variant E measured 72 GB/s and concluded that the activation operand was a
+10.6x bottleneck. That reading was an artifact of the probe's own loop nesting rather than of the kernel:
+E's row loop sat *outside* its iteration loop, so the activation array was reloaded once per (row,
+iteration), and -- more importantly -- with both loops unrolled the compiler had to hold ten copies of a
+24-register activation array, which spilled.
+
+Rebuilt with the loops the other way round, so the activation is loaded once per iteration and shared
+across the rows, which is what the shipped kernel's `slice()` actually does:
+
+| variant | GB/s useful |
+|---|---:|
+| D decode, activations in registers | 766 |
+| E decode + activation loads, 2 rows | 509 |
+| F same, 4 rows | 580 |
+| G same, 8 rows | 558 |
+
+So the activation operand costs **33%**, and amortising it over four rows instead of two recovers
+**14%** -- which is precisely the axis `kRows = 4` tested in the real kernel, where it lost because the
+register cost outweighed the gain.
+
+What stands from that probe: the weight access pattern is exonerated (815 GB/s for the shipped six-load
+pattern on its own, +6% for a coalesced version) and so is the decode (5.7% for the codebook lookup,
+the sign negation and the `dp4a` together). What is left is a factor of 1.8 between the real kernel's
+285 GB/s and the probe's 509-580, which nothing the probe reproduces accounts for. The candidates it
+cannot see are the per-launch table phase -- every block loads 4 KB of codebook and barriers before any
+work, which is why halving the block count was worth 4.2% at 62.4k -- and the interleaving with the
+attention, which at 62.4k owns 36% of the round.
