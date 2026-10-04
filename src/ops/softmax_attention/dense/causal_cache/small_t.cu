@@ -47,6 +47,65 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
     return (splits < Geometry::SmallTMaximumSplits) ? splits : Geometry::SmallTMaximumSplits;
 }
 
+// Wave alignment for the verify band. The launch grid is KVHeads * splits CTAs, and this kernel keeps
+// two CTAs resident per SM (ncu: Block Limit Registers 2 and Block Limit Shared Mem 2 at Bc=16), so a
+// grid that is not a whole number of waves leaves a partial wave -- at 62k the policy's 130 splits give
+// grid 520 = 3.25 waves, and ncu estimates that tail at up to 25% of the kernel. Rounding the count to a
+// multiple of (wave / KVHeads) removes it at the price of uneven keys-per-split.
+//
+// Measured at the deployment's window 2 (ternary artifact, 128 greedy tokens, same fixtures), mode 0
+// against mode 1:
+//
+//   15.6k  60.8 -> 62.3   (+2.5%)
+//   31.2k  50.4 -> 51.9   (+3.0%)
+//   62.4k  44.6 -> 44.5   (0%, within noise)
+//
+// Rounding DOWN is the default because it wins where the policy over-splits: at 15.6k the tier policy
+// asks for 65 splits (grid 260 = 1.6 waves) and 40 is one clean wave, and the per-CTA cost that fewer
+// CTAs amortise is the redundant q staging -- every CTA stages the full 32-row q tile, so splitting
+// harder multiplies that traffic. At 62.4k the graph envelope has already driven the count to 274, and
+// rounding it to 240 changes nothing measurable.
+//
+// NINFER_CAUSAL_WAVE_ALIGN: 0 off, 1 round down (default), 2 round up, 3 nearest. Modes 1 and 3 leave
+// the gate's window (about 100 tokens, 4 splits) at the 4-split floor, so its reduction order -- and
+// therefore the frozen v2 baseline -- is untouched. Mode 2 is the one that would move it.
+template <typename Geometry>
+std::int32_t causal_small_t_wave_aligned_splits(std::int32_t splits) {
+    static const std::int32_t mode = [] {
+        const char* env = std::getenv("NINFER_CAUSAL_WAVE_ALIGN");
+        return env == nullptr ? std::int32_t(1)
+                              : static_cast<std::int32_t>(std::strtol(env, nullptr, 10));
+    }();
+    if (mode <= 0 || splits <= 0) { return splits; }
+    static const std::int32_t resident_ctas = [] {
+        int sms = 0;
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess ||
+            sms <= 0) {
+            return std::int32_t(0);
+        }
+        return sms * 2;
+    }();
+    if (resident_ctas <= 0) { return splits; }
+    const std::int32_t per_wave = resident_ctas / Geometry::KVHeads;
+    if (per_wave <= 1) { return splits; }
+    const std::int32_t down = (splits / per_wave) * per_wave;
+    const std::int32_t up   = ((splits + per_wave - 1) / per_wave) * per_wave;
+    std::int32_t chosen     = splits;
+    if (mode == 1) {
+        chosen = down;
+    } else if (mode == 2) {
+        chosen = up;
+    } else {
+        chosen = (splits - down < up - splits) ? down : up;
+    }
+    // A count below one wave has no partial wave to remove, and rewriting it changes the reduction
+    // order for nothing: the gate's graph envelope asks for 8 splits at its ~511-key tier, and clamping
+    // that to the 4-split floor is what forked the frozen v2 baseline. Leave those counts alone.
+    constexpr std::int32_t kFloor = 4 * Geometry::SmallTSplitScale;
+    if (chosen < kFloor) { return splits; }
+    return chosen;
+}
+
 template <typename Geometry>
 std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens,
                                         KvCacheStorage storage) {
@@ -59,11 +118,12 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
     // nearly empty second tile. T=5 uses one 32-key tile per split; the short T>=6 profile keeps
     // all newly appended rows in one tail split while retaining a useful B=8 grid.
     if (storage == KvCacheStorage::Int8Group64 && tokens == 5 && window > 128 && window <= 512) {
-        return div_up(window, 32 / Geometry::SmallTSplitScale);
+        return causal_small_t_wave_aligned_splits<Geometry>(
+            div_up(window, 32 / Geometry::SmallTSplitScale));
     }
     if (storage == KvCacheStorage::Int8Group64 && tokens >= 6 && window > 128 && window <= 160) {
         constexpr std::int32_t kKeysPerSplit = Geometry::SmallTSplitScale == 2 ? 17 : 24;
-        return div_up(window, kKeysPerSplit);
+        return causal_small_t_wave_aligned_splits<Geometry>(div_up(window, kKeysPerSplit));
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one 170-SM wave after accounting for the geometry's KV-head count.
@@ -72,9 +132,10 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
         constexpr std::int32_t kMin = 4 * Geometry::SmallTSplitScale;
         constexpr std::int32_t kMax = 42 * Geometry::SmallTSplitScale;
         const std::int32_t clamped  = (splits > kMin) ? splits : kMin;
-        return (clamped < kMax) ? clamped : kMax;
+        return causal_small_t_wave_aligned_splits<Geometry>((clamped < kMax) ? clamped : kMax);
     }
-    return causal_small_t_split_upper_bound<Geometry>(window);
+    return causal_small_t_wave_aligned_splits<Geometry>(
+        causal_small_t_split_upper_bound<Geometry>(window));
 }
 
 template <typename Geometry>

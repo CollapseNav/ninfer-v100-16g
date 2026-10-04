@@ -3938,3 +3938,84 @@ A bit-identity-safe route for T=3 would have to cut the footprint without touchi
 `v_s` as int8 (the cache is int8; `k_s`/`v_s` are dequantized into fp16 in shared, and the dequant is
 exact) would save 4,224 B and reach 29,824 B at an unchanged `Bc` -- a real change to the staging path,
 and the next idea worth pricing.
+## The decode sweep, and the one candidate that survived the gate (2026-10-04)
+
+Everything below was tried against the same shape -- ternary artifact, window 2, `--lm-head-draft`,
+128 greedy tokens, `long.json`'s body repeated for 15.6k/31.2k/62.4k -- and every code candidate had to
+clear `v3_regress.sh` as well, because that gate is a *bit-identity* gate against a frozen v2 baseline.
+
+| candidate | kind | result |
+|---|---|---|
+| **wave-align the split count, rounding down** | code | **+4.1% at 15.6k and 31.2k, neutral at 62.4k. Applied.** |
+| wave-align rounding up | code | neutral at 62.4k, and it is the mode that moves the gate's split count. Rejected. |
+| wave-align to the nearest multiple | code | worse than rounding down where both were measured (62.4k 44.2 vs 44.5; 31.2k 50.5 vs 51.9). Rejected. |
+| `Bc 16 -> 8` (three CTAs/SM) | code | +4.5..6%, but `REGRESSION_DIFF`: it halves the online-softmax rescale interval. Rejected. |
+| `Br` per token tile | code | segfault: `q_s` is mma-shaped at 32 rows. Rejected. |
+| runtime extent cap | code | -28% at 62k. Rejected. |
+| `--kv-dtype fp8` | flag | **hangs** -- 18 minutes at `engine ready`, no output. Rejected. |
+| `--kv-dtype bf16` | flag | does not fit: 8.76 GiB of KV beside 7.45 GiB of weights on a 16 GiB card. |
+| lookup suffix 6 | flag | +9..20% where the generated tail re-emits the prompt, but a lottery on reasoning traffic. Not the default. |
+| draft window 1 vs 2 vs 5 | flag | 2, from the context sweep. Already applied. |
+
+### The one that survived: align the split count to the wave
+
+The launch grid is `KVHeads * splits` CTAs and this kernel keeps **two** CTAs resident per SM (ncu:
+`Block Limit Registers 2`, `Block Limit Shared Mem 2` at Bc=16), so an 80-SM device runs 160 CTAs per
+wave. The policy's split counts ignore that: at 15.6k it asks for 65 splits, giving grid 260 = 1.6
+waves, and ncu estimates the partial wave at up to 25% of the kernel. Rounding the count down to a
+multiple of `wave / KVHeads = 40` fixes the shape, and the mechanism is not only the tail: **every CTA
+stages the full 32-row `q_s` tile regardless of how many rows are real**, so splitting harder
+multiplies redundant q traffic. Fewer, fuller CTAs win.
+
+Paired on one binary with the mode switched by environment variable, which is the cleanest form of this
+measurement (run-to-run spread on this fixture is about 2%):
+
+| context | mode 0 (off) | mode 1 (down) | delta | output |
+|---|---:|---:|---:|---|
+| 15.6k | 62.1 | **63.6** | **+2.4%** | identical |
+| 31.2k | 51.0 | **52.8** | **+3.5%** | identical |
+| 62.4k | 44.3 | 44.3 | 0% | differs |
+
+The 62.4k row is worth its own sentence: the speed is unchanged and the *output* changes, because
+rounding 274 splits down to 240 changes the order the partials are reduced in, and this file already
+records that this path has near-ties that flip on perturbations at least that small. It is not a
+correctness change -- the verify pass is authoritative for what it emits -- but it does mean the
+deployment's tokens at the largest contexts can differ from the pre-change build, and the *gate* stays
+green only because the gate's own windows are far below the 40-split threshold the alignment acts on.
+
+At 62.4k the CUDA-graph envelope has already driven the count to 274, and rounding it to 240 changes
+nothing measurable -- which is itself informative: the graph path sizes splits from the *envelope's*
+`max_visible_keys` (the profile tier, up to the whole capacity) rather than the live window, so it
+over-splits the same way the policy does at small windows, and it is why this lever is worth 4% at the
+smaller contexts and nothing at the largest.
+
+**Getting it past the gate took a second correction, and the failure is worth recording.** The first
+version clamped the aligned count up to the 4-split floor, which rewrote the gate's own count: its
+decode runs under CUDA graphs, whose envelope asks for **8** splits at the ~511-key tier, and 8 became 4
+-- a different reduction order, a different v2 output, `REGRESSION_DIFF`. A count below one wave has no
+partial wave to remove, so the rule is now *leave sub-wave counts exactly as the policy gave them*, and
+that is what makes the change bit-identity-safe: the gate's 8 stays 8, its prefill's 4 stays 4, and
+every window the deployment actually decodes at is above 40 splits.
+
+`NINFER_CAUSAL_WAVE_ALIGN` keeps the four modes reachable (`0` off, `1` down -- the default, `2` up,
+`3` nearest), because the wave size is a device property and the 2-CTA figure is a property of this
+kernel's footprint.
+
+### What is left, in the order I would take it
+
+1. **Stage `v_s` as int8.** The cache is int8 and the dequantization to fp16 is exact, so `v_s` could
+   stay int8 in shared and be converted in the load path: 4,224 B saved at an unchanged `Bc`, which is
+   29,824 B and the third CTA **without touching the softmax recurrence**. That is the only route to
+   occupancy that the gate permits, and it is the one thing here that could reach the 40.6% of the
+   long-context round that attention owns.
+2. **The CompactTail threshold.** `WarpsPerCta = 5` already raises resident warps from 8 to 10 without
+   touching the key tile, and it is selected only for `TokenTile == 6` above a 16,391-key window -- a
+   threshold chosen on the author's hardware. Bit-identity-safe, T=6 only, one constant.
+3. **The 32-row mma tile's waste at small T.** At T=3 the kernel does 32 rows of mma work for 18 real
+   rows, and `q_s`'s 14 zero rows are staged every pass. Both are consequences of the fragment layout
+   (`volta_qp_get_i() = threadIdx.x & 31`), so they are not knobs -- but they are why small-T verify
+   rounds cost what they do.
+4. **The verify band's weight sharing** (this file's own "one change that would pay"): the marginal
+   verify column costs 0.60 of a T=1 step here against llama.cpp's 0.27 on the same card, and the
+   ternary GEMV is 36-47% of the round. It is the largest remaining lever at short and medium context
+   and it is a kernel rewrite rather than a constant.
