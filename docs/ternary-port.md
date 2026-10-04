@@ -2139,6 +2139,49 @@ Locking clocks or raising the iteration count is a prerequisite for any future k
 path, the 8-byte grid gathers are inherently at least two-way bank-conflicted, and the occupancy is
 grid-clamped for a good reason. A cheaper decoder -- not another knob -- is what is left.
 
+### The stall is L1TEX, and kRows is now settled with a reliable harness
+
+ncu's own advice names the stall precisely rather than by category:
+
+```
+OPT  Est. Speedup: 32.97%
+     each warp spends 9.8 cycles stalled waiting for a scoreboard dependency on a L1TEX
+     (local, global, surface, texture) operation -- 54.6% of the 17.8 cycles between two issues
+```
+
+so it is the **long scoreboard** -- global/L1 load latency -- and not shared-memory bank conflicts, which
+retires the previous section's guess. For the low-bit formats the activation is the larger half of the
+traffic: a slice reads 1024 bytes of q8 activation against 592 bytes of IQ2_XS weights, because the
+activation is a byte per weight where the weight is 2.3 bits.
+
+The harness was fixed before acting on that: **min-of-200 rather than a 20-iteration mean**, which took
+the run-to-run band from **+-15% to about 2%** (the same configuration twice: 547.0/536.4, 506.9/506.9,
+500.0/500.0, 723.9/734.0). Every earlier kernel-level reading in this document should be re-read as
+"neutral within noise"; only the iq1_s -78% from the register pin was ever outside it.
+
+With a reliable harness, more rows per warp -- which amortises exactly that activation traffic -- is
+**worse**, not better:
+
+| format | kRows=2 | kRows=4 | kRows=8 |
+|---|---:|---:|---:|
+| iq2_xs | **547.0** | 483.8 | 474.7 |
+| iq2_xxs | **547.3** | 477.4 | 477.4 |
+| iq2_s | **506.9** | 457.0 | 450.1 |
+| iq1_s | **500.0** | 361.7 | 425.0 |
+| iq4_xs | **723.9** | 711.4 | 711.4 |
+
+The extra accumulators cost more than the saved activation loads, which is v2's own finding word for
+word. Note also that the activation is only ~5 KB at T = 1, so after the first row iteration it is
+L1-resident and those stalls are L1-hit latency, not DRAM -- which is why moving it to shared memory,
+ncu's generic suggestion, would buy only the ~8 cycles between L1 and smem latency. The slice loop is
+already `#pragma unroll`ed for the static-K instantiations, so the ILP is there too.
+
+**That closes the knobs.** Every shape, occupancy, grid and precision lever reachable from this kernel's
+parameters has now been measured with a harness good to 2%, and the kernel sits at a local optimum. The
+remaining 33% ncu estimates needs a decoder that reads the weights differently -- the QPN-shaped work --
+not another parameter.
+
+
 
 
 
