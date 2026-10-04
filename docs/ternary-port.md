@@ -4234,3 +4234,44 @@ computed as "8.15 GiB of weights per token at 900 GB/s", but the verify reads th
 round, not once per token**: `vec::kernel<ggml_type=16, int=3, ...>` handles all three verified tokens in
 one call, which is the whole point of speculative decoding. The ceiling is therefore far higher, and
 109.4 tok/s at 15.6k already exceeds the figure that was quoted as a ceiling.
+### The vec kernel's row-per-thread parameter is already tuned (2026-10-04)
+
+The GGUF vector kernel is 55.9% of the v3's decode and runs at about 31% of DRAM peak, so its structure
+was the next thing to look at. Per lane per iteration it decodes **one IQ2_XS sub-block** -- 32 elements,
+9.25 bytes of weight -- and does `T` dot products over the 32 activations, which it re-reads as `T x 40`
+bytes of quantized activation. At `T = 3` that is 120 bytes of activation against 9.25 bytes of weight,
+and the activation is identical for every row, so the naive reading is that the kernel drowns in
+activation traffic.
+
+**It does not.** That activation is 17 KB for three tokens and is L1-resident, and the row-per-thread
+parameter is already at its optimum. Measured on the non-fused projections (the fused ones cannot
+participate -- see the landmine below), bit-identical in every arm:
+
+| context | kRows = 1 | **kRows = 2 (shipped)** | kRows = 4 |
+|---|---:|---:|---:|
+| 15.6k | 107.4 | **109.4** | 98.5 |
+| 31.2k | 67.6 | **69.0** | 60.0 |
+| 62.4k | 55.4 | 54.5 | 50.6 |
+
+Four rows per thread is 7-13% *worse* and one row is 2% worse at short context: amortising the
+activation read buys nothing because it was never the cost, and carrying more rows costs the parallelism
+that hides the weight stream's latency. Both were reverted.
+
+**A landmine worth recording, because it is silent until it is not.** `kRows` is not a free constant.
+The `Fused` branch -- the gate/up swiglu projections, which are most of the MLP's weight bytes --
+initialises exactly two row pointers, `rowp[0]` and `rowp[1]`, being the gate and up halves of one output
+row. Raising `kRows` makes the r-loop decode `rowp[2]` and `rowp[3]` as well, and those are
+uninitialised pointers: `compute-sanitizer` reports `Trace/breakpoint trap` at
+`vec::kernel<(ggml_type)19, (int)4, (bool)1, (int)0>`, i.e. the first swiglu projection, at thread
+(96,0,0) of block (480,0,0). The launch's `per_block` is likewise hard-coded to 2 and has to follow
+whatever `kRows` applies. Widening the fused path to two gate/up pairs is possible but is a real change,
+not a constant.
+
+**What is left for this kernel.** Two candidates, neither measured yet. The dequantization itself: per
+sub-block the decode does a 1024-word grid lookup plus the byte-wise sign negation of eight words, which
+is roughly 32-40 ALU operations against 8 `dp4a` per token -- so the dequant is the larger half of the
+ALU work, and it is shared across tokens only because it is done once per sub-block rather than once per
+token. And occupancy: the kernel is launched with `__launch_bounds__(kVecWarps * 32)` and no `minBlocks`,
+so whatever register count the compiler chooses is what caps resident blocks -- at `kRows = 2` the grid
+sizes itself to `min(groups, resident * sm_count)` blocks of 4 warps, which is about 32 warps per SM
+against the V100's 64.
