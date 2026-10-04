@@ -3801,3 +3801,78 @@ rather than whatever the container was born with.
 The check is the process start against the binary's mtime, and the proof is behavioural: this
 deployment's 11,348-token copying request is deterministic per configuration, `mtp accepted 466/604` at
 suffix 16 and `402/688` at 6, so the counters say which build is actually serving.
+## Kernel engineering attempt 1: the attention footprint, and why q_s cannot shrink (2026-10-04)
+
+The target was the occupancy number ncu produced for
+`causal_attention_small_t_tc_volta_partial_i8_kernel` at 62k: **12.5% theoretical occupancy, 2 CTAs per
+SM, limited by both registers (213/thread) and shared memory (34.05 KB/block)**, with 64.8% of cycles
+having no eligible warp and DRAM at 16%. Raising that to 3-4 CTAs is the biggest single lever this file
+has identified, so this was the first thing to try.
+
+### What the footprint is actually made of
+
+| array | size | what sizes it |
+|---|---:|---|
+| `q_s[Br * SmemStride]` | 16,896 B | **Br = 32 rows, and that is not a knob** |
+| `k_s[Bc * SmemStride]` | 8,448 B | Bc = 16 keys per tile |
+| `v_s[Bc * SmemStride]` | 8,448 B | Bc = 16 |
+| `physical_pages_s[64]` | 256 B | PageIds |
+| total | **34,048 B** | against 98,304 B of shared per SM |
+
+(`q_tail_s` and `p_tail_s` are declared but the compiler drops them at `WarpsPerCta == 4`: 34,048 is
+exactly the four rows above, and the CompactTail instantiations do carry them -- 36,288 B at T=6.)
+
+The attempt was to size `Br` to the token tile, `Br = round_up_8(TokenTile * GroupSize)`, which would
+have shrunk `q_s` to 12,672 B at T=3/4 (29,824 B total, under the 32,768 B that three CTAs need) **and**
+covered all `row_count = 6 * TokenTile` rows in one pass instead of two at T=6. Resource usage confirmed
+both halves: T=2/3/4 came back with `REG:168` (down from 213, no spills -- `LOCAL:0`) and `SHARED:25,600`
+/ `29,824`, i.e. 3 CTAs by both limits; T=5..8 kept 2 CTAs but with one row pass.
+
+**It segfaulted, and the reason is structural.** `cudaErrorIllegalAddress` in every arm, reported
+asynchronously at a later kernel until `CUDA_LAUNCH_BLOCKING=1` pinned it to `small_t.cu:199`, and then
+`compute-sanitizer --tool memcheck` (which needs `--privileged`) named it outright:
+
+```
+Invalid __shared__ read of size 16 bytes
+    at ... in volta_mma.cuh:68
+    by thread (57,0,0) in block (0,0,0)
+    Address 0x7590 is out of bounds
+    Device Frame: ... causal_attention_small_t_tc_volta_partial_i8_kernel<
+        CausalAttentionGeometry<24,4,1>, 4, 4, false, false, CausalAppendInput>+0x92d0
+        in small_t_i8_volta.cuh:459
+```
+
+`volta_mma.cuh:68` is `volta_load_qp`'s `dst[l] = base[row * stride + l]`, and its row index is
+`volta_qp_get_i() = threadIdx.x & 31`. **The Q/P mma tile is 32 rows wide by construction** --
+`tile<32,4,half2,I_MAJOR>` -- so the loader walks all 32 lanes whatever the token count is, and `q_s`
+must hold 32 rows no matter how few of them are real. `Br` is the mma's M extent, not a tile size, and
+the row-count mismatch is handled elsewhere: by a second pass over the row space (the 4-warp path), or
+by the fifth warp of the CompactTail path.
+
+Reverted. The baseline is confirmed back: 62k window 2 gives 44.6 tok/s against 44.3 before, and the
+output md5 is `ae2e8e05...`, byte-identical to the pre-change trajectory.
+
+### What that leaves, correctly scoped
+
+* **`q_s` cannot shrink.** It is 16,896 B of the 34,048 and it is mma-shaped. Three CTAs need the
+  footprint at or below 32,768 B, so 1,280 B has to come out of `k_s`/`v_s`/pads.
+* **`Bc 16 -> 8` is the only clean lever**: it halves `k_s`+`v_s` to 8,448 B and lands the block at
+  25,600 B, which is three CTAs with room to spare. The price is twice as many key tiles and therefore
+  twice as many `__syncthreads()` per row pass -- a real trade, and the next thing to measure.
+* **The register half is free but currently pointless.** `__launch_bounds__(128, 2)` is what lets the
+  compiler spend 213 registers; asking for 3 caps it at 170 with **no spills at all** (`LOCAL:0`,
+  `STACK:16` unchanged). That is only worth having once shared memory stops being the binding limit.
+* **The T=6 double pass is already known and already handled.** `launch_tc_partial_i8` routes
+  `TokenTile == 6 && GroupSize == 6` to `WarpsPerCta = 5` (CompactTail) when
+  `implementation_window >= 16391`, precisely so the 4-row tail does not become a second row pass. So
+  the double pass exists only for T=6 below a 16,391-key window -- and that threshold was chosen on the
+  author's hardware, which makes it a cheap, legitimate thing to re-measure on 80 SMs.
+
+### The diagnostic path, for the next time
+
+`CUDA_LAUNCH_BLOCKING=1` first (turns the asynchronous sticky error into the launch that caused it --
+`small_t.cu:199`), then `compute-sanitizer --tool memcheck` under `--privileged` for the kernel, the
+source line and the address. `--error-limit` is an ncu option, not a sanitizer one, and passing it makes
+the tool print its usage instead of profiling. `cuobjdump --dump-resource-usage` on the built binary
+gives REG/STACK/SHARED/LOCAL per instantiation, which is how the two halves of this change were
+confirmed before anything was run.
