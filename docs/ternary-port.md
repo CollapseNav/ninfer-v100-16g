@@ -1656,6 +1656,45 @@ in two separate artifact objects.
 does not.** The remaining fault is entirely inside this port, and the argmax is what is wrong rather
 than the average: PPL is only 1.27x off while greedy output loops.
 
+### Three more candidates eliminated
+
+**The chat templates are identical.** llama.cpp's run opened with a control marker this port's did not
+produce, which suggested the two engines were formatting the prompt differently -- and this port
+deliberately falls back to the artifact's embedded template when the `.jinja` is unregistered. Parsing
+the GGUF's own `tokenizer.chat_template`:
+
+| template | bytes | sha256 |
+|---|---:|---|
+| GGUF (what llama.cpp uses) | 8952 | `c3cf9e34abf4f9e3` |
+| artifact `.jinja` | 9712 | `a497db9e663941e6` |
+| artifact embedded | 8952 | `c3cf9e34abf4f9e3` |
+
+The GGUF's template is byte-identical to the **embedded** one, so the fallback picks exactly the
+template llama.cpp uses. Both engines format the same prompt.
+
+**The thinking flag is not it.** `--no-thinking` changes the output (`**Answer:** ...` instead of
+`User sent instruction ...`) but both are still degenerate, so it is an input difference and not the
+fault.
+
+**And the incremental path is not it.** Round 14 suspected the decode step's token feedback because
+perplexity re-prefills every window. Testing that directly -- six 4-token steps, each a fresh prefill
+of the text so far -- degrades just as fast:
+
+```
+step 1: User sent instruction requesting
+step 2: The user sent.Fragment
+step 3: We nEe          step 4: We complete classics!?
+```
+
+So the pure-prefill path is wrong too, and the fault is in the forward pass itself rather than in
+anything decode-specific.
+
+**What that leaves.** PPL is 1.27x off while the argmax is wrong often enough to loop, and every stage
+has been measured -- so the next step is a logits diff: `llama-perplexity --save-all-logits` on the
+source against the same from this port. This port's perplexity report carries only aggregates, so it
+needs a small env-gated logits dump, and that diff would show which logits are wrong and by how much.
+
+
 **Its threshold is between context 320 and 384.** Bisecting:
 
 | context | scored width | result |
