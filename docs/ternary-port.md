@@ -1921,6 +1921,28 @@ That leaves the attention's *use* of the cache -- the append, the positions, the
 softmax -- all of which is shared code that drives the ternary artifact correctly, and none of which
 has been instrumented yet.
 
+### A functional test sharpens it: one token of context, then nothing
+
+Perplexity is an average. A generation test says it more sharply: the prompt is
+`Remember these digits: 7 3 9 1.` followed by `What were the digits I asked you to remember? They
+were`, with and without ~470 tokens of filler in between.
+
+| engine | short prompt | long prompt |
+|---|---|---|
+| **llama.cpp on the source GGUF** | **`7 3 9 1`** | (prompt echo differs; not extracted) |
+| this port | `7 २৩оновэrchaniedig` | `they WERE THESE-DITIS !**!!: **: **:** :**` |
+
+This port retrieves **`7`** -- the digit about ten tokens back -- and then comes apart; it cannot reach
+`3 9 1` even though the digits are adjacent in the prompt. With the filler, it retrieves nothing at all.
+
+So the model sees roughly one token of context beyond the immediate window. The only thing that carries
+exactly a few tokens is the GDN's four-tap convolution; the attention (16 layers) and the GDN's
+recurrent state (48 layers) contribute nothing to the output. That is a much sharper statement of the
+fault than "the prefix does not help", and it points at the residual chain between layers as much as at
+either memory: if a layer's output never reached the next layer, only the embedding and the first
+window would matter, which is what this looks like.
+
+
 
 
 
