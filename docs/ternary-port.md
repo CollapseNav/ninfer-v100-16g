@@ -4275,3 +4275,45 @@ token. And occupancy: the kernel is launched with `__launch_bounds__(kVecWarps *
 so whatever register count the compiler chooses is what caps resident blocks -- at `kRows = 2` the grid
 sizes itself to `min(groups, resident * sm_count)` blocks of 4 warps, which is about 32 warps per SM
 against the V100's 64.
+### The vec kernel measured: latency-bound on a register knife-edge (2026-10-04)
+
+With ncu finally selecting it by its base name (`kernel`) under `--no-cuda-graph`, the kernel that owns
+55.9% of the v3's decode can be read directly, grouped by grid size:
+
+| grid | DRAM % | Memory % | L1/TEX % | SM % | no-eligible % |
+|---|---:|---:|---:|---:|---:|
+| 128 | 4.9-8.0 | 12-19 | 13-20 | 11-18 | 82-87 |
+| 256 | 8.1-14.3 | 22-33 | 24-38 | 20-30 | 67-77 |
+| 320 | 12.0 | 47-49 | 51-54 | 44-45 | 53-55 |
+| **640** (the register-limited maximum) | **25.5-26.9** | **40-41** | **44** | **38** | **58** |
+
+with L1 hit rate 93.7% -- so the activation re-read really is cheap, as the row-count experiment already
+implied -- and L2 hit rate 78.8%. `Warp Cycles Per Issued Instruction` is 9.55.
+
+So the kernel is **not bandwidth-bound at any grid size**. Even with the grid full it reaches 26% of DRAM
+and spends 58% of its cycles with no eligible warp. It is waiting on the weight stream, and both levers
+that follow from that are now measured and closed:
+
+**More warps: no.** The register file is exactly full -- 64 registers x 128 threads x 8 blocks = 65,536 --
+so the grid is already at its register-limited maximum. Asking for 10 blocks, which caps registers at 51,
+**collapses** the decode:
+
+| context | shipped (8 blocks, 64 regs) | 10 blocks (51 regs) |
+|---|---:|---:|
+| 15.6k | 109.4 | **35.7** |
+| 31.2k | 69.0 | **18.5** |
+| 62.4k | 54.5 | **17.5** |
+
+`LOCAL` stays 0, so nothing spilled: the compiler **rematerialized**, and what it rematerializes is the
+activation operand, which is already the dominant L1 traffic at 6.5x the weight bytes. The kernel needs
+its 64 registers to hold the activation slice; capping them multiplies the loads instead of buying warps.
+
+**More rows per thread: no** (measured before: `kRows` 4 is 7-13% worse, 1 is 2% worse at short context).
+
+**What is left for this kernel** is more memory-level parallelism per warp *without* more registers:
+software-pipelining the weight loads, so iteration `it+1`'s block is in flight while `it` is being
+decoded. The measurement says that is the right target -- the warps are waiting on the weight stream, not
+on bandwidth, and the inner loop currently issues four small scattered loads (2 bytes for the scale, 1 for
+the grid index, 4 and 4 for the two quant words) and cannot start its table lookup until all four land.
+Doing it without adding register pressure is the difficulty, and it is an inner-loop rewrite rather than
+a constant.
