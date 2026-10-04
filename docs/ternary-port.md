@@ -2090,6 +2090,56 @@ access -- which is the opposite of the conclusion the prefill reached. v2 evalua
 rejected it, but for a reason that does not hold here: their PQ2 layout already used every sector,
 whereas these IQ formats spend their time in the grid lookups. That is the next thing to measure.
 
+### Four decode levers, tried and measured -- and the diagnosis they produced
+
+`ncu` is in the build container but needs `--privileged`, and once it runs it corrects the guess above.
+On one IQ2_XS `vec::kernel` launch at T = 1:
+
+```
+Duration                    62.62 us     L1/TEX Cache Throughput   67.75%   <- the busiest path
+Memory Throughput           65.10%       Compute (SM) Throughput   41.33%
+DRAM Throughput             46.50%
+
+Occupancy   Block Limit Registers   12.00   <- registers cap it
+            Block Limit Warps       16.00
+            Theoretical Occupancy   75.00%
+            Achieved Occupancy      49.50%   <- only half
+
+Scheduler   No Eligible            56.86%   <- no warp can issue for over half the cycles
+            Eligible Warps/Sched     0.86    <- less than one eligible warp
+Warp State  Warp Cycles/Instr       18.19    <- 18 cycles per instruction
+```
+
+**It is latency-bound, not ALU-bound**, so the earlier "the rate tracks the decoder's cost per byte"
+reading was wrong. What it is waiting on is the L1/shared-memory path, and the occupancy is too low to
+hide it.
+
+Four levers follow from that, and all four were tried:
+
+| lever | result |
+|---|---|
+| `kRows = 1` (v2 measured 2-rows-per-warp as slower) | **worse** -- iq1_s 455.8 -> 368.4 GB/s |
+| `kVecWarps` 2 and 8 | neutral, within noise |
+| `__launch_bounds__` min-CTA pin (v2's 116->80 registers for +8%) | +1% on iq2_xs, **-78% on iq1_s** |
+| raising the grid clamp `resident * sm_count` (x2, x3, x4) | **uniformly worse** on all seven formats |
+
+The register pin is the interesting one: ncu says registers cap occupancy at 12 blocks where warps allow
+16, so the pin *should* bite -- and forcing it makes the IQ1 decoder spill, which is exactly v2's own
+finding (their 4-CTA variant spilled 268 bytes a thread and lost). The grid clamp is the other: raising
+it is worse because the shared-memory grid table is copied once per block, so more blocks means more
+redundant copies.
+
+**And a methodology correction worth more than any of them**: the harness's run-to-run variance is
+**+-15%** -- the same configuration measured 476.5 and 545.8 GB/s in two sweeps, and ncu reports the SM
+clock at 1.30 GHz against a 1.48 GHz base. Only the iq1_s -78% is safely outside that band, so the
+earlier `kRows`/`kVecWarps`/`launch_bounds` readings should be treated as neutral rather than as wins.
+Locking clocks or raising the iteration count is a prerequisite for any future kernel-level sweep here.
+
+**No decode speedup landed this round.** What it produced is the diagnosis: the stall is on the L1/smem
+path, the 8-byte grid gathers are inherently at least two-way bank-conflicted, and the occupancy is
+grid-clamped for a good reason. A cheaper decoder -- not another knob -- is what is left.
+
+
 
 
 
