@@ -2012,6 +2012,44 @@ parity with it. `NINFER_GGUF_F16_PREFILL=0` restores mmq without a rebuild.
 dequantize pass is now the shared bottleneck. Closing that needs the QPN analogue -- a kernel that
 decodes the blocks inside the MMA pipeline -- rather than another routing change.
 
+## What the v2 ternary kernels say, checked against this one
+
+The ternary port reached its prefill speed by the same route this port just took: its dispatch tries
+QPN (tensor core), then `ternary_cutlass_sm70`, then SIMT rungs, and the CUTLASS arm's own comment says
+it "dequantises the weight chunk to fp16 once and then runs a GEMM". Two independent ports, same
+conclusion. Three further v2 lessons were checked here rather than assumed.
+
+**Its register pin does not transfer.** v2's GEMV carries a measured `__launch_bounds__` min-CTA pin
+(116 registers -> 80 for +8%, and 4 CTAs measured -58% because it spilled 268 bytes a thread). The GGUF
+vector kernel, compiled with `-Xptxas -v`, uses **14-32 registers across all 52 instantiations with zero
+spills anywhere** -- there is nothing for a pin to buy, so this lever is dead here.
+
+**The bandwidth numbers are the real finding.** A coalesced 16-byte read probe on this card reaches
+**897 GB/s** (essentially the spec 900). Against that:
+
+| | achieved | of reachable |
+|---|---:|---:|
+| decode (7.83 GiB of weights per token) | **390 GB/s** | **43%** |
+| the prefill's dequantize (178 MB written, 18.6 MiB read) | **184 GB/s** | **20%** |
+
+So the decode's ceiling on this artifact is about **107 tok/s**, not the 48.7 it runs at, and the
+dequantize has roughly five times its current rate available. Neither is a compute limit.
+
+**The dequantize's launch shape is the anomaly, and fixing it is not a one-liner.** The fork's own
+`launch_dequantize` grid is `(k/256, rows)` with **32 or 64 threads a block**, so one 17408x5120 tensor
+becomes **348,160 one-to-two-warp blocks** and the 32-blocks-per-SM cap turns that into half occupancy --
+exactly the "occupancy, not instruction count" point v2's GEMV makes. Widening to 256 threads with one
+warp per 256-value block was tried: it **broke correctness** (`causal scoring returned a non-finite
+logprob`) and was **slower** (prefill 1.05k against 1.12k, decode 48.2 against 48.7), because the
+vendored device helpers derive their lane mapping from the `tid` they are handed and some of them assume
+the dispatched block width. Reverted; the change needs the helpers audited first, not a launch edit.
+
+**One v2 note applies to this port's own change**: "the arena is what the ternary linear op runs out of
+first", which is why v2 compiled out an int8 scratch nothing read. This port's FP16 route reserves three
+`k*T*2` activation buffers in its workspace query while usually using one, and the still-unfixed
+`std::bad_alloc` at context >= 384 is the same class of problem.
+
+
 
 
 ### A functional test sharpens it: one token of context, then nothing
