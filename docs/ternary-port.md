@@ -3692,12 +3692,13 @@ occurrences of the string), and neither does the 39.8 GB Flash-Next GGUF, whose 
 | what | where | notes |
 |---|---|---|
 | DFlash2 drafter GGUF, Qwen3.8-27B | [`z-lab/Qwen3.8-27B-DFlash2-GGUF`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) | BF16 / Q4_K_M / Q8_0, 503k downloads, tagged `draft-model` |
-| **ninfer-v3 container with dflash2** | `WaveCut/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-DFlash2-ninfer-v3.ninfer` | tagged `ninfer`, `groupwise-int`, `dflash2`, rtx-3090/4090/5090 -- i.e. the profile this tree's ternary artifact runs, in the v3 container this tree reads |
+| **ninfer-v3 container with dflash2** | `WaveCut/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-DFlash2-ninfer-v3.ninfer` | tagged `ninfer`, `groupwise-int`, `dflash2`, rtx-3090/4090/5090 -- i.e. the profile this tree's ternary artifact runs, in the v3 container this tree reads. **Verified from the container's own header** (12 MB HTTP Range request, not a 10 GB download): 1513 bindings, of which **91 are `dflash2/*`** -- `candidate_selector/{hidden_projection,predecessor_codebook,successor_codebook}`, `context_norm`, `feature_projection` and `layers/{0..4}/{attention_conv,mlp_conv}/{base_kernel,kernel_projection}` -- which is field-for-field this tree's `DFlash2Weights`, alongside its own 16 `mtp/*` and 2 `proposal/*`. So the bundle is real, in this container format, for this profile, with the names this tree's binder expects |
 | ninfer-v3 + dflash2, NVFP4 | `kaushikvira/Qwen3.8-27B-swift15-nvfp4full-dflash2-NInfer-v3` | tagged `blackwell`, `w4a4` |
 | DFlash2 drafter for the Ternary-Bonsai family | `ProCreations/Ternary-Bonsai-2-27B-DFlash2` | plain GGUF (Q8_0), not a `.ninfer` |
 
-So "there is no DFlash model" is not the blocker. (HuggingFace is not reachable from this host; the
-listing above came from `hf-mirror.com`'s API, which is.)
+So "there is no DFlash model" is not the blocker, and it is not a matter of trusting tags: the one
+ninfer-format candidate was checked by reading its header. (HuggingFace is not reachable from this
+host; the listings and the Range request came from `hf-mirror.com`, which is.)
 
 **The blocker is the Volta port, and it is already scoped in this tree.** `src/ops/dflash2_sm70_stub.cu`
 exists precisely because upstream's DFlash2 kernels are sm_80+ (cp.async, bf16 mma, `__reduce_*_sync`),
