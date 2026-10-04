@@ -4483,3 +4483,36 @@ the sign negation and the `dp4a` together). What is left is a factor of 1.8 betw
 cannot see are the per-launch table phase -- every block loads 4 KB of codebook and barriers before any
 work, which is why halving the block count was worth 4.2% at 62.4k -- and the interleaving with the
 attention, which at 62.4k owns 36% of the round.
+### The fused gate/up path widened to two pairs: bit-identical, register-bound, no gain (2026-10-04)
+
+The probe measured +14% for amortising the activation operand over four rows instead of two, and the
+fused gate/up projections are the one place in the kernel that still carries a single output row per
+thread -- `rowp[0]` and `rowp[1]` are the gate and up halves of the *same* row -- while being the largest
+weight block in the model (2 x 17408 rows). Widening them to two gate/up pairs is bit-identical (same
+md5s) and costs no time, but it is not a win either:
+
+| T | Fused | REG before | REG after | warps/SM before | warps/SM after |
+|---|---:|---:|---:|---:|---:|
+| 1 | 1 | 38 | 47 | 48 | 40 |
+| 2 | 1 | 56 | 73 | 32 | 24 |
+| **3** | 1 | **64** | **100** | **32** | **16** |
+| 4-5 | 1 | 64 | 128 | 32 | 16 |
+| 6-8 | 1 | 75-80 | 169-173 | 24 | 8 |
+
+Decode: **109.7 / 69.2 / 56.1** against 109.7 / 69.3 / 57.0. Reverted.
+
+Four rows need twice the accumulators and twice the row pointers, and that pushed the instantiation from
+four blocks per SM to two, and to one at T >= 6. The activation saving the probe measured is real but
+smaller than the occupancy it costs -- the same trade that killed `kRows = 4` on the non-fused path, and
+the second time this axis has been measured and lost.
+
+**Where this leaves the vec kernel.** It has now rejected the row count (2 is optimal), the
+register-capped occupancy (forcing more blocks rematerialises the activation operand and collapses the
+decode), the access pattern (the shipped six-load pattern reaches 815 GB/s alone, +6% coalesced), the
+decode cost (5.7%), the activation magnitude (33%, and amortising it costs more registers than it saves),
+and now the fused-pair width. The one thing that won was the block size -- 8 warps, +4.2% at 62.4k -- and
+that was a per-launch overhead, not the inner loop.
+
+The probe puts the inner loop's own ceiling at 509-580 GB/s and the kernel achieves about 285 in situ.
+Nothing that can be reproduced in isolation accounts for the difference, which leaves the per-launch
+structure and the interleaving with the attention -- both system-level, not inner-loop.
