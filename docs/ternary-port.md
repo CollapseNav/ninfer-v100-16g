@@ -2225,6 +2225,47 @@ decoder per format reading the packed layout, and binding changes to hand the pa
 kernel. Expected ceiling from the per-format table: the five slow formats sit at 45-61% of reachable, so
 lifting them toward 85% is about **1.24x on the decode step**, 48.7 -> ~60 tok/s.
 
+### Why IQ2 loses to Q2 despite carrying fewer bits
+
+Measured on one 17408x5120 tensor at T = 1, ncu counting instructions and shared traffic:
+
+| | instructions | shared-load wavefronts | DRAM bytes | L1TEX | decode GB/s |
+|---|---:|---:|---:|---:|---:|
+| iq2_xs | 10,078,720 | **2,075,250** | 26.15 MB | **67.24%** | 547.0 |
+| iq2_xxs | 9,766,400 | **2,023,150** | 23.35 MB | 60.29% | 547.3 |
+| q2_k | **6,120,960** | **0** | 30.12 MB | **48.23%** | 611.6 |
+| iq4_xs (control) | -- | **0** | 49.40 MB | -- | 723.9 |
+
+**The grid and sign lookups are the whole difference.** IQ2 pays a grid load plus a sign load per eight
+values; Q2 pays none; and `iq4_xs`, which also pays none, is the fastest format in the artifact. On
+Volta shared memory goes through the same L1TEX unit, which is why IQ2 sits at 67% of it against Q2's
+48%.
+
+Normalised per weight rather than per byte -- IQ2 and Q2 hold different numbers of weights per KB, so a
+per-byte comparison overstates this:
+
+| | instructions per weight | DRAM bytes per weight |
+|---|---:|---:|
+| iq2_xs | **0.113** | 0.293 |
+| iq2_xxs | 0.110 | 0.262 |
+| q2_k | **0.069** | 0.338 |
+
+**IQ2 reads 13% fewer bytes and executes 64% more instructions.** Since this kernel is instruction- and
+latency-bound rather than bandwidth-bound (DRAM 46.5%, warps stalled on the load scoreboard), that trade
+loses. The same decoders back `dequantize_rows`, which is why the fp16 prefill shows the same gap
+(iq2_xxs 331 us per call against q2_k's 157) -- one cause, two symptoms.
+
+**But "IQ2 is behind across the board" is not right.** It wins the integer mmq prefill by a wide margin:
+iq2_xxs 36.3 TFLOP/s against q2_k's 15.4, where q2_k is the outlier rather than IQ2. IQ2 loses the
+decode and every path that goes through a separate dequantize.
+
+**And a calibration for the repack work above**: closing the IQ2-to-Q2 gap entirely is worth only about
+4% of the decode step (2955 MiB moving from ~520 to ~610 GB/s saves 0.84 ms of 20.5 ms), because even Q2
+sits at 68% of reachable and 40% of the step is not a weight GEMM at all. The repack is only worth more
+than that if it takes the IQ formats *past* Q2 -- which means cutting both the instruction count (0.113
+against 0.069) and the shared traffic (2.07M wavefronts against zero), not just rearranging bytes.
+
+
 
 
 

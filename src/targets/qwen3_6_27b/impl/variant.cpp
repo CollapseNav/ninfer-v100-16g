@@ -261,7 +261,7 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
     auto scope     = workspace.scope();
     const int cols = hidden.ne[1];
     Tensor packed  = workspace.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, cols});
-    ops::linear(hidden, weights.packed, packed, stream);
+    ops::linear(hidden, weights.packed, packed, text_policy(weights.packed), workspace, stream);
     Tensor query_heads = query.view({TextConfig::head_dim, TextConfig::query_heads, cols});
     Tensor key_heads   = key.view({TextConfig::head_dim, TextConfig::kv_heads, cols});
     Tensor gate_heads  = gate.view({TextConfig::head_dim, TextConfig::query_heads, cols});
@@ -276,9 +276,9 @@ void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjecti
 
 void Variant::mtp_q_gate_projection(const Tensor& hidden,
                                     const MtpAttentionProjectionWeights& weights, Tensor& query,
-                                    Tensor& gate, WorkspaceArena&, cudaStream_t stream) {
-    ops::linear(hidden, weights.query, query, stream);
-    ops::linear(hidden, weights.output_gate, gate, stream);
+                                    Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream) {
+    ops::linear(hidden, weights.query, query, text_policy(weights.query), workspace, stream);
+    ops::linear(hidden, weights.output_gate, gate, text_policy(weights.output_gate), workspace, stream);
 }
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
@@ -448,19 +448,19 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
         Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
         ops::detail::gguf_swiglu(hidden, gguf->gate, &gguf->up, activation, workspace, stream);
         Tensor delta = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
-        ops::linear(activation, gguf->down, delta, stream);
+        ops::linear(activation, gguf->down, delta, text_policy(gguf->down), workspace, stream);
         ops::residual_add(delta, residual, stream);
         return;
     }
     const auto& fused = std::get<DenseMlpPayload>(weights);
     Tensor gate_up    = workspace.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, cols});
-    ops::linear(hidden, fused.gate_up, gate_up, stream);
+    ops::linear(hidden, fused.gate_up, gate_up, text_policy(fused.gate_up), workspace, stream);
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
     ops::silu_mul(gate_up.slice(0, 0, TextConfig::intermediate),
                   gate_up.slice(0, TextConfig::intermediate, TextConfig::intermediate), activation,
                   stream);
     Tensor delta = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
-    ops::linear(activation, fused.down, delta, stream);
+    ops::linear(activation, fused.down, delta, text_policy(fused.down), workspace, stream);
     ops::residual_add(delta, residual, stream);
 }
 
