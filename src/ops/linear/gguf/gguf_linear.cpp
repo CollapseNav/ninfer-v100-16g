@@ -15,8 +15,23 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// Rows the dequantize-and-GEMM route converts per pass for a type with no integer kernel.
-constexpr std::size_t kDequantizedScratchBytes = std::size_t{16} << 20;
+// Scratch the dequantize-and-GEMM route converts per pass for a type with no integer kernel. It is the
+// denominator of that route's pass count, and the pass count is what its cost is made of: on the
+// artifact's IQ1_M MLP tensor (17408 x 5120) at T = 512, 16 MiB means 12 passes and 64 MiB means 3, and
+// the measured time falls 12.914 -> 10.130 ms (-21.6%) for it. Past 64 MiB the curve flattens (128 MiB
+// is another 1.7%), so 64 is where the win is bought cheaply. NINFER_GGUF_DEQUANT_SCRATCH_MIB overrides
+// it -- reachable on purpose, because a tuning constant nobody can sweep is a constant nobody sweeps.
+std::size_t dequantized_scratch_bytes() {
+    constexpr std::size_t kDefaultMib = 64;
+    static const std::size_t bytes = [] {
+        const char* env = std::getenv("NINFER_GGUF_DEQUANT_SCRATCH_MIB");
+        if (env == nullptr) { return kDefaultMib << 20; }
+        const long mib = std::strtol(env, nullptr, 10);
+        if (mib < 1 || mib > 4096) { return kDefaultMib << 20; }
+        return static_cast<std::size_t>(mib) << 20;
+    }();
+    return bytes;
+}
 // Up to this many columns such a type loops the vector kernel instead: those are decode and verify
 // batches, captured in graphs, where a cuBLAS call is best avoided.
 constexpr std::int32_t kDequantizedVectorColumns = 64;
@@ -164,7 +179,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
         (void)layout.alloc_bytes(fixup_bound());
         if (dequantized) {
             (void)layout.alloc_bytes(gguf::vector_activation_bytes(k, gguf::kMaxVectorColumns));
-            (void)layout.alloc_bytes(kDequantizedScratchBytes);
+            (void)layout.alloc_bytes(dequantized_scratch_bytes());
         }
         for (std::size_t i = 0; i < std::max<std::size_t>(layouts.size(), 1) * activations; ++i) {
             (void)layout.alloc_bytes(gguf::matrix_activation_bytes(k, t));
@@ -227,7 +242,7 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     if (dequantized) {
         vector_activation =
             workspace.alloc_bytes(gguf::vector_activation_bytes(k, gguf::kMaxVectorColumns)).data;
-        scratch = workspace.alloc_bytes(kDequantizedScratchBytes).data;
+        scratch = workspace.alloc_bytes(dequantized_scratch_bytes()).data;
     }
 
     for (const auto& p : products) {
@@ -267,7 +282,7 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
                 source = gathered;
             }
             gguf::dequantized_product(type, w.qdata, row_bytes(w), w.n, k, source, t, out, stride,
-                                      scratch, kDequantizedScratchBytes, stream);
+                                      scratch, dequantized_scratch_bytes(), stream);
         }
         if (!direct) { gguf::store_plane(plane, w.n, w.n, t, output(p, 0), stream); }
     }

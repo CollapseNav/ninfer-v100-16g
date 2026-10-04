@@ -44,8 +44,11 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
     }
     if (is_gguf(qtype)) {
+        // The parts form passes gate and up as TWO products, and gguf_project_workspace_bytes sizes the
+        // activation per shape it is handed. The fused-parent form below passes one, so sizing for two
+        // covers both without under-counting the pair.
         const detail::GgufShape parent{qtype, gate_up_rows, input_rows};
-        return detail::gguf_swiglu_workspace_bytes(parent, nullptr, min_tokens, max_tokens);
+        return detail::gguf_swiglu_workspace_bytes(parent, &parent, min_tokens, max_tokens);
     }
     if (qtype == QType::W8G32_F16S) {
         if (policy != LinearPolicy::A16Only) {

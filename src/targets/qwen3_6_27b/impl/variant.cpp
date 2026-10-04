@@ -489,9 +489,18 @@ std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t
 // is known -- the plan is queried before any weight is bound -- so size for the FUSED parent width the
 // other profiles use. That is an over-estimate for every layer, which is safe because the arena is
 // sized once for the whole model and no part is ever wider than its parent.
-std::size_t gguf_projection_bytes(std::int32_t rows, std::int32_t first, std::int32_t last) {
+// The GGUF parts route quantizes the activation to ggml's q8_1 once per DISTINCT input gather, and
+// gguf_project_workspace_bytes sizes that per shape it is handed. This port's profile-level cases run
+// before any weight is bound, so they cannot know the real part list -- and passing one shape
+// under-counted the activations by the part count, which is four for attention (q|gate|k|v) and four
+// for GDN (q|k|v|z). That shortfall is what surfaced as std::bad_alloc at context >= 384. Sizing for
+// the widest part list any layer can have is safe: the arena is sized once for the whole model and
+// over-reserving a few activation buffers is the trade the tree already makes elsewhere.
+std::size_t gguf_projection_bytes(std::int32_t rows, std::int32_t first, std::int32_t last,
+                                  std::int32_t parts = 4) {
     const ops::detail::GgufShape parent{QType::GGUF_IQ2_XXS, rows, TextConfig::hidden};
-    return ops::detail::gguf_project_workspace_bytes({&parent, 1}, first, last);
+    const std::vector<ops::detail::GgufShape> shapes(static_cast<std::size_t>(parts), parent);
+    return ops::detail::gguf_project_workspace_bytes(shapes, first, last);
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
