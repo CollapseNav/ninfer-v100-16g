@@ -2049,6 +2049,48 @@ first", which is why v2 compiled out an int8 scratch nothing read. This port's F
 `k*T*2` activation buffers in its workspace query while usually using one, and the still-unfixed
 `std::bad_alloc` at context >= 384 is the same class of problem.
 
+## The decode, split before it is touched
+
+The decode reads **6.76 GiB per token across 338 GGUF tensors** (token_embedding excluded: a decode step
+reads one row of it, not the tensor). Timing the vector kernel per format in isolation, at T = 1, gives
+403-729 GB/s against the 897 GB/s this card reaches on a coalesced read:
+
+| format | MiB/token | tensors | GB/s | % of 897 | ms/token |
+|---|---:|---:|---:|---:|---:|
+| iq4_xs | 1236.5 | 12 | 729.3 | 81% | 1.778 |
+| iq2_s | 1018.6 | 49 | 506.0 | 56% | 2.111 |
+| q2_k | 917.1 | 51 | 612.9 | 68% | 1.569 |
+| iq2_xxs | 872.7 | 56 | 548.7 | 61% | 1.668 |
+| iq3_s | 779.9 | 45 | 660.8 | 74% | 1.238 |
+| iq2_xs | 679.3 | 37 | 548.2 | 61% | 1.299 |
+| iq3_xxs | 616.3 | 32 | 626.9 | 70% | 1.031 |
+| iq1_s | 384.8 | 28 | 514.4 | 57% | 0.784 |
+| iq1_m | 223.1 | 21 | 403.0 | 45% | 0.581 |
+| q6_k | 135.4 | 3 | 523.1 | 58% | 0.271 |
+| q4_k | 56.2 | 4 | 684.8 | 76% | 0.086 |
+
+**Summed at those rates the weight-reading kernels should take 12.42 ms. The measured decode step is
+20.53 ms. So 8.12 ms -- 40% -- is not a weight-reading GEMM at all.** That is the split worth having
+before touching anything: the per-format kernels are not the whole story, and neither is the 390 GB/s
+figure for the step as a whole.
+
+**The low-bit IQ formats are ALU-bound, not bandwidth-bound.** Their rate tracks the decoder's cost per
+byte almost monotonically: iq1_s (50 bytes per 256 values) 514, iq2_xxs (66) 549, iq2_xs (74) 548, iq2_s
+(82) 506, against iq4_xs (136) at 729. Reading the inner loop confirms it: the warp's weight reads cover
+four consecutive blocks and the activation reads cover 1024 contiguous bytes, so the access pattern is
+sound; what a lane carries is a `Slice` of `int w[8]` plus `float f[6]`.
+
+**And the occupancy lever is dead here too.** `__launch_bounds__(kVecWarps * 32)` with no min-CTA pin,
+`kVecWarps = 4` and 14-32 registers means 16 blocks of 128 threads per SM -- the full 64 warps. There is
+no headroom for a pin to buy, so v2's register lever fails here for the same reason it failed on the
+dequantize.
+
+**Where that leaves the decode.** The remaining win is in the decoder's cost per byte, not in its memory
+access -- which is the opposite of the conclusion the prefill reached. v2 evaluated prepacking and
+rejected it, but for a reason that does not hold here: their PQ2 layout already used every sector,
+whereas these IQ formats spend their time in the grid lookups. That is the next thing to measure.
+
+
 
 
 
