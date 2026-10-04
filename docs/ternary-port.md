@@ -1805,6 +1805,28 @@ the ternary artifact drives it correctly. Whatever is wrong is in what this port
 `v` and `z` from its own GGUF projections, since `g` and `beta` come from the shared bf16 control
 projections.
 
+### The prefix finding, now with the control it needed
+
+The obvious objection to the table above is that perplexity over wider windows is a different
+measurement, so flatness might be the instrument rather than the port. Running the **working ternary
+artifact** through the identical settings settles it:
+
+| context / stride | prefix | ternary (working) | this port (GGUF) |
+|---:|---:|---:|---:|
+| 8 / 4 | 4 | 4.836 | 10.279 |
+| 64 / 32 | 32 | **3.303** (-32%) | 10.691 (+4%) |
+| 256 / 128 | 128 | **2.630** (**-46%**) | 10.556 (+3%) |
+
+Same text, same tool, same flags, same window structure. The ternary path gains **46%** from a longer
+prefix; this port gains nothing. That is the cleanest controlled result in this whole investigation, and
+it says the GGUF path is not using its prefix at all.
+
+The prefix lives in two places: the KV cache, which only the 16 full-attention layers read, and the
+GDN's recurrent state, which the other 48 carry. A failure of that size has to be the recurrent state,
+and the state is driven by shared code with `q`, `k`, `v` and `z` supplied by this port's own GGUF
+projections.
+
+
 
 
 
