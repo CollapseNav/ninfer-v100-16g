@@ -1921,6 +1921,43 @@ That leaves the attention's *use* of the cache -- the append, the positions, the
 softmax -- all of which is shared code that drives the ternary artifact correctly, and none of which
 has been instrumented yet.
 
+### RESOLVED: the GGUF linear_swiglu path dropped post_attention_norm
+
+The functional test above is what found it. It pointed at the layer chain rather than at either memory,
+and reading the fused MLP path against the non-fused one showed why:
+
+```cpp
+    if (is_gguf(gate_up_weight.qtype)) {
+        detail::gguf_swiglu(x, gate_up_weight, nullptr, out, ws, stream);
+        return;                       // in_norm never applied
+    }
+```
+
+`linear_swiglu` carries the input rmsnorm for its callers -- its own comment says the norm "moved down
+into post_mixer -> linear_swiglu" -- and every non-GGUF branch runs it. The GGUF branch returned before
+doing so, so every layer whose artifact stores gate and up in ONE object (8 of the 64 here) silently
+lost `post_attention_norm` and contributed unnormalised values to the residual. This port's own parts
+path applies the norm explicitly, which is why only the fused layers were affected and why the damage
+looked like a subtle numerical error rather than a missing step.
+
+The fix reproduces the plain-norm branch:
+
+| context | before | after |
+|---:|---:|---:|
+| 8 | 10.279 | **4.809** |
+| 64 | 10.691 | **3.191** |
+| 256 | 10.556 | **2.507** |
+| improvement | -1% | **-48%** |
+
+The -48% slope agrees with both references (llama.cpp -46%, ternary artifact -46%), and generation is
+now correct: `2 + 2 =` gives *"The user is asking me to complete the equation "2 + 2 = ". This is a
+simple arithmetic problem."*, the capital-of-France prompt answers *Paris*, and the recall prompt
+returns `7 3 9 1`. `REGRESSION_OK_md5_identical` still holds for the v2 ternary artifact.
+
+Final numbers on the artifact this port was built for: 4421 prompt tokens at **prefill 476.4 tok/s**,
+**decode 48.7 tok/s**, 7.83 GiB resident, and coherent output on a CUDA-kernel analysis prompt.
+
+
 ### A functional test sharpens it: one token of context, then nothing
 
 Perplexity is an average. A generation test says it more sharply: the prompt is
