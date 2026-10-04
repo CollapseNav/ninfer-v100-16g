@@ -3189,10 +3189,25 @@ activation container is the multi-file change that collects it -- not the tensor
 
 ## Profile access
 
-`ncu` is in the build image at `/usr/local/cuda/bin/ncu` (not on `PATH`). It cannot profile here: the
-driver returns `ERR_NVGPUCTRPERM`, which needs `NVreg_RestrictProfilingToAdminUsers=0` in a host
-modprobe file plus a module reload or reboot — not done, the host GPU is in use. Also, ncu sees
-nothing inside CUDA graphs; pass `--no-cuda-graph`.
+`ncu` is in the build image at `/usr/local/cuda/bin/ncu` (not on `PATH`). **It does profile here -- the
+earlier note in this section was wrong.** A plain `docker run` returns `ERR_NVGPUCTRPERM`, but
+`docker run --privileged` is enough; no host modprobe change and no reboot are needed. The working
+incantation, used for the long-context attention numbers at the end of this file:
+
+```
+docker run --rm --privileged --gpus all -e NINFER_TERNARY_ROTATE_SPLIT=16 \
+  -v /root/ninfer-v100:/src -v /opt/models/ninfer:/models:ro -v $D:/ab -w /src \
+  ninfer-v100-buildenv:cu128 \
+  ncu --target-processes all --kernel-name regex:causal_attention_small_t \
+      --launch-skip 24 --launch-count 3 --section SpeedOfLight --section WarpStateStats \
+      --section SchedulerStats --section MemoryWorkloadAnalysis \
+      /src/build-sm70/apps/ninfer <model> ... --no-cuda-graph
+```
+
+`--no-cuda-graph` is still mandatory: ncu sees nothing inside CUDA graphs, because the kernels only
+execute once, during capture. `--kernel-name regex:...` plus `--launch-skip` is how to reach the decode
+kernels without paying for the prefill. ncu's note about the missing `smsp__pcsamp_sample_count` metric
+costs only the source-level stall locations, not the sections above.
 
 Because of that, every number above comes from A/B runs and timing probes on the real model rather
 than from a profiler, which is why each probe is documented with what it deletes.
