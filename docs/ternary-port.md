@@ -4380,3 +4380,40 @@ at the price of a reduction pass and a changed summation order, i.e. it would no
 The cheaper direction is to identify which projections those 240-block launches are, which a one-line
 print of `args.rows` in `launch` answers, and then see whether a different `per_block` assignment covers
 them without the activation cost that made `kRows = 1` lose 2%.
+### Correction: the vec kernel's grid is not underfilled, its occupancy is register-capped (2026-10-04)
+
+The previous section concluded from the nvprof grid histogram that "every decode launch underfills the
+GPU", taking 640 blocks -- 8 blocks per SM across 80 SMs -- as the capacity. That denominator was wrong
+twice over.
+
+First, the capacity is `resident * sm_count` where `resident` is the *runtime* occupancy, not a constant.
+At `kVecWarps = 8` (256 threads) the T=3 instantiation uses **64 registers**, so
+`65536 / (256 * 64) = 4` blocks per SM, i.e. **320 blocks** -- and the histogram's mode of 240 is 75% of
+that, not 37.5%. The launch is close to full, not a third full.
+
+Second, an instrumented build is not a neutral observer. Adding the probe's static arrays pushed the T=3
+instantiation to `resident = 3` in its own log, so the `blocks` it printed were the probe's, not the
+shipped build's.
+
+What survives, measured on the shipped build:
+
+| T | Fused | REG | LOCAL | blocks/SM | warps/SM |
+|---|---:|---:|---:|---:|---:|
+| 1 | 0 / 1 | 39 / 38 | 0 | 6 | 48 |
+| 2 | 0 / 1 | 56 | 0 | 4 | 32 |
+| **3** | 0 / 1 | **64** | 0 | **4** | **32** |
+| 4-6, 8 | 0 | 64 | 0 | 4 | 32 |
+| 7, 8 | 1 | 75 / 80 | 0 | 3 | 24 |
+
+So the vec kernel at the deployment's verify width runs at **32 warps per SM against the V100's 64** --
+50% occupancy, register-limited, with `LOCAL: 0`.
+
+Three consequences. The row-limited projections are the grid-64 and grid-128 launches, **7.8% of the vec
+time**, so split-K has little to win and the machine is not sitting empty. Window 1 (T=2, 56 registers)
+is still far worse on the current build -- 101.0 / 55.2 / 44.4 against 109.7 / 69.3 / 57.0 -- because the
+acceptance falls with it (3.53 / 2.00 / 2.00 against 4.62 / 2.50 / 3.00), so the verify width stays 2
+even though a narrower verify costs fewer registers. And the register cap is the wall: the minBlocks
+route through it is closed because the compiler rematerializes the activation operand rather than
+spilling, which multiplies the loads.
+
+What is left for this kernel is the inner loop's memory-level parallelism, not its grid.
