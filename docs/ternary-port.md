@@ -3793,15 +3793,37 @@ container:
     bash /root/serve_start.sh 1 16 iq2xs       # the v3 IQ2_XS artifact: window 1, chunk 2048
 
 The third argument selects the artifact, and each carries its own measured settings. `iq2xs` is the v3
-container (`/root/ms/swift15_iq2xs_mtp.ninfer`, IQ2_XS, multimodal, weights 8.49 GiB) and it needs
-`--prefill-chunk 2048` to plan at 131072 at all: the GGUF route's per-projection FP32 plane is
-`rows * T * 4` and `text_prefill` is sized by the chunk, so chunk 4096 gives it a 1.72 GB prefill layout
-against the ternary's 1.21 GB and the runtime reservation comes out 0.43 GiB over what is free after
-weights. Chunk 2048 halves that plane (1.05 GB) and 131072 plans again, at a measured prefill cost of
-about 4-5% (31.2k: 942 against 997 tok/s; 62.4k: 773 against 806). It also wants window 1 -- 35.7/40.3/31.9
-against 31.5/34.0/27.6 on window 2 -- and its MTP acceptance length is only 1.02-1.25 at these contexts,
-so it decodes 24-44% slower than the ternary. Both artifacts serve under the runtime name
-`qwen3.8-27b`, so a client does not have to know which one is resident.
+container (`/root/ms/swift15_iq2xs_mtp.ninfer`, IQ2_XS, multimodal) and it needs `--prefill-chunk 2048`
+to plan at 131072 at all: the GGUF route's per-projection FP32 plane is `rows * T * 4` and
+`text_prefill` is sized by the chunk, so chunk 4096 gives it a 1.72 GB prefill layout against the
+ternary's 1.21 GB and the runtime reservation comes out 0.43 GiB over what is free after weights. Chunk
+2048 halves that plane (1.05 GB) and 131072 plans again, at a measured prefill cost of about 4-5%
+(31.2k: 942 against 997 tok/s; 62.4k: 773 against 806).
+
+**It must NOT be given `--lm-head-draft`, and an earlier revision of this section got that wrong.** That
+flag selects the learned proposal head as the drafter instead of the LM-head argmax, and on this
+artifact it destroys MTP -- measured at ctx 4096, window 1, thinking on: plain drafter 81.0 tok/s with
+acceptance length 2.10 (66/74 drafts), `--lm-head-draft` 44.2 with 1.08 (9/118); at window 3, 77.6/2.86
+against 31.2/1.07. The flag had been carried over from the old artifact's command line, where the
+lookup/proposal path did help. Dropping it also stops materializing the proposal head, so weights fall
+from 8.49 to **8.15 GiB** and free-after-startup rises from 1.18 to 1.51 GiB.
+
+With the flag gone the v3 wants **window 2**, and it is faster than the ternary at every context rather
+than slower -- the earlier "24-44% slower" figure was the flag, compared against a ternary table that
+had never used it:
+
+| context | v3 window 1 | **v3 window 2** | ternary window 2 |
+|---|---:|---:|---:|
+| 15.6k | 78.2 (2.61) | **88.2 (3.53)** | 63.6 |
+| 31.2k | 54.4 (2.00) | **69.1 (2.50)** | 52.8 |
+| 62.4k | 42.3 (2.00) | **54.4 (3.00)** | 44.3 |
+
+(acceptance length in brackets; 128 greedy tokens, `--no-thinking`, `long.json`'s body repeated.) So the
+v3 is +23% to +39% on the ternary, and a real request through the resident server measures **68.8 tok/s
+with 51.2% MTP acceptance**, against 43.1 tok/s and 4.5% under the old flag.
+
+Both artifacts serve under the runtime name `qwen3.8-27b`, so a client does not have to know which one
+is resident.
 
 **A rebuilt binary needs the container restarted -- any restart.** The executable is bind-mounted from
 `/root/ninfer-v100`, so a running process keeps the old image of the file until it is re-exec'd; a
