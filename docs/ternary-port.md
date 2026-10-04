@@ -3782,3 +3782,18 @@ is not worth +20% on the copying phases.
 The knob and the trace are kept, because the value is a workload parameter in exactly the way the draft
 window is: `NINFER_MTP_LOOKUP_MATCH=6` for copying-dominated traffic, where the gain is measured with
 identical output, and 16 otherwise. This is the same conclusion the window reached, from the other side.
+
+`/root/serve_start.sh` is the deployment's authority and now carries both parameters, since the window
+already was one and this makes the set self-describing. It takes them positionally and recreates the
+container:
+
+    bash /root/serve_start.sh          # window 2, lookup suffix 16  (the resident setting)
+    bash /root/serve_start.sh 1        # window 1
+    bash /root/serve_start.sh 2 6      # window 2, suffix 6 -- copying/re-emission heavy traffic
+
+**A rebuilt binary needs that script, not `docker restart`.** The executable is bind-mounted from
+`/root/ninfer-v100`, so a running process keeps the old image of the file until it is re-exec'd, and a
+container that predates the build will happily keep serving the old one. The reliable check is to compare
+the process start against the binary's mtime, and the reliable proof is behavioural: this deployment's
+11,348-token copying request is deterministic per configuration, `mtp accepted 466/604` at suffix 16 and
+`402/688` at 6, so the counters say which build is actually serving.
