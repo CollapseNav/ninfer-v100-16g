@@ -4053,3 +4053,56 @@ kernel's footprint.
    verify column costs 0.60 of a T=1 step here against llama.cpp's 0.27 on the same card, and the
    ternary GEMV is 36-47% of the round. It is the largest remaining lever at short and medium context
    and it is a kernel rewrite rather than a constant.
+## The v3's own settings, measured (2026-10-04)
+
+With `--lm-head-draft` gone (see the previous section: that flag was costing this artifact half its
+decode rate), every setting the resident server uses was re-measured on the v3 itself rather than
+inherited from the old artifact's command line.
+
+**Window.** 128 greedy tokens, `--no-thinking`, `long.json`'s body repeated:
+
+| context | window 1 | **window 2** | window 3 |
+|---|---:|---:|---:|
+| 15.6k | 78.2 | **88.2** | 86.9 |
+| 31.2k | 54.4 | **69.1** | 59.4 |
+| 62.4k | 42.3 | **54.4** | 47.6 |
+
+Window 2 wins at every context. (Acceptance lengths 3.53 / 2.50 / 3.00.)
+
+**Prefill chunk**, at `--max-context 131072` on one fixture, thinking off, so decode and prefill are
+comparable:
+
+| chunk | decode | prefill | plans at 131072? |
+|---:|---:|---:|---|
+| 2048 | 69.1 | 942 | yes, 1.67 GiB free |
+| **3072** | **69.0** | **963** | yes, 1.41 GiB free |
+| 3584 | 66.0 | 990 | yes |
+| 4096 | -- | -- | **no** |
+
+3072 is the largest that keeps decode: 3584 buys 2.8% of prefill and pays 4.3% of decode, which on a
+21k-prompt / 28k-output turn is 18 s against 0.6 s. 4096 still does not plan even with the proposal head
+no longer materialized -- it is short by about 0.09 GiB.
+
+**Lookup suffix**, window 2, against the engine default of 16:
+
+| fixture | 16 | **6** |
+|---|---:|---:|
+| short-repeat prose (medium) | 116.4 | **163.1** (+40%) |
+| re-emit the CUDA source verbatim | 158.1 | **166.9** (+5.6%) |
+| long-repeat (31k), thinking off | 69.0 | 69.0 |
+| long-repeat (31k), thinking on | 63.3 | 63.3 |
+
+Every arm's output is byte-identical to its 16 counterpart, and the lookup does fire on this artifact
+without `--lm-head-draft`: 7-8 gate hits on the copying fixture, which runs at 158-167 tok/s against
+about 88 for ordinary prose. The engine default stays 16 -- it was chosen from runs on the OLD artifact
+that also carried `--lm-head-draft`, and that combination is what showed a non-ordering "lottery" on
+reasoning traffic -- so the deployment overrides it with `NINFER_MTP_LOOKUP_MATCH=6` rather than the code
+being changed. On the v3 the two values are identical on reasoning traffic, so there is no lottery to
+avoid here.
+
+**Wave alignment**, which was chosen on the old artifact, checked on this one: mode 1 (the default)
+against mode 0 gives 69.1 against 66.0 at 31.2k and 54.4 against 54.3 at 62.4k, so it holds here too.
+
+End to end on one request shape (71-token prompt, 256 generated, thinking on), the three changes
+compound: **43.1 tok/s with 4.5% MTP acceptance** under the inherited flags, **68.8 with 51.2%** once
+`--lm-head-draft` is dropped, **75.6 with 60.9%** once the suffix and chunk are the measured ones.
