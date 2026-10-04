@@ -4417,3 +4417,40 @@ route through it is closed because the compiler rematerializes the activation op
 spilling, which multiplies the loads.
 
 What is left for this kernel is the inner loop's memory-level parallelism, not its grid.
+### The vec kernel's bottleneck is the activation operand, re-read once per warp (2026-10-04)
+
+A standalone probe (`/root/vec_probe*.cu`, built with the tree's usual nvcc line) reproduces the kernel's
+inner loop and adds one piece at a time, at the same grid (320 blocks) and the same register cap (256
+threads, `minBlocks 4`, matching the shipped 64 registers):
+
+| variant | GB/s useful |
+|---|---:|
+| A the shipped six-load weight pattern | 815 |
+| B the same 296 bytes read coalesced | 870 |
+| C A without the register cap | 855 |
+| D A plus the whole IQ2_XS decode (codebook lookup, sign negation, `dp4a`) | 769 |
+| **E D plus the activation loads** | **72** |
+
+So the weight access pattern is *not* the problem -- the shipped scattered pattern streams at 91% of the
+V100's 900 GB/s on its own, and a fully coalesced version buys 6%. Nor is the decode: the codebook
+lookup with realistic index dispersion, the sign negation and the `dp4a` cost 5.7% between them. Adding
+the activation operand costs **10.6x**, taking the kernel from 769 GB/s to 72 GB/s.
+
+**Why.** Every warp in a block handles a *different* row-pair, but all eight of them read the *same*
+activation slices: lane `l` reads slice `l + 32*it` regardless of which row it is on. So a block reads the
+whole activation row eight times over. The activation is 1 byte per value against 0.29 bytes of IQ2_XS
+weight, and at T=3 the kernel reads 120 bytes of activation per lane per iteration against 9.25 bytes of
+weight -- a 13:1 ratio of L1 traffic, which is what the kernel's 44% L1/TEX utilisation was showing.
+
+This also explains the earlier row-count result from the other side: `kRows = 4` halves the activation
+traffic per weight byte, but it costs registers and the register cost won. The fix is the other axis:
+**split the K range across the block's warps instead of the rows**, so each warp reads a different
+eighth of the activation, at the price of an inter-warp reduction in place of the current per-warp
+shuffle. That is a structural change to the kernel rather than a constant, and it is the first candidate
+in this whole investigation whose mechanism accounts for the entire gap between 285 GB/s measured and
+768 GB/s demonstrated.
+
+One caveat, recorded: probe E loads the activations once per row per iteration, whereas the shipped
+kernel loads them once per *row-pair* (the activation array sits outside the `r` loop in `slice()`). E is
+therefore pessimistic by a factor of two on that axis; even so it lands at 72 GB/s against 769, so the
+conclusion does not depend on the difference.
