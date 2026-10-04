@@ -4106,3 +4106,35 @@ against mode 0 gives 69.1 against 66.0 at 31.2k and 54.4 against 54.3 at 62.4k, 
 End to end on one request shape (71-token prompt, 256 generated, thinking on), the three changes
 compound: **43.1 tok/s with 4.5% MTP acceptance** under the inherited flags, **68.8 with 51.2%** once
 `--lm-head-draft` is dropped, **75.6 with 60.9%** once the suffix and chunk are the measured ones.
+### The v3's decode is a different shape from the old artifact's
+
+Every kernel-level priority in this file was derived from the OLD artifact, and the v3 runs a different
+weight path (GGUF vector/matrix instead of the ternary QPN), so the decomposition had to be measured
+rather than inherited. nvprof on the v3 at 62.4k, window 2, `--lm-head-draft` gone, and with the lookup
+gate pinned shut (`NINFER_MTP_LOOKUP_MATCH=64`, an impossible suffix) so this is ordinary decode.
+
+The trace needed a different cut from the old artifact's: there, CUTLASS was prefill-only and the decode
+was everything after its last launch. Here **CUTLASS f16 and `gqa_attention_volta_flash` both have
+launches at the very end of an 89.7 s trace**, so the cut is by time bucket instead. The last 400 ms
+bucket is pure decode -- no CUTLASS, no gqa_flash, and the GGUF vector kernel present:
+
+| kernel family | launches | ms | share |
+|---|---:|---:|---:|
+| **GGUF vector (weight GEMV)** | 1034 | 52.3 | **55.9%** |
+| **`causal_attention_small_t`** | 73 | 33.3 | **35.7%** |
+| rmsnorm | 448 | 2.4 | 2.5% |
+| gdn recurrent | 98 | 2.1 | 2.2% |
+| gdn gating / mmq / rope / other | | ~3.4 | ~3.7% |
+
+Against the old artifact's 62k decode (attention 40.6%, qpn ternary GEMM 36.4%, w8 6.8%, other 16.2%).
+So the two artifacts invert each other: **the v3 spends 56% of its decode in the GGUF weight GEMV and
+36% in the attention**, and nothing this file says about the ternary GEMV or its verify band transfers
+to it. What does transfer is the attention: it is the same `small_t` kernel, still at two CTAs per SM,
+still DRAM-idle.
+
+Two consequences for the plan. The GGUF vector kernel is now the single largest decode term on the
+artifact actually being served and its efficiency has never been measured -- one ncu run on it is the
+next step, exactly as the attention was measured before it was touched. And the attention's gate-safe
+occupancy route (`v_s` staged as int8, -4,224 B at unchanged `Bc`, three CTAs without touching the
+softmax recurrence) now targets 36% of the round instead of the 40.6% it targeted on the old artifact --
+still the largest lever that does not require inventing a new kernel.
