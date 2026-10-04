@@ -35,6 +35,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -42,8 +44,42 @@
 #include <utility>
 #include <vector>
 
+#include <cuda_bf16.h>
+
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
+
+// NINFER_DUMP_LOGITS=<path> appends, for each column, the argmax over the token domain and its value,
+// taken from the BF16 logits this context just produced. It exists to compare this port's argmax
+// against another engine's logits on identical weights: perplexity is only 1.27x off here while greedy
+// output loops, so the question is which positions' argmax differ and by how much. Off unless set.
+inline void dump_logits_argmax(const Tensor& logits, std::int32_t token_domain,
+                               cudaStream_t stream) {
+    static const char* path = std::getenv("NINFER_DUMP_LOGITS");
+    if (path == nullptr || logits.data == nullptr || logits.dtype != DType::BF16) { return; }
+    const std::int32_t rows = logits.ne[0];
+    const std::int32_t cols = logits.ne[1];
+    if (rows <= 0 || cols <= 0) { return; }
+    const std::int32_t domain = std::min(token_domain, rows);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    std::vector<__nv_bfloat16> host(static_cast<std::size_t>(rows) * cols);
+    if (cudaMemcpy(host.data(), logits.data, host.size() * sizeof(__nv_bfloat16),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return;
+    }
+    static std::FILE* file = std::fopen(path, "w");
+    if (file == nullptr) { return; }
+    for (std::int32_t c = 0; c < cols; ++c) {
+        float best = -std::numeric_limits<float>::infinity();
+        std::int32_t best_row = -1;
+        for (std::int32_t r = 0; r < domain; ++r) {
+            const float v = static_cast<float>(host[static_cast<std::size_t>(c) * rows + r]);
+            if (v > best) { best = v; best_row = r; }
+        }
+        std::fprintf(file, "%d %d %.6f\n", c, best_row, best);
+    }
+    std::fflush(file);
+}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -686,6 +722,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
         ops::linear(hidden, *lm_head_, logits, ops::LinearPolicy::A16Only, work_, stream);
+        dump_logits_argmax(logits, kCfg.token_domain, stream);
     }
     work_.reset();
 }
@@ -746,6 +783,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
         ops::linear(flat_hidden, *lm_head_, flat_logits, ops::LinearPolicy::A16Only, work_, stream);
+        dump_logits_argmax(flat_logits, kCfg.token_domain, stream);
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
     work_.reset();

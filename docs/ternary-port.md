@@ -1713,6 +1713,30 @@ That is the state after eighteen rounds: every stage measured, the artifact byte
 source, a working reference engine on the identical weights, and one small systematic error left inside
 this port -- with a logits diff as the tool that will name it.
 
+### The tokenizer matches too, and where the scoring actually lives
+
+This port's degenerate output contains identifier fragments -- `sourceMappingement`, `IsNullOr`,
+`salvagerement` -- which looked like a wrong id-to-text mapping rather than a wrong model, and would
+have explained "nearly right perplexity, garbage text" neatly. It is not:
+
+| | |
+|---|---|
+| GGUF `tokenizer.ggml.tokens` | 248320 entries |
+| artifact `tokenizer.json` | 248044 BPE entries + 33 added tokens = 248077 |
+| ids 0..248043 identical | **248044 of 248044** |
+
+and the added tokens are the standard Qwen set (`<|endoftext|>`, `<|im_start|>`, `<|im_end|>`,
+`<|object_ref_start|>`, …). So the vocabulary is the same on both sides, the 248077 figure matches
+`kTokenDomain`, and the fragments are the model's own doing.
+
+**Where the scoring actually lives**, found this round because the first logits probe never fired: the
+perplexity tool calls `Engine::score_tokens`, which dispatches to
+`runtime::CausalScoreCore<Qwen3_6_27BInstance>::score`, several layers below the `TextContext`
+`lm_head_` call sites that were instrumented. The probe itself is in the tree, gated on
+`NINFER_DUMP_LOGITS`, and dumps each column's argmax over the token domain with its value -- it just
+needs to be called from `CausalScoreCore::score` instead.
+
+
 
 
 **Its threshold is between context 320 and 384.** Bisecting:
