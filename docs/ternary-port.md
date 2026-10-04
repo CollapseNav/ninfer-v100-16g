@@ -1957,6 +1957,62 @@ returns `7 3 9 1`. `REGRESSION_OK_md5_identical` still holds for the v2 ternary 
 Final numbers on the artifact this port was built for: 4421 prompt tokens at **prefill 476.4 tok/s**,
 **decode 48.7 tok/s**, 7.83 GiB resident, and coherent output on a CUDA-kernel analysis prompt.
 
+## Prefill: onto Volta's fp16 tensor cores, 481 -> 1120 tok/s (2.33x)
+
+The prefill was running at 26.3 TFLOP/s average -- inside the range the integer mmq kernel measures
+per format, so there was no overhead left to remove. The reason it is that rate and not higher is the
+card: **Volta has FP16 tensor cores and neither int8 nor bf16 ones.** mmq is int8, so on sm_70 it runs
+dp4a on CUDA cores; the dequantized fallback asked cuBLAS for `CUDA_R_16BF`, which also has no tensor
+cores here. cuBLAS alone, at this model's projection shapes:
+
+| shape | fp16 | bf16 |
+|---|---:|---:|
+| mlp gate/up (17408x5120, N=512) | **82.6 TFLOP/s** | 9.6 |
+| mlp down (5120x17408, N=512) | **104.0** | 11.3 |
+| attn query (6144x5120, N=4421) | **98.9** | 11.8 |
+
+an 8-9x gap that both existing arms were leaving on the table.
+
+**The obvious transfer of the v2 lesson was measured and refuted first**: dequantize-then-cuBLAS lost to
+mmq by 4.05x to 14.83x on every format, because the BF16 GEMM it fed was the slow part. Adding FP16 as a
+third arm changed that completely -- at T = 512 with a 64 MiB scratch:
+
+| format | mmq | bf16-dequant | fp16 | fp16 vs mmq |
+|---|---:|---:|---:|---:|
+| iq1_s | 2.804 | 10.089 | **2.212** | 1.27x |
+| iq2_s | 2.824 | 10.140 | **2.226** | 1.27x |
+| iq2_xs | 2.810 | 10.130 | **2.161** | 1.30x |
+| iq2_xxs | 2.511 | 10.141 | **2.183** | 1.15x |
+| iq3_s | 2.603 | 10.156 | **2.177** | 1.20x |
+| iq3_xxs | 2.531 | 10.150 | **2.177** | 1.16x |
+| iq4_xs | 2.436 | 9.698 | **1.801** | 1.35x |
+| q2_k | 5.939 | 9.554 | **1.580** | **3.76x** |
+| q4_k | 2.878 | 9.730 | **1.817** | 1.58x |
+| q6_k | 2.810 | 9.552 | **1.573** | 1.79x |
+
+FP16 wins on **every** format, including mmq's best ones. `q2_k` -- the anomaly flagged in the previous
+round at 15.4 TFLOP/s where its peers got 32-36 -- is the largest relative win.
+
+The bridge already templated its dequantizer on the destination type, so this needed a new entry point
+(`dequantize_rows` to `__nv_half`), a bf16->fp16 activation conversion, and `dequantized_product_f16`;
+`gguf_linear` then routes the matrix regime through it. End to end on a 4421-token prompt:
+
+| | before | after |
+|---|---:|---:|
+| prefill | 481.2 tok/s | **1120 tok/s** |
+| decode | 48.7 | 48.7 (vector path, unchanged) |
+| PPL | 2.506652 | **2.505203** |
+
+The perplexity improves rather than degrades, because FP16 carries ten mantissa bits where BF16 carries
+seven. The greedy text differs between the routes, as it must for any numerical change, and both are
+coherent. For reference the tree's ternary artifact prefills at 1.20k tok/s, so the GGUF path is now at
+parity with it. `NINFER_GGUF_F16_PREFILL=0` restores mmq without a rebuild.
+
+**What is left on the table**: the fp16 arm reaches 41-58 TFLOP/s against cuBLAS's own 83-104, so the
+dequantize pass is now the shared bottleneck. Closing that needs the QPN analogue -- a kernel that
+decodes the blocks inside the MMA pipeline -- rather than another routing change.
+
+
 
 ### A functional test sharpens it: one token of context, then nothing
 
