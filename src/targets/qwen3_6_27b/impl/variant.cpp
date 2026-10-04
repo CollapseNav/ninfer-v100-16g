@@ -313,7 +313,18 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
 }
 
 void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjectionWeights& weights,
-                                Tensor& key, Tensor& value, WorkspaceArena&, cudaStream_t stream) {
+                                Tensor& key, Tensor& value, WorkspaceArena& workspace,
+                                cudaStream_t stream) {
+    // ops::linear_pair is a W8G32_F16S-only op that takes no workspace, and it validates the weights
+    // it is handed. The GGUF MTP block stores key and value as two row ranges of ONE gguf_q6_k
+    // object, so on that profile the pair goes through the ordinary workspace-bearing linear twice.
+    // The plan reserves the transient for both profiles (see
+    // mtp_kv_projection_workspace_capacity_bytes); the pair route simply ignores it.
+    if (is_gguf(weights.key.qtype)) {
+        ops::linear(hidden, weights.key, key, text_policy(weights.key), workspace, stream);
+        ops::linear(hidden, weights.value, value, text_policy(weights.value), workspace, stream);
+        return;
+    }
     ops::linear_pair(hidden, weights.key, weights.value, key, value, stream);
 }
 
@@ -524,7 +535,11 @@ std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int3
 std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
                                                                 std::int32_t last) {
     validate_token_interval(first, last);
-    return 0;
+    // Zero was right while this was the W8 pair op, which needs no workspace. It is not right for a
+    // GGUF artifact, whose key and value take the ordinary linear route. Like the other MTP queries
+    // this one takes no weights profile, so it reserves the GGUF transient unconditionally: the
+    // arena is sized once for the whole model and the pair route ignores the extra.
+    return gguf_projection_bytes(TextConfig::kv_size, first, last, 1);
 }
 
 std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
