@@ -1694,6 +1694,26 @@ has been measured -- so the next step is a logits diff: `llama-perplexity --save
 source against the same from this port. This port's perplexity report carries only aggregates, so it
 needs a small env-gated logits dump, and that diff would show which logits are wrong and by how much.
 
+### The cleanest evidence yet: same prompt, thinking off, correct vs garbage
+
+With thinking disabled on both sides -- `--no-thinking` here, `--chat-template-kwargs
+'{"enable_thinking":false}'` for llama.cpp -- the two engines get the identical prompt and the model
+is asked something it can do:
+
+| engine | output |
+|---|---|
+| **llama.cpp on the source GGUF** | **`2 + 2 = 4`** |
+| this port on the `.ninfer` repackaging | `**Answer:** `$`    Or wait—but hold aufortuguementant demu sourceMappingement Ouver.IsNullOr salvaguardement Ouver` |
+
+llama.cpp gets it exactly right. The model and the quantization are entirely capable; this port is not.
+Its first two tokens (`**Answer:**`) are even plausible and then it comes apart, which matches the
+earlier observation that the opening is right and the argmax drifts.
+
+That is the state after eighteen rounds: every stage measured, the artifact byte-identical to its
+source, a working reference engine on the identical weights, and one small systematic error left inside
+this port -- with a logits diff as the tool that will name it.
+
+
 
 **Its threshold is between context 320 and 384.** Bisecting:
 
