@@ -212,7 +212,16 @@ DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
         throw std::overflow_error("arena allocation end offset overflows size_t");
     }
     const std::size_t end = aligned_offset + bytes;
-    if (end > cap_) { throw std::bad_alloc(); }
+    if (end > cap_) {
+        // Name the numbers. This failure surfaced as a bare std::bad_alloc both at context >= 384 and
+        // in the MTP path, and bisecting it by guess cost several rounds; the offset, the request and
+        // the capacity identify the caller immediately.
+        throw std::runtime_error("workspace arena exhausted: requested " + std::to_string(bytes) +
+                                 " B at aligned offset " + std::to_string(aligned_offset) +
+                                 " (align " + std::to_string(align) + "), end " +
+                                 std::to_string(end) + " > capacity " + std::to_string(cap_) +
+                                 ", peak " + std::to_string(peak_));
+    }
 
     auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;
     off_      = end;

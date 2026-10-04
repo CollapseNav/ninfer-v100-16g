@@ -276,16 +276,23 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
         void* data;
     };
     std::vector<Activation> activations;
+    // A product with an f32 destination and a Store epilogue writes straight there and needs no FP32
+    // plane. For the output head that plane is 248320 rows x T x 4 bytes -- 362 MiB at T = 384 -- and
+    // it was what exhausted the arena (measured: end 544 MiB against a 500 MiB capacity).
     std::int32_t plane_rows = 0;
     bool dequantized        = false;
+    bool needs_plane        = false;
     for (const auto& p : products) {
-        plane_rows = std::max(plane_rows, p.weight->n);
+        if (p.f32 == nullptr || p.epilogue != GgufEpilogue::Store) {
+            plane_rows = std::max(plane_rows, p.weight->n);
+            needs_plane = true;
+        }
         dequantized |= !matrix_kernel(*p.weight);
     }
     // The FP16 arm carries every product, so it needs the scratch whatever the formats are.
     if (use_f16_prefill(t)) { dequantized = true; }
-    auto* plane = static_cast<float*>(
-        workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data);
+    auto* plane = needs_plane ? static_cast<float*>(
+        workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data) : nullptr;
     void* fixup = workspace.alloc_bytes(fixup_bound()).data;
     void* vector_activation = nullptr;
     void* scratch           = nullptr;
