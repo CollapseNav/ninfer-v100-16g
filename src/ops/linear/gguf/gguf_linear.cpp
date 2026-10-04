@@ -30,6 +30,23 @@ bool f16_prefill_enabled() {
     return enabled;
 }
 
+// The fp16 arm dequantizes a whole weight per projection whatever the token count, so its cost is
+// mostly T-independent while mmq's scales with T. Measured wall-clock crossover on a 17408x5120
+// projection, one token generated, prompt 21 / 323 / 1523 tokens:
+//
+//   tokens   fp16      mmq
+//   21       12.62 s   12.35 s   <- mmq wins
+//   323      12.94 s   12.96 s   <- even
+//   1523     13.66 s   15.43 s   <- fp16 wins by 1.77 s
+//
+// so the arm is only worth taking once the GEMM dominates. 256 is just under the measured crossing
+// point, which the algebra puts at T = fixed_dequantize / (mmq_slope - fp16_slope) ~= 320.
+constexpr std::int32_t kF16PrefillMinTokens = 256;
+
+bool use_f16_prefill(std::int32_t tokens) {
+    return f16_prefill_enabled() && tokens >= kF16PrefillMinTokens;
+}
+
 // Scratch the dequantize-and-GEMM route converts per pass for a type with no integer kernel. It is the
 // denominator of that route's pass count, and the pass count is what its cost is made of: on the
 // artifact's IQ1_M MLP tensor (17408 x 5120) at T = 512, 16 MiB means 12 passes and 64 MiB means 3, and
@@ -52,6 +69,15 @@ std::size_t dequantized_scratch_bytes() {
 constexpr std::int32_t kDequantizedVectorColumns = 64;
 // The widest stream-k fixup plane any launch can ask for: one 128 x 128 FP32 tile per SM.
 constexpr std::size_t kFixupTileBytes = 128 * 128 * sizeof(float);
+
+// The FP16 route pipelines two buffers so the dequantize of one overlaps the GEMM of the other, so it
+// asks the workspace for twice what the single-buffer BF16 route needs. One helper, used by both the
+// query and the allocation, keeps the two from drifting apart -- which is what made raising the scratch
+// fail with std::bad_alloc before the part-count fix.
+std::size_t scratch_allocation_bytes() {
+    const std::size_t one = dequantized_scratch_bytes();
+    return f16_prefill_enabled() ? 2 * one : one;
+}
 
 std::int64_t row_bytes(const Weight& w) {
     const auto block = gguf_block_shape(w.qtype);
@@ -197,7 +223,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
         (void)layout.alloc_bytes(fixup_bound());
         if (dequantized) {
             (void)layout.alloc_bytes(gguf::vector_activation_bytes(k, gguf::kMaxVectorColumns));
-            (void)layout.alloc_bytes(dequantized_scratch_bytes());
+            (void)layout.alloc_bytes(scratch_allocation_bytes());
         }
         // The FP16 arm keeps the converted activation for the whole call, and a product with its own
         // input gather needs a BF16 staging buffer plus its converted copy. Three is the widest any
@@ -257,7 +283,7 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
         dequantized |= !matrix_kernel(*p.weight);
     }
     // The FP16 arm carries every product, so it needs the scratch whatever the formats are.
-    if (f16_prefill_enabled() && t > gguf::kMaxVectorColumns) { dequantized = true; }
+    if (use_f16_prefill(t)) { dequantized = true; }
     auto* plane = static_cast<float*>(
         workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data);
     void* fixup = workspace.alloc_bytes(fixup_bound()).data;
@@ -266,12 +292,12 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     if (dequantized) {
         vector_activation =
             workspace.alloc_bytes(gguf::vector_activation_bytes(k, gguf::kMaxVectorColumns)).data;
-        scratch = workspace.alloc_bytes(dequantized_scratch_bytes()).data;
+        scratch = workspace.alloc_bytes(scratch_allocation_bytes()).data;
     }
     // One conversion per call: cuBLAS wants both operands in the same type, and every product reads the
     // same activation apart from its own gather.
     __nv_half* x_half = nullptr;
-    if (f16_prefill_enabled() && t > gguf::kMaxVectorColumns) {
+    if (use_f16_prefill(t)) {
         x_half = static_cast<__nv_half*>(workspace.alloc_bytes(std::size_t(k) * t * 2).data);
         gguf::convert_bf16_to_f16(xb, x_half, std::size_t(k) * t, stream);
     }
@@ -294,7 +320,7 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
                 source = gathered_h;
             }
             gguf::dequantized_product_f16(type, w.qdata, row_bytes(w), w.n, k, source, t, out,
-                                          stride, scratch, dequantized_scratch_bytes(), stream);
+                                          stride, scratch, 2 * dequantized_scratch_bytes(), stream);
         } else if (gguf::has_matrix_kernel(type)) {
             const int layout = gguf::matrix_activation_layout(type);
             auto found = std::find_if(activations.begin(), activations.end(), [&](const Activation& a) {
