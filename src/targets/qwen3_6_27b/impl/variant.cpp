@@ -464,26 +464,6 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
     ops::residual_add(delta, residual, stream);
 }
 
-std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                       std::int32_t last) {
-    validate_token_interval(first, last);
-    WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, last});
-    return layout.peak_bytes(1);
-}
-
-std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                std::int32_t last) {
-    validate_token_interval(first, last);
-    return 0;
-}
-
-std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                    std::int32_t last) {
-    validate_token_interval(first, last);
-    return 0;
-}
-
 // The GGUF parts route quantizes the activation to ggml's q8_1 once per projection and reuses it for
 // every part, so its transient bytes depend on the part shapes. At plan time only the weights profile
 // is known -- the plan is queried before any weight is bound -- so size for the FUSED parent width the
@@ -501,6 +481,33 @@ std::size_t gguf_projection_bytes(std::int32_t rows, std::int32_t first, std::in
     const ops::detail::GgufShape parent{QType::GGUF_IQ2_XXS, rows, TextConfig::hidden};
     const std::vector<ops::detail::GgufShape> shapes(static_cast<std::size_t>(parts), parent);
     return ops::detail::gguf_project_workspace_bytes(shapes, first, last);
+}
+
+// The MTP queries take no weights profile, so they cannot know whether the artifact's MTP block is
+// GGUF. Over-reserving is safe -- the arena is sized once for the whole model -- and under-reserving
+// is a std::bad_alloc while preparing graphs, which is what `--spec mtp` hit: the q_gate query
+// returned 0 unconditionally. Each of these therefore also reserves the GGUF parts route's transient
+// bytes, sized for the widest projection in the model rather than the real one.
+std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                       std::int32_t last) {
+    validate_token_interval(first, last);
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, last});
+    return std::max(layout.peak_bytes(1),
+                    gguf_projection_bytes(TextConfig::mtp_attention_input_rows, first, last, 1));
+}
+
+std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                std::int32_t last) {
+    validate_token_interval(first, last);
+    return 0;
+}
+
+std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                    std::int32_t last) {
+    validate_token_interval(first, last);
+    // Two separate single-part projections, query and output_gate; sized for the model's widest.
+    return gguf_projection_bytes(TextConfig::intermediate, first, last, 1);
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
@@ -726,7 +733,9 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
     (void)layout.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, last});
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
     (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
-    return layout.peak_bytes(1);
+    // The GGUF branch is a swiglu pair plus a down projection: two parts then one.
+    return std::max(layout.peak_bytes(1),
+                    gguf_projection_bytes(TextConfig::intermediate, first, last, 2));
 }
 
 } // namespace ninfer::targets::qwen3_6_27b::detail
