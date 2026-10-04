@@ -2181,6 +2181,51 @@ parameters has now been measured with a harness good to 2%, and the kernel sits 
 remaining 33% ncu estimates needs a decoder that reads the weights differently -- the QPN-shaped work --
 not another parameter.
 
+### Five levers rejected, and the design the sixth one has to be
+
+With the min-of-200 harness, the L1 prefetch was the last cheap idea and it lost too -- the stall is a
+long scoreboard on the weight loads, so prefetching the next slice's block should have converted DRAM
+misses into L1 hits, but it takes an LSU slot from the loads it is meant to help and arrives a slice
+late:
+
+| format | baseline | + L1 prefetch |
+|---|---:|---:|
+| iq2_xs | **547.0** | 474.7 |
+| iq2_xxs | **547.3** | 477.4 |
+| iq2_s | **506.9** | 449.7 |
+| iq1_s | **500.0** | 395.3 |
+| iq4_xs | **723.9** | 711.4 |
+| iq3_s | **659.6** | 575.4 |
+| q2_k | **611.6** | 595.0 |
+
+Five levers, all rejected on measurement: `kRows` 1/4/8, `kVecWarps` 2/8, the `__launch_bounds__` min-CTA
+pin, raising the grid clamp, and this prefetch. The kernel is at a local optimum for its structure.
+
+**What the next decoder has to do differently.** The measured facts that constrain it:
+
+* DRAM runs at **46.5%** while warps stall on the load scoreboard -- too few loads in flight, not too
+  little bandwidth. Reaching peak needs more bytes per outstanding load, or more outstanding loads.
+* The warp's weight reads are **already coalesced** (four consecutive blocks per step), so this is not a
+  sector-utilisation problem and the fix is not a repack for locality.
+* Registers cap occupancy at 12 blocks where warps allow 16, so neither software pipelining nor a larger
+  tile can be paid for in registers. Volta has no `cp.async`.
+* Per slice a warp reads **1024 bytes of q8 activation against 592 bytes of IQ2_XS weight**, because the
+  activation is a byte per weight where the weight is 2.3 bits -- and the activation is L1-resident
+  after the first row iteration, so the DRAM traffic is the weight alone.
+
+So the win has to come from **more weight bytes per load instruction**, which is a layout change: pack
+each lane's block into one contiguous span so a single wide load replaces the 2-3 scattered accesses it
+makes today (`qs[4*ib+il]`, `scales[ib]` and `d` live 60 bytes apart in a 74-byte IQ2_XS block). This is
+v2's "lane l loads one byte" principle, and their reason for rejecting prepacking does not apply here --
+they rejected it because PQ2's layout already used every sector, whereas the cost here is instruction
+count and memory-level parallelism.
+
+The work is: a one-time repack pass over the 6.76 GiB of decode weights (~30 s at this card's rate), a
+decoder per format reading the packed layout, and binding changes to hand the packed buffer to the
+kernel. Expected ceiling from the per-format table: the five slow formats sit at 45-61% of reachable, so
+lifting them toward 85% is about **1.24x on the decode step**, 48.7 -> ~60 tok/s.
+
+
 
 
 
