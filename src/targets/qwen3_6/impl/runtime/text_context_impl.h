@@ -727,6 +727,64 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
     work_.reset();
 }
 
+// NINFER_DUMP_RECURRENT=<path>: one line per (step, layer) with a spread sample of the recurrent
+// state on entry and on exit -- a checksum, the count of non-zero samples, and the first few values.
+// A state that carries nothing from the previous step is what "the model does not use its prefix" looks
+// like from the inside. Off unless the variable is set.
+inline void dump_recurrent_state(std::uint32_t layer, std::int32_t slot_in, std::int32_t slot_out,
+                                 const Tensor& in, const Tensor& out, cudaStream_t stream) {
+    static const char* path = std::getenv("NINFER_DUMP_RECURRENT");
+    if (path == nullptr || in.data == nullptr || out.data == nullptr) { return; }
+    // The state may be BF16 or FP32; both are read as floats.
+    const bool bf16 = in.dtype == DType::BF16;
+    if (!bf16 && in.dtype != DType::FP32) { return; }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    constexpr std::size_t kSamples = 8192;
+    const std::size_t total = static_cast<std::size_t>(in.numel());
+    if (total == 0) { return; }
+    const std::size_t stride = std::max<std::size_t>(1, total / kSamples);
+    std::vector<float> a(kSamples), b(kSamples);
+    const std::size_t elem = bf16 ? sizeof(__nv_bfloat16) : sizeof(float);
+    const auto* pin = static_cast<const std::byte*>(in.data);
+    const auto* pout = static_cast<const std::byte*>(out.data);
+    std::size_t taken = 0;
+    for (std::size_t i = 0; i < total && taken < kSamples; i += stride, ++taken) {
+        if (bf16) {
+            __nv_bfloat16 va{}, vb{};
+            if (cudaMemcpy(&va, pin + i * elem, elem, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(&vb, pout + i * elem, elem, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return;
+            }
+            a[taken] = static_cast<float>(va);
+            b[taken] = static_cast<float>(vb);
+        } else {
+            if (cudaMemcpy(&a[taken], pin + i * elem, elem, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(&b[taken], pout + i * elem, elem, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return;
+            }
+        }
+    }
+    auto stats = [&](const std::vector<float>& v) {
+        double sum = 0.0;
+        std::size_t nz = 0;
+        for (std::size_t i = 0; i < taken; ++i) {
+            sum += v[i];
+            if (v[i] != 0.0f) { ++nz; }
+        }
+        return std::pair<double, std::size_t>(sum, nz);
+    };
+    const auto [sum_in, nz_in]   = stats(a);
+    const auto [sum_out, nz_out] = stats(b);
+    static std::FILE* file       = std::fopen(path, "a");
+    if (file == nullptr) { return; }
+    std::fprintf(file,
+                 "layer=%u slots=%d/%d dtype=%s samples=%zu in_sum=%.6g in_nz=%zu in0=%.6f "
+                 "out_sum=%.6g out_nz=%zu out0=%.6f\n",
+                 layer, slot_in, slot_out, bf16 ? "bf16" : "f32", taken, sum_in, nz_in,
+                 a.empty() ? 0.0f : a[0], sum_out, nz_out, b.empty() ? 0.0f : b[0]);
+    std::fflush(file);
+}
+
 template <class Tap>
 void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                            const Tensor& rope_positions,
@@ -1003,6 +1061,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                                                *active_linear_state_source_slots_, records.key,
                                                records.value, records.gate, out_batch, s);
         } else {
+            // The slot indices arrive as device tensors on this path, so they are not readable here;
+            // -1 marks them as unavailable rather than wrong.
+            dump_recurrent_state(gidx, -1, -1, recurrent_states, recurrent_states, s);
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
                 /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
@@ -1013,6 +1074,12 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor recurrent_state_out =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
+        // NINFER_DUMP_RECURRENT=<path>: record what the recurrent state held on entry and what it holds
+        // on exit, per layer per step. A state that never carries anything from the previous step is
+        // exactly what "the model does not use its prefix" looks like from the inside, and this is the
+        // only place both buffers are visible at once.
+        dump_recurrent_state(gidx, linear_state_source_slot_, linear_state_destination_slot_,
+                             recurrent_state_in, recurrent_state_out, s);
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
                              /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
                              o, s);

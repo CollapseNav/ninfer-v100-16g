@@ -1826,6 +1826,37 @@ GDN's recurrent state, which the other 48 carry. A failure of that size has to b
 and the state is driven by shared code with `q`, `k`, `v` and `z` supplied by this port's own GGUF
 projections.
 
+### The recurrent state is alive, and its decay is right
+
+A probe on both `gated_delta_net` call sites (`NINFER_DUMP_RECURRENT`, one line per layer per call with
+a spread sample of the state) says the state is not frozen:
+
+```
+layer=0  in_sum=0          <- first call, state empty
+layer=0  in_sum=16.2646
+layer=0  in_sum=14.4299
+layer=0  in_sum=15.5968
+layer=0  in_sum=18.0053
+layer=0  in_sum=19.2588
+layer=0  in_sum=21.037
+layer=0  in_sum=22.7059
+layer=0  in_sum=25.0905
+```
+
+(the probe is called before the update, so `in` and `out` read the same pre-update buffer; what matters
+is that consecutive calls differ, which they do.)
+
+And the decay is correct. `g = softplus(alpha + dt) * a` with `a = -exp(a_log)`, and the artifact's
+`a_log` is all-negative over its 48 values, `[-5.5625, -1.0859]`, so `a` lands in
+`[-0.0406, -0.0095]` -- a proper small negative decay. (An earlier note in this document cited a range
+of `[-5.7, 19.25]` for `a_log`; that was a different fp32 tensor from the same artifact, not `a_log`.)
+
+So the recurrent path looks healthy: the state evolves, the decay is right, the layout, row order and
+gating arithmetic match llama.cpp. What is still unexplained is why the prefix does not reach the
+output -- and the probe cannot settle it, because it never sees the post-update state or the value the
+layer hands downstream.
+
+
 
 
 
