@@ -1736,6 +1736,32 @@ perplexity tool calls `Engine::score_tokens`, which dispatches to
 `NINFER_DUMP_LOGITS`, and dumps each column's argmax over the token domain with its value -- it just
 needs to be called from `CausalScoreCore::score` instead.
 
+### The model is not using its context at all
+
+The probe was moved into `gguf_linear` itself -- every caller of the head funnels through that one
+function -- and while running it, llama.cpp's perplexity on the same text at a smaller context produced
+the number that matters:
+
+| context | this port | llama.cpp on the source GGUF |
+|---:|---:|---:|
+| 8 | 10.256 | -- |
+| 64 | 10.691 | **59.593** |
+| 256 | 10.556 | -- |
+| 512 | -- | **8.140** |
+
+llama.cpp improves **7x** from context 64 to 512. This port moves from 10.26 to 10.69 to 10.56 --
+essentially flat. **This port's model is not benefiting from context at all**, which is exactly why it
+repeats: it cannot see what it has already said. The tree's ternary artifact, by contrast, does improve
+with context (4.836 at 8, 4.015 at 16).
+
+That also retires an earlier "negative" that was never a negative: round 6 recorded the KV cache as
+exonerated because int8 and bf16 produced identical text. That test only ruled out the cache's
+*quantization*, never its *use*.
+
+So the fault is in the GGUF attention path -- and the K and V that path caches are written by this
+port's own GGUF projections, which is where to look next.
+
+
 
 
 

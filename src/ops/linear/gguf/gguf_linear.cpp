@@ -3,9 +3,14 @@
 #include "core/layout.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <cuda_bf16.h>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -268,10 +273,47 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     }
 }
 
+// NINFER_DUMP_LOGITS=<path>: for a product whose row count is the padded vocabulary, append each
+// column's argmax and its value. Off unless the variable is set.
+void dump_lm_head_argmax(const Weight& w, const Tensor& out, cudaStream_t stream) {
+    static const char* path = std::getenv("NINFER_DUMP_LOGITS");
+    if (path == nullptr || w.n != 248320 || out.data == nullptr || out.dtype != DType::BF16) {
+        return;
+    }
+    const std::int32_t rows = out.ne[0];
+    const std::int32_t cols = out.ne[1];
+    if (rows <= 0 || cols <= 0 || rows != w.n) { return; }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    std::vector<__nv_bfloat16> host(static_cast<std::size_t>(rows) * cols);
+    if (cudaMemcpy(host.data(), out.data, host.size() * sizeof(__nv_bfloat16),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return;
+    }
+    static std::FILE* file = std::fopen(path, "a");
+    if (file == nullptr) { return; }
+    std::fprintf(file, "# call rows=%d cols=%d\n", rows, cols);
+    for (std::int32_t c = 0; c < cols; ++c) {
+        float best = -std::numeric_limits<float>::infinity();
+        std::int32_t best_row = -1;
+        for (std::int32_t r = 0; r < rows; ++r) {
+            const float v = static_cast<float>(host[static_cast<std::size_t>(c) * rows + r]);
+            if (v > best) { best = v; best_row = r; }
+        }
+        std::fprintf(file, "%d %d %.6f\n", c, best_row, best);
+    }
+    std::fflush(file);
+}
+
 void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                  cudaStream_t stream) {
     const GgufProduct product{&w, &out, 0, GgufEpilogue::Store};
     gguf_project(x, {&product, 1}, workspace, stream);
+    // NINFER_DUMP_LOGITS=<path>: when this product is the language-model head (its row count is the
+    // padded vocabulary), append each column's argmax over the token domain and its value. Placed here
+    // rather than in the runtime because every caller of the head -- scoring, sampling, verify --
+    // funnels through this one function, and chasing the scoring path through the program layers
+    // proved to be several indirections deep.
+    dump_lm_head_argmax(w, out, stream);
 }
 
 void gguf_linear_add(const Tensor& x, const Weight& w, Tensor& residual,
