@@ -71,6 +71,29 @@ ops::LinearPolicy text_policy(const Weight& weight) {
 
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
+// The GDN input-projection leaves below need this: the GGUF parts route runs a ggml projection INSIDE
+// the leaf, so the leaf has to hold its transient too. (It is defined here rather than next to its
+// other users because those leaves are the first thing in the file that needs it.)
+//
+// The GGUF parts route quantizes the activation to ggml's q8_1 once per projection and reuses it for
+// every part, so its transient bytes depend on the part shapes. At plan time only the weights profile
+// is known -- the plan is queried before any weight is bound -- so size for the FUSED parent width the
+// other profiles use. That is an over-estimate for every layer, which is safe because the arena is
+// sized once for the whole model and no part is ever wider than its parent.
+// The GGUF parts route quantizes the activation to ggml's q8_1 once per DISTINCT input gather, and
+// gguf_project_workspace_bytes sizes that per shape it is handed. This port's profile-level cases run
+// before any weight is bound, so they cannot know the real part list -- and passing one shape
+// under-counted the activations by the part count, which is four for attention (q|gate|k|v) and four
+// for GDN (q|k|v|z). That shortfall is what surfaced as std::bad_alloc at context >= 384. Sizing for
+// the widest part list any layer can have is safe: the arena is sized once for the whole model and
+// over-reserving a few activation buffers is the trade the tree already makes elsewhere.
+std::size_t gguf_projection_bytes(std::int32_t rows, std::int32_t first, std::int32_t last,
+                                  std::int32_t parts = 4) {
+    const ops::detail::GgufShape parent{QType::GGUF_IQ2_XXS, rows, TextConfig::hidden};
+    const std::vector<ops::detail::GgufShape> shapes(static_cast<std::size_t>(parts), parent);
+    return ops::detail::gguf_project_workspace_bytes(shapes, first, last);
+}
+
 // Folded (rotated-basis) ternary activation scratch: a [input_width, last] BF16 buffer that
 // ternary weights need before their matmul (P, then the signs, then the nominal Hadamard).
 //
@@ -126,8 +149,19 @@ std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
     const std::int32_t width = hidden.ne[1];
     // The GGUF parts carry the same q|k|v geometry the split form does, so both take the shape-keyed
     // snapshot query rather than a QType-keyed one.
-    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection) ||
-        std::holds_alternative<GgufGdnInputProjectionPayload>(weights.input_projection)) {
+    if (std::holds_alternative<GgufGdnInputProjectionPayload>(weights.input_projection)) {
+        // The GGUF parts route projects INSIDE this leaf, so its ggml transient is the leaf's to
+        // hold as well. Mirrors Variant::gdn_input_projection_snapshot_workspace_capacity_bytes;
+        // without the second term the leaf is 625 KB and the projection's 5 MiB stream-k fixup
+        // plane dies on it while the CUDA graphs are prepared.
+        return std::max(
+            kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch, width,
+                width) +
+                gguf_projection_bytes(16384, batch * width, batch * width));
+    }
+    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection)) {
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
@@ -145,8 +179,17 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
                                        const Variant::GdnProjectionWeights& weights) {
     const std::int32_t batch = hidden.ne[2];
     const std::int32_t width = hidden.ne[1];
-    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection) ||
-        std::holds_alternative<GgufGdnInputProjectionPayload>(weights.input_projection)) {
+    if (std::holds_alternative<GgufGdnInputProjectionPayload>(weights.input_projection)) {
+        // Same as the snapshot leaf: the ggml transient is spent inside this leaf. Mirrors
+        // Variant::gdn_input_projection_record_workspace_capacity_bytes.
+        return std::max(
+            kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch, width,
+                width) +
+                gguf_projection_bytes(16384, batch * width, batch * width));
+    }
+    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection)) {
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
@@ -462,25 +505,6 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
     Tensor delta = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
     ops::linear(activation, fused.down, delta, text_policy(fused.down), workspace, stream);
     ops::residual_add(delta, residual, stream);
-}
-
-// The GGUF parts route quantizes the activation to ggml's q8_1 once per projection and reuses it for
-// every part, so its transient bytes depend on the part shapes. At plan time only the weights profile
-// is known -- the plan is queried before any weight is bound -- so size for the FUSED parent width the
-// other profiles use. That is an over-estimate for every layer, which is safe because the arena is
-// sized once for the whole model and no part is ever wider than its parent.
-// The GGUF parts route quantizes the activation to ggml's q8_1 once per DISTINCT input gather, and
-// gguf_project_workspace_bytes sizes that per shape it is handed. This port's profile-level cases run
-// before any weight is bound, so they cannot know the real part list -- and passing one shape
-// under-counted the activations by the part count, which is four for attention (q|gate|k|v) and four
-// for GDN (q|k|v|z). That shortfall is what surfaced as std::bad_alloc at context >= 384. Sizing for
-// the widest part list any layer can have is safe: the arena is sized once for the whole model and
-// over-reserving a few activation buffers is the trade the tree already makes elsewhere.
-std::size_t gguf_projection_bytes(std::int32_t rows, std::int32_t first, std::int32_t last,
-                                  std::int32_t parts = 4) {
-    const ops::detail::GgufShape parent{QType::GGUF_IQ2_XXS, rows, TextConfig::hidden};
-    const std::vector<ops::detail::GgufShape> shapes(static_cast<std::size_t>(parts), parent);
-    return ops::detail::gguf_project_workspace_bytes(shapes, first, last);
 }
 
 // The MTP queries take no weights profile, so they cannot know whether the artifact's MTP block is
