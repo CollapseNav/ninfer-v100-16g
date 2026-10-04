@@ -3876,3 +3876,65 @@ source line and the address. `--error-limit` is an ncu option, not a sanitizer o
 the tool print its usage instead of profiling. `cuobjdump --dump-resource-usage` on the built binary
 gives REG/STACK/SHARED/LOCAL per instantiation, which is how the two halves of this change were
 confirmed before anything was run.
+### Attempt 2: Bc 16 -> 8 buys the third CTA, and the gate rejects it
+
+With `q_s` established as mma-shaped and fixed at 32 rows, the only genuinely tile-sized arrays are
+`k_s`/`v_s`, sized by `Bc`. Halving `Bc` to 8 halves both to 4,224 B and lands the block at
+**25,600 B** -- three CTAs with room (`98,304 / 25,600 = 3.8`), and `PVChunks = Bc/8` stays whole so the
+per-8-key recurrence still applies. `cuobjdump` confirmed it before anything ran: **SHARED 25,600 B and
+REG 164-166 for every instantiation** (from 34,048 B and 213), `LOCAL:0` -- no spills at the 170-register
+cap that `__launch_bounds__(..., 3)` imposes. The CompactTail instantiation lands at REG 128.
+
+ncu confirms the occupancy moved and the kernel got busier:
+
+| metric | Bc=16 | Bc=8 |
+|---|---:|---:|
+| Registers / thread | 213 | 164 |
+| Static shared / block | 34.05 KB | 25.60 KB |
+| Block Limit (registers / shared) | 2 / 2 | **3 / 3** |
+| Theoretical occupancy | 12.50% | **18.75%** |
+| Achieved occupancy (warps/SM) | 12.16% (7.78) | **17.15% (10.98)** |
+| DRAM throughput | 16.0% | 18.2% |
+| L1/TEX throughput | 51.1% | 61.4% |
+| Compute (SM) | 29.5% | 35.1% |
+
+And it is worth decode time, increasingly so with context:
+
+| point | Bc=16 | Bc=8 | delta |
+|---|---:|---:|---:|
+| window 2, 15.6k | 61.2 | 62.5 | +2.1% |
+| window 2, 31.2k | 50.4 | 50.9 | +1.0% |
+| window 2, 62.4k | 44.3 | 46.3 | +4.5% |
+| window 5, 15.6k | 62.8 | 63.0 | +0.3% |
+| window 5, 62.4k | 38.5 | 40.8 | **+6.0%** |
+| window 1, 62.4k | 42.7 | 45.0 | +5.4% |
+
+with the 62.4k window-2 output byte-identical (`ae2e8e05...`), so on that point nothing numerical moved.
+
+**It still fails the gate: `REGRESSION_DIFF`.** Halving the key tile halves the online-softmax rescale
+interval -- the outer rescale runs per key tile, so "every 16 keys" becomes "every 8" -- and the v2
+path's rounding moves enough for 96 greedy tokens to fork. This file already records that this path has
+near-ties that flip on much smaller perturbations (the KV dtype changes the *assignment* of the same two
+branches), so that is the expected failure mode rather than a surprise. Reverted; `REGRESSION_OK_md5_identical`
+is back.
+
+**What this establishes is a constraint, not just a rejected edit: on this kernel, occupancy and
+bit-identity pull against each other.** The footprint is `q_s` 16,896 + `k_s` 8,448 + `v_s` 8,448 +
+pages 256 = 34,048 B against a 32,768 B three-CTA budget:
+
+* `q_s` is mma-shaped and cannot shrink (attempt 1).
+* `k_s`/`v_s` can only shrink by changing `Bc`, which changes the recurrence (attempt 2).
+* The remaining 1,280 B would have to come from the bank-conflict pad (`SmemPad = 8`, worth 1,024 B
+  across the three arrays) plus the page table -- and the pad is documented as the fix for 724M bank
+  conflicts against 891M wavefronts, so trading it for a third CTA is a bad bet.
+
+The bit-identity-safe occupancy route that already exists is `WarpsPerCta = 5` (CompactTail): it raises
+resident warps per SM from 8 to 10 without touching the key tile or the recurrence, and it is selected
+only for `TokenTile == 6 && GroupSize == 6` above `implementation_window >= 16391`. That threshold was
+chosen on the author's hardware, so re-measuring it on 80 SMs is the cheap next step -- but it only
+exists for T=6, i.e. window 5, not for the deployment's window 2.
+
+A bit-identity-safe route for T=3 would have to cut the footprint without touching the tile: staging
+`v_s` as int8 (the cache is int8; `k_s`/`v_s` are dequantized into fp16 in shared, and the dequant is
+exact) would save 4,224 B and reach 29,824 B at an unchanged `Bc` -- a real change to the staging path,
+and the next idea worth pricing.
