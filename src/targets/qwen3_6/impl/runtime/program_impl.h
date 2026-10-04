@@ -12019,6 +12019,23 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
     }
 
+    // The verify batch's WIDTH is this number, and the width is what a round costs -- not the extent.
+    // `next_extents` shrinks the drafts produced per round and the attention's column loop follows it
+    // (`valid_columns`), but the weight GEMMs run over all verify_k + 1 columns whatever the extent, so
+    // capping the extent while the width stays at the startup `draft_window` pays the wide cost for a
+    // narrow return. That was built and measured: 62k context goes 38.5 -> 27.8 tok/s. The window is
+    // therefore a startup decision, and it is context-dependent -- measured on the ternary artifact,
+    // 128 greedy tokens, long.json's body repeated (see "The deployment's decode at long context"):
+    //
+    //   context   K=1    K=2    K=3    K=5
+    //   15.6k     59.8   61.2   58.5   62.8
+    //   31.2k     52.6   50.4   46.4   47.7
+    //   46.8k     48.3    --     --    40.5
+    //   62.4k     42.7   44.3   43.8   38.5
+    //
+    // i.e. 5 is right below ~16k and 13-19% wrong beyond 30k, and the reason is that the causal
+    // attention inside the verify grows with the context it reads (40.6% of decode GPU time at 62k
+    // against 18.7% at 4k) while the MTP head's per-position acceptance does not.
     const std::uint32_t verify_k =
         use_lookup ? qwen3_6::kMtpLookupMaximumDrafts : draft_window;
     const std::uint32_t proposal_k = use_lookup ? 1U : draft_window;

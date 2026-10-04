@@ -3541,3 +3541,126 @@ profiles now go through one path, and the 35B target gets the same method -- its
 The pattern is three for three in this port. Every one of these failures was a query that answered for
 one profile while the execution took another, and in every case the op's own
 `*_workspace_capacity_bytes` was already right -- the plan simply was not calling it.
+## The deployment's decode at long context: the window was a short-context decision, and attention owns the round (2026-10-04)
+
+This chapter starts from the resident server's own request log rather than from a benchmark. A real
+agent task -- `openai-chat`, 11-13 messages, 63 tools, `thinking xhigh`, one request per turn:
+
+| req | prompt | cache | output | prefill | **decode** | mtp accepted |
+|---|---:|---:|---:|---:|---:|---:|
+| #1 | 175 | 0% | 64 | 336.5 | **66.9** | 34.5% |
+| #2 | 21,104 | 0% | 28,809 | 1.08k | **51.9** | 36.0% |
+| #3 | 49,961 | 42.2% | 10,563 | 756.8 | **63.2** | 51.1% |
+| #4 | 67,762 | 89.3% | 1,632 | 563.2 | **35.8** | 28.2% |
+| #5 | 69,451 | 30.4% | 256 | 668.6 | **35.8** | 28.1% |
+
+Decode falls from 66.9 on a 175-token prompt to 35.8 at 68k, and the MTP acceptance falls with it. This
+is the axis `ctx_sweep.sh` was written to characterise and never ran: **every window number in this
+file's tables was taken at ~100 tokens of context**, including the ones that chose the deployment's
+draft window.
+
+### Where the round goes, and why context costs
+
+`nvprof`, ternary artifact, `--spec mtp --draft-tokens 5`, 32 greedy tokens, aggregated over the decode
+window only (the trace is cut at the last CUTLASS launch -- CUTLASS refuses `T < 256`, so it is
+prefill-only and its last appearance is the boundary):
+
+| family | ~4k context | ~62k context |
+|---|---:|---:|
+| causal attention | 139.2 ms (18.7%) | **447.4 ms (40.6%)** |
+| qpn ternary GEMM | 349.6 (46.9%) | 400.8 (36.4%) |
+| w8 | 91.9 (12.3%) | 74.7 (6.8%) |
+| everything else | 165.1 | 178.8 |
+| **total** | **745.8** | **1101.7** |
+
+The weight GEMMs are flat (+15%); **the causal attention is 3.2x and is the entire growth.** Per
+generated token it goes from 4.4 ms to 14.0 ms while the ternary GEMM goes 10.9 to 12.5.
+
+`ncu` -- which does work on this host with `--privileged`, and needs `--no-cuda-graph` or the kernels
+only execute once during capture -- on `causal_attention_small_t_tc_volta_partial_i8_kernel` at 62k,
+`grid(4,130,1) x block(128,1,1)`, 1.03 ms:
+
+| metric | value |
+|---|---:|
+| Active warps per scheduler | **1.94 of 16** |
+| No eligible | 64.8% |
+| Issued warp per scheduler | 0.35 |
+| L1/TEX cache throughput | **51.1%** |
+| DRAM throughput | 16.0% |
+| Compute (SM) throughput | 29.5% |
+
+That is the same signature this file already records for the decode GEMM, one level up: **the kernel is
+latency-bound because its footprint leaves roughly one CTA resident per SM**, so there is nothing to
+hide the L1TEX latency behind. 520 CTAs of 4 warps each would be 6.5 warps per scheduler if they were
+all resident; the machine averages 1.94, and 64.8% of cycles have no eligible warp at all. Neither
+bandwidth (DRAM 16%) nor math (29.5%) is the limit.
+
+### The window is a context-dependent parameter, and 5 is wrong past ~20k
+
+`serve_start.sh` chose `--draft-tokens 5` from four short-context measurements. Re-measured against
+context on one fixture and one binary, 128 greedy tokens, `long.json`'s body repeated (no
+`--lm-head-draft`, so this is the AR path and the repeated fixture cannot make the lookup path fire and
+flatter itself):
+
+| context | K=1 | K=2 | K=3 | K=5 |
+|---:|---:|---:|---:|---:|
+| 15.6k | 59.8 | 61.2 | 58.5 | **62.8** |
+| 31.2k | **52.6** | 50.4 | 46.4 | 47.7 |
+| 46.8k | **48.3** | -- | -- | 40.5 |
+| 62.4k | 42.7 | **44.3** | 43.8 | 38.5 |
+
+Repeat runs of the two contested cells (`c62_k2` 44.3/44.2, `c31_k1` 52.6/52.7) put the noise at about
+0.3%, so the ordering is real. Read as averages over a turn's context range: 21k -> 50k (the shape of
+req#2) gives K=1 52.7, K=2 50.8, K=5 47.6; at 68k it is K=2 44.3, K=1 42.7, K=5 38.5. **5 is right
+below ~16k and a 13-19% loss beyond 30k.** The server's default is now 2 -- never the worst in any
+regime, the best at the longest contexts, and within 2.5% of 5 at 16k. Windows 1 and 2 are within ~4%
+of each other and the choice between them is not settled by this data.
+
+Greedy output is unaffected: windows 1, 2 and 3 produce byte-identical 128-token outputs at 62k
+(`md5 ae2e8e05...`), which is what exact speculative decoding requires. Window 5 differs, which is the
+near-tie fork this file already records for the speculative path.
+
+End to end, through the deployment's own path -- one `openai-chat` request, 46,822-token prompt, 256
+generated tokens, `--lm-head-draft`, the server restarted on each window:
+
+| window | decode | mtp accepted | TTFT | prefill |
+|---:|---:|---:|---:|---:|
+| 5 | 51.3 | 173/419 (41.3%) | 52.5 s | 892.5 |
+| 2 | **53.5** | 152/230 (66.1%) | 52.7 s | 889.7 |
+
++4.3%, which is *less* than the 11-19% the AR-path table predicts at this context, and the reason is
+worth stating: the fixture repeats, so the lookup path fires and it sets `verify_k` to
+`kMtpLookupMaximumDrafts` regardless of the startup window. Real agent traffic repeats too (tool
+schemas, prior turns), so the deployment's gain sits between +4% and +19% depending on how much of a
+turn's suffix has a prompt continuation.
+
+### A runtime extent cap does not work, and the measurement is why
+
+The obvious repair is to leave the startup window at 5 and shrink the *extent* per round, since the
+device already computes `next_extents` from the remaining budget and context. That was built and
+measured: `mtp_window_cap` scaled the window by `16384 / frontier`, which moved the mean extent from
+4.93 (16k) to 2.03 (31k) to 1.06 (47k and 62k) exactly as intended -- and made everything worse:
+
+| context | K=5, capped extent | K=5 | K=1 |
+|---:|---:|---:|---:|
+| 15.6k | 62.8 | 62.8 | 59.8 |
+| 31.2k | 42.4 | 47.7 | 52.6 |
+| 46.8k | 30.4 | 40.5 | 48.3 |
+| 62.4k | 27.8 | 38.5 | 42.7 |
+
+The reason is that the verify batch's **width** is what costs, and the width is `verify_k = draft_window`
+-- a startup property that the captured graphs are built around. Only the attention's column loop is
+gated by `valid_columns` (`small_t_i8_volta.cuh` bounds `valid_tokens` by it); the weight GEMMs run over
+all six columns regardless. So the capped round pays the full T=6 cost and returns one draft's worth of
+tokens: 1.77 tokens / 68 ms = 26 tok/s, which is what the 62k row measures. The change was reverted
+rather than parked. **Making the window adaptive needs adaptive batch widths, i.e. graph profiles
+captured for more than one width**, which is a change to the graph planner and its memory budget.
+
+### What is left
+
+The attention kernel is the lever, and it is now scoped rather than guessed at: 40.6% of the round at
+62k, latency-bound at ~1 CTA/SM, with L1TEX at 51% and DRAM at 16%. Two directions follow from the
+numbers and neither is a constant to sweep: raise the resident CTA count (the shared-memory staging is
+what limits it), or stop re-reading the whole window per verify column. The second is the same idea
+this file's verify-band section already identified for the weights -- "how the weight is shared across
+the token dimension inside the kernel is the difference" -- applied to the KV.
