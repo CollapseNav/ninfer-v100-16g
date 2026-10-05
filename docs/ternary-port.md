@@ -4682,3 +4682,46 @@ peak, which matches both the ncu reading taken earlier (DRAM 16%) and the arithm
 does 457. So the largest single decode inefficiency is the attention's memory behaviour -- 36% of the
 round at 62.4k -- not the vec kernel, and the sub-group staging change that bought 3.5-3.9% there is
 unlikely to be the end of it.
+### The vec kernel's gap explained: register pressure, and forcing it down loses (2026-10-04)
+
+The gap was never a memory-behaviour mystery. ncu on the real in-situ launches, with 256 threads per
+block, reads:
+
+| grid | REG | achieved occupancy | warps/SM |
+|---|---:|---:|---:|
+| 160 | 109 | 24.5% | 15.7 |
+| 128 | 80 | 20.0% | 12.8 |
+| 240 | 80 | 32.7% | 21.0 |
+
+The standalone probe runs the *same inner loop* at **4 blocks per SM x 8 warps = 32 warps** -- because it
+carries `__launch_bounds__(256, 4)`, which forces 64 registers. The real kernel has no `minBlocks`, so the
+compiler picks **80-109 registers**, `resident` falls to **2-3 blocks per SM**, and several launches are
+then row-limited *below* even that (grids of 128-160 against a 240 cap). That is the 1.5-2x.
+
+**Forcing the registers down loses.** `minBlocks 4` does produce 64 registers and 4 blocks with `LOCAL: 0`
+-- and it is 15-19% *slower*:
+
+| context | shipped (80-109 regs, 2-3 blocks) | minBlocks 4 (64 regs, 4 blocks) |
+|---|---:|---:|
+| 15.6k | 109.7 | **93.6** |
+| 31.2k | 69.3 | **56.3** |
+| 62.4k | 57.0 | **47.7** |
+
+`STACK` is non-zero (32-40 bytes), so the compiler rematerialized -- the same failure as `minBlocks 10`
+(51 registers), only milder. The real loop needs those registers; the probe's does not, because the probe
+has no `rowp[]` array, no `Fused` branch and no row-address arithmetic.
+
+So the mechanism is settled and the direct fix is closed: the only remaining path is to make the inner
+loop leaner *by construction* -- shorten the live range of the eight decode words by interleaving the
+decode with the `dp4a` instead of building all eight first, drop intermediate state -- rather than
+capping registers by attribute. That is an inner-loop rewrite whose payoff the compiler controls, not the
+author.
+
+Two smaller facts from the same measurement. The 80-register instantiations cap at 240 blocks
+(`65536 / (256 * 80) = 3.2`) and the 109-register one at 160, so the "cap" is per-instantiation, not a
+constant. And `causal_attention_small_t` at 3 CTAs now measures DRAM 22.4% (from 16.0%), L1/TEX 63.0%
+(from 51.1%) and compute 42.5% (from 29.5%) with 18.36% achieved occupancy -- so the sub-group staging
+change moved all three, and the kernel is still latency-bound at 56% no-eligible cycles behind a wall
+that is both shared memory (25,600 x 4 > 98,304) and registers (164 x 128 x 4 > 65,536). On Volta there
+is no async copy to pipeline the staging with: `memory.cuh` records that `cp_async` below sm_80 is a
+synchronous load-and-store, so the bf16 sibling's "async" staging is not async on this hardware either.
