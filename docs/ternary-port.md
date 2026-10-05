@@ -4725,3 +4725,37 @@ change moved all three, and the kernel is still latency-bound at 56% no-eligible
 that is both shared memory (25,600 x 4 > 98,304) and registers (164 x 128 x 4 > 65,536). On Volta there
 is no async copy to pipeline the staging with: `memory.cuh` records that `cp_async` below sm_80 is a
 synchronous load-and-store, so the bf16 sibling's "async" staging is not async on this hardware either.
+### Correction and a new lead: the decode is 80.6% GPU-busy, with a 7-9 ms stall per round (2026-10-05)
+
+An earlier claim in this work -- that the decode's GPU is busy only 23% of the round -- was wrong, and the
+error was a mismatched denominator: the nvprof trace's decode window covers 152 ms while the decode's wall
+time was 530 ms, so the 122.6 ms of GPU-busy time belongs to the window, not to the whole decode. Within
+the window it is **122.6 of 152.1 ms = 80.6%**.
+
+The gap distribution is clean and rules out launch overhead:
+
+| statistic | value |
+|---|---:|
+| gaps > 1 ms | 3, totalling 22.5 ms |
+| median gap | ~0 ms (launches overlap) |
+| p90 gap | 0.054 ms |
+| max gap | 8.9 ms |
+
+So the launches are back-to-back and there is no launch-overhead problem -- which agrees with CUDA graphs
+being worth only 4.6% here (54.5 eager against 57.0 graphed). But **three gaps of 6.8, 6.9 and 8.9 ms hold
+76% of all gap time**, i.e. a stall of roughly 7-9 ms that recurs about once per round and is therefore
+worth about 15% of the decode.
+
+What makes it interesting is *where* it sits: not at a round boundary but **mid-layer**. The 8.9 ms gap
+sits between an MLP tail (`rmsnorm` plus three `vec::kernel` launches) and the next layer's
+`vec::kernel`/`gdn_gating`/`rmsnorm`; the 6.8 ms one sits between a `ggml_bridge`/`rmsnorm`/vec tail and
+the next layer's `rmsnorm`/`rope`/vec, immediately before that layer's attention. Nothing in the sequence
+obviously waits.
+
+For scale, the kernel durations in the same window are small: the vector launches run 30-95 us each and
+the attention launch 631 us (consistent with the 730 us ncu measured separately). So the stall is not a
+slow kernel; it is time when the GPU has nothing to run.
+
+This is the decode's remaining lever and it is not a kernel problem: something per round -- a host
+decision, a synchronisation, or a graph replay that waits on one -- leaves the device idle for 7-9 ms.
+It needs a targeted look rather than another kernel experiment.
