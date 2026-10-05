@@ -4789,3 +4789,45 @@ That closes the vec kernel. Combined with the attention's wall (shared 25,600 x 
 164 x 128 x 4 > 65,536, with no async copy on Volta to pipeline the staging), and with the decode budget
 now closing at ~41 ms of kernel time per round against a ~50 ms round, the decode has no remaining knob,
 no remaining cheap kernel change, and no hidden idle time.
+### The prefill's 12% "quantize family" is the documented price of a 2.3x win (2026-10-05)
+
+The last unexplored kernel family in the prefill was the 37,816 launches / 9.62 s bucketed as
+"gguf bridge (mmq/quant)" -- the activation quantize and the plane store the GGUF route needs. Split by
+kernel it is not the quantize at all:
+
+| kernel | launches | seconds | share | per chunk / per layer |
+|---|---:|---:|---:|---:|
+| `dequantize_rows_kernel<ggml_type=16>` | 3,243 | 1.45 | 1.85% | 154 / 2.4 |
+| `dequantize_rows_kernel<22>` | 2,530 | 1.19 | 1.52% | 120 / 1.9 |
+| `dequantize_rows_kernel<17>` | 2,300 | 1.02 | 1.30% | 110 / 1.7 |
+| `convert_bf16_to_f16_kernel` | 7,061 | 0.96 | 1.23% | 336 / 5.3 |
+| five more `dequantize_rows` instantiations | | ~2.5 | ~3.1% | |
+| total | | **~7.1** | **~9.0%** | |
+
+So it is the **f16 prefill route's own overhead**: it dequantizes the GGUF weights to f16 and then runs a
+plain CUTLASS GEMM, and the dequantize runs once per chunk -- 21 times over this prefill. `mul_mat_q`,
+the mmq path that fuses the dequantize into the matmul, accounts for only 0.50 s / 0.6%, i.e. the f16
+route has almost entirely displaced it.
+
+That is not a mistake, and the source says so where the knob is:
+
+```
+// NINFER_GGUF_F16_PREFILL=0 restores the mmq path without a rebuild.
+// ... 481 -> 1120 tok/s, and the perplexity improves slightly rather than degrading, because FP16
+// carries ten mantissa bits where BF16 carries seven.
+```
+
+The route is a measured 2.3x win, the crossover is documented at T ~= 320 against a gate of 256, and the
+dequantize scratch is tuned by a recorded sweep (16 MiB -> 12.914 ms, 64 MiB -> 10.130 ms, 128 MiB a
+further 1.7%, hence the 64 MiB default). The overhead cannot be removed either: dequantizing 27B
+parameters to f16 is 54 GB and cannot be resident, so it has to happen per chunk, and fusing it into the
+GEMM is exactly what mmq does -- the path this route replaced.
+
+`NINFER_GGUF_DEQUANT_SCRATCH_MIB` was also swept on this artifact at the deployment's settings (32 and
+16 MiB): neither is faster and neither lets `--prefill-chunk 4096` plan, so the scratch is not the binding
+term for the memory ceiling either.
+
+**So the prefill is closed as well**, and with it every kernel family in both phases. What remains in this
+engine is not a kernel: it is the deployment-side prefix caching (the real turns' TTFT varied 12.9-72 s
+with cache hits between 0 and 89%), or a structural project with uncertain payoff -- a swizzled attention
+layout to buy back the 1,024 bytes that four CTAs need, or a fused dequantize-GEMM.
