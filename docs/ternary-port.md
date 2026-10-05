@@ -4759,3 +4759,33 @@ slow kernel; it is time when the GPU has nothing to run.
 This is the decode's remaining lever and it is not a kernel problem: something per round -- a host
 decision, a synchronisation, or a graph replay that waits on one -- leaves the device idle for 7-9 ms.
 It needs a targeted look rather than another kernel experiment.
+### The vec kernel's registers are pure ILP, not fat to trim (2026-10-05)
+
+The shipped kernel compiles to 80-109 registers with no `minBlocks`, so `resident` is 2-3 blocks per SM,
+while the standalone probe of the same loop runs at 4. That looked like a slimming opportunity: shorten
+live ranges by construction and get 4 blocks without forcing the compiler. A compile-only probe settles
+it. Copying the real inner loop's structure -- the `rowp[kRows]` array, the `Fused` branch, the T=3
+activation array, the decode and the `dp4a` chain -- and instantiating four variants:
+
+| variant | REG | STACK | LOCAL | blocks/SM |
+|---|---:|---:|---:|---:|
+| T=1, rowp array, not fused | 64 | 0 | 0 | 4 |
+| T=3, rowp array, not fused | 64 | 0 | 0 | 4 |
+| T=3, rowp array, fused | 64 | 0 | 0 | 4 |
+| T=3, no rowp array | 64 | 16 | 0 | 4 |
+
+**All four fit in 64 registers with `LOCAL: 0`.** So the live ranges are not the problem: the shipped
+kernel's 80-109 registers are the compiler's *scheduling choice*, buying instruction-level parallelism it
+judges worth more than the third and fourth resident block. And the earlier `minBlocks 4` measurement
+agrees -- forcing 64 gave `LOCAL: 0`, no spills, and cost 15-19%. The cost is the lost ILP, not
+rematerialisation.
+
+**So there is nothing to trim.** The occupancy is a deliberate trade the compiler already optimises, and
+the measurement says it chose correctly. Beating it would need a different algorithm, and the one
+candidate -- warp-cooperative wide loads with shuffle redistribution -- has a measured ceiling of +6%,
+and that ceiling skips the redistribution entirely.
+
+That closes the vec kernel. Combined with the attention's wall (shared 25,600 x 4 > 98,304 and registers
+164 x 128 x 4 > 65,536, with no async copy on Volta to pipeline the staging), and with the decode budget
+now closing at ~41 ms of kernel time per round against a ~50 ms round, the decode has no remaining knob,
+no remaining cheap kernel change, and no hidden idle time.
