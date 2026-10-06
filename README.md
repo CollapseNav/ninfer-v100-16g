@@ -40,6 +40,69 @@ cmake --build build-sm70 --parallel 8
 The binaries link `libavformat.so.60`, which the host here does not provide, so they are run through
 the `ninfer-v100-buildenv:cu128` image as `docs/e5-ssh-workflow.md` describes.
 
+## V100-16GB gguf-mixed tuning round (2026-10-05/06)
+
+A tuning round over the *other* 16GB artifact — `swift15_iq2xs_mtp.ninfer` (identity
+`qwen3.8-27b` / `gguf-mixed`, 8.15 GiB, 11 GGUF formats mixed across 401 tensors) — on the
+V100-SXM2-16GB with `--kv-dtype int8` group-64, MTP K=2, greedy, `--max-new 128`, CUDA graphs, one
+resident model. The three arms are prefixes of a single text (`wikitext/00` + `pg19/00`), so they
+differ only in depth; two repetitions each.
+
+| context | prompt | prefill | decode | MTP acceptance |
+|---|---:|---:|---:|---:|
+| short | 4,084 | 1,075 tok/s | **92.3 tok/s** | 2.82 tok/round |
+| medium | 16,351 | 1,055 tok/s | **83.2 tok/s** | 2.76 |
+| long | 130,771 | 557.7 tok/s | **52.6 tok/s** | 2.80 |
+
+**Kept (2).** `--prefill-chunk 8192` whenever `max-context <= 16K` is worth **+9.1% prefill @4K**
+and **+8.4% @16K** with decode unchanged — it cannot be used at 128K, see the wall below. And
+`small_t_i8_volta.cuh` now stages the KV gather 16 codes at a time (one `int4` load replacing two
+`int2`): bit-identical (md5-equal at both depths, K = 1/3/5 including the 5-warp CompactTail path)
+and worth **128K decode 52.6 -> 53.3 tok/s (+1.33%)**. `ncu` attributes the stall this removes to
+`long_scoreboard`, 103.5% -> 69.3% of issue-active.
+
+**Refuted on measurement (10).** The documented 7-9 ms per-round stall does not reproduce — five
+configurations measure 95.9-97.4% GPU-busy and the only hole above 1 ms sits on the
+prefill→decode boundary. `--lm-head-draft` collapses acceptance to **1.00** on this artifact
+(decode 92.4 -> 33.5), so the "every number used Optimized" note in `decode-round` does not apply
+here. `--kv-dtype fp8` is 65-90% slower; `NINFER_CAUSAL_WAVE_ALIGN`'s default already wins against
+0/2/3; `NINFER_GGUF_F16_PREFILL=0` fails at startup; lowering `NINFER_GGUF_DEQUANT_SCRATCH_MIB`
+costs more than the chunk it buys. The 128K prefill's flash-attention is at its roofline — ncu reads
+**DRAM 81.5% (735 of 902 GB/s)** on the kernel that is 53.8% of that prefill. And
+shared-staging the vec kernel's weight blocks (the universal form of the per-format repack) is
+bit-identical but **-17..-29%**: it relocates `decode`'s loads instead of removing them — 192
+global loads become 66 global **plus** 192 shared.
+
+**Two walls.** The runtime reservation follows `--max-context`, not the prompt: at 131072 tokens of
+int8 KV, `--prefill-chunk 4096` is 108 MB over budget and `--lm-head-draft` 59 MB over, so at 128K
+the chunk is pinned to 3072 and the optimized proposal head cannot be loaded. `--max-context` itself
+is speed-neutral (mc 8192 and mc 131072 measure identically at 4K). And the KV attention kernel's
+**18.4% occupancy with 55.9% of cycles holding no eligible warp** is not improvable: `q_s` must keep
+its 32 rows because `volta_qp_get_i()` returns `threadIdx.x & 31` (the QK fragment addresses rows
+0..31 whatever the row capacity is), `k_s`/`v_s` are pinned to `StageKeys = 8` by the mma N
+dimension, and 25,600 B > 98,304/4. Shrinking `Br` past that faults with an invalid `__shared__`
+read that `compute-sanitizer` pins to `small_t_i8_volta.cuh:472`. The "+37.96%" ncu attaches to that
+kernel is an occupancy heuristic, not a budget — the same class of estimate cashed at only
+**+3.5..3.9%** on the previous 2→3 CTA step (`51632bfb`).
+
+**Copying vs explaining.** The 219 tok/s at the top of this file is a *context-lookup* number: a
+round cannot commit more than ~16 tokens, and 219 tok/s at the documented 64 ms round needs 12.91 of
+them. The same mechanism measured here on `lookup10`/`lookup16` ("repeat this sentence ..."):
+
+| prompt | K | decode | acceptance |
+|---|---:|---:|---:|
+| natural prose, 4K | 2 | 92.3 | 2.82 tok/round |
+| `lookup10` | 2 / 5 / **7** | 149.4 / 175.1 / **171.5** | 7.27 / 10.90 / **12.11** |
+| `lookup16` | **7** | **178.4** | **12.70** |
+| `lookup10`, thinking on | 2 | 113.0 | 3.85 |
+
+At K=7 the acceptance is **12.11 / 12.70 — identical to the values recorded in
+`docs/decode-round-2026-10-01.md`** for a different artifact on a different card, so the mechanism
+and the tokens-per-round agree exactly; what differs is round cost (70.6 ms here against 51.6 ms
+there), i.e. the weight route and the harness (`--max-new 128` full-run average against
+`ninfer_bench`'s ten measured rounds after two warmups). On this artifact alone, copying against
+explaining is **92 -> 178 tok/s (+93%)**, and turning thinking back on drops it to 113.
+
 ## Models
 
 | Model | Weights | Artifact | Download and model card |
