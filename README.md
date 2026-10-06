@@ -54,12 +54,41 @@ differ only in depth; two repetitions each.
 | medium | 16,351 | 1,055 tok/s | **83.2 tok/s** | 2.76 |
 | long | 130,771 | 557.7 tok/s | **52.6 tok/s** | 2.80 |
 
-**Kept (2).** `--prefill-chunk 8192` whenever `max-context <= 16K` is worth **+9.1% prefill @4K**
-and **+8.4% @16K** with decode unchanged — it cannot be used at 128K, see the wall below. And
-`small_t_i8_volta.cuh` now stages the KV gather 16 codes at a time (one `int4` load replacing two
-`int2`): bit-identical (md5-equal at both depths, K = 1/3/5 including the 5-warp CompactTail path)
-and worth **128K decode 52.6 -> 53.3 tok/s (+1.33%)**. `ncu` attributes the stall this removes to
-`long_scoreboard`, 103.5% -> 69.3% of issue-active.
+The baseline row is at `--draft-tokens 2`, which is the value `ternary-port.md` ships. Sweeping the
+window afterwards — same fixture, same settings, only `--draft-tokens` varying — puts the peak
+somewhere that sweep never looked:
+
+| `--draft-tokens` | 4K decode | 16K decode | 128K decode |
+|---:|---:|---:|---:|
+| 1 | -- | 70.2 | -- |
+| **2 (shipped)** | 86.8 | 83.3 | 53.3 |
+| **3** | 85.3 | **93.5** | **59.9** |
+| 4 | -- | 86.8 | -- |
+| 5 | **89.8** | 81.7 | 48.6 |
+
+**`--draft-tokens 3` is the value to run** on a serve that must reach 128K: **+12.2% @16K,
++12.4% @128K**, for −1.7% @4K. Window 5 wins only at 4K and collapses at 128K (48.6 tok/s on an
+87.0 ms round), so wider is not uniformly better. The window axis is also not monotone — 16K reads
+70.2 / 83.3 / **93.5** / 86.8 / 81.7 — which is why `ternary-port.md`'s "monotone and steep"
+conclusion, drawn from the {2, 4, 6} set at 31.2k, does not generalise: **window 3 was never in that
+table.** It also does not conflict with `decode-round-2026-10-01.md` Round 13, which sweeps K = 1..7
+on `real_task` and finds K = 2/3/4 a dominated basin — that sweep runs the **PQ2/QPN** route on
+`bonsai2_27b_swift_pq2`, where the QPN band edge at T = 5 makes K = 4 verify through SIMT while K = 5
+verifies through QPN and comes out 20% cheaper while accepting more. The gguf route has no such band,
+so the two curves are different, not contradictory. Acceptance is text-sensitive (the
+`--prefill-chunk` A/B below moved it 2.82 -> 2.65 purely by reordering the reduction), so this is a
+measured recommendation on one fixture, not a re-qualified default.
+
+**Kept (3).**
+
+1. `--prefill-chunk 8192` whenever `max-context <= 16K` is worth **+9.1% prefill @4K** and
+   **+8.4% @16K** with decode unchanged — it cannot be used at 128K, see the wall below.
+2. `--draft-tokens 3` for a 128K-capable serve: **+12.2% @16K, +12.4% @128K**, −1.7% @4K (table
+   above).
+3. `small_t_i8_volta.cuh` stages the KV gather 16 codes at a time (one `int4` load replacing two
+   `int2`): bit-identical (md5-equal at both depths, K = 1/3/5 including the 5-warp CompactTail path)
+   and worth **128K decode 52.6 -> 53.3 tok/s (+1.33%)**. `ncu` attributes the stall this removes to
+   `long_scoreboard`, 103.5% -> 69.3% of issue-active.
 
 **Refuted on measurement (10).** The documented 7-9 ms per-round stall does not reproduce — five
 configurations measure 95.9-97.4% GPU-busy and the only hole above 1 ms sits on the

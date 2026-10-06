@@ -4618,6 +4618,38 @@ steep:
 
 Each extra draft token costs about 13% of the rate and buys only 0.5 of acceptance.
 
+> **Correction (2026-10-06): window 3 was never in that table, and it is the peak.** Re-measured on
+> `swift15_iq2xs_mtp.ninfer` (`qwen3.8-27b` / `gguf-mixed`, 8.15 GiB) at three depths, one
+> prefix-sliced fixture, `--max-new 128`, greedy, INT8 group-64 KV, `--prefill-chunk 8192` (3072 at
+> 128K), CUDA graphs, only `--draft-tokens` varying:
+>
+> | `--draft-tokens` | 4K decode | 16K decode | 128K decode |
+> |---:|---:|---:|---:|
+> | 1 | -- | 70.2 | -- |
+> | 2 (shipped) | 86.8 | 83.3 | 53.3 |
+> | **3** | 85.3 | **93.5** | **59.9** |
+> | 4 | -- | 86.8 | -- |
+> | 5 | **89.8** | 81.7 | 48.6 |
+>
+> **Window 3 is +12.2% at 16K and +12.4% at 128K over the shipped 2**, for −1.7% at 4K. At 16K the
+> round goes 33.1 -> 38.8 ms while tokens per round go 2.76 -> 3.63, and that is where the net comes
+> from. The curve is not monotone on this artifact — 16K reads 70.2 / 83.3 / **93.5** / 86.8 / 81.7 —
+> so "monotone and steep" above describes the {2, 4, 6} set at 31.2k, not the window axis itself.
+> Nor is wider uniformly better: window 5 collapses at 128K (48.6 tok/s on an 87.0 ms round).
+>
+> **Still one fixture.** MTP acceptance is text-sensitive — the `--prefill-chunk` A/B in the same round
+> moved it 2.82 -> 2.65 purely by reordering the reduction and changing the generated text — so
+> `--draft-tokens 3` is recorded here as the measured recommendation for a 128K-capable serve, not as
+> a re-qualified shipped default. A second fixture is the outstanding check.
+>
+> **Not a contradiction of `decode-round-2026-10-01.md` Round 13**, which sweeps K = 1..7 on
+> `real_task` and finds K = 2/3/4 a *strictly dominated basin* (64.5 / 54.9 / 49.5 / 45.7 / 64.0 /
+> 61.8 / 59.7 t/s). That sweep runs the **PQ2/QPN** route on `bonsai2_27b_swift_pq2`, where the QPN
+> band edge at T = 5 makes K = 4 verify at T = 5 through SIMT while K = 5 verifies at T = 6 through
+> QPN and comes out 20% cheaper *while accepting more*. The gguf route this section measures has no
+> QPN band to sit on, so that valley does not exist here — which is exactly why the peak moved to 3.
+> Two routes, two curves; neither generalises to the other.
+
 **The lookup suffix's lower end is worse.** The gate admits 2..64 and only 6 and 16 had been measured:
 
 | suffix | 31.2k decode | acceptance | copying fixture |
@@ -4645,7 +4677,9 @@ verify on `mmq`, which is the regime that had never been measured:
 About twice as slow, with byte-identical output -- so this is a pure kernel-cost difference and the
 vector kernel is the right route for the decode. Reverted.
 
-**Where that leaves decode and MTP.** Every knob is now measured: the draft window (2), the lookup
+**Where that leaves decode and MTP.** Every knob is now measured: the draft window (2 -- measured at
+{2, 4, 6}; the 2026-10-06 correction above puts the peak on gguf-mixed at 3, and recommends 3 for a
+128K-capable serve), the lookup
 suffix (6), the drafter (the LM head; the proposal head is broken and does not fit), the route
 threshold (vector), the KV dtype (int8), the prefill chunk (3072, memory-capped), the lookup's other
 gate conditions (non-binding), and the two kernels themselves (sub-group staging and 8 warps, both
