@@ -89,11 +89,48 @@ __device__ __forceinline__ int4 causal_kv_dequant_i8x8_f16_from(
     return *reinterpret_cast<const int4*>(packed);
 }
 
+// Sixteen codes out of one 16-byte load, returned as the two int4 fp16 halves. The per-element
+// arithmetic is exactly causal_kv_dequant_i8x8_f16_from's -- round(float(code) * scale) -- so the
+// staged values are bit-identical; only the load instruction count changes. The caller must pass a
+// d that is a multiple of 16: 16 divides the 64-element quant group, so the span stays inside one
+// group and the single `scale` is the right one (16 also divides the 8-wide mma staging chunk).
+__device__ __forceinline__ void causal_kv_dequant_i8x16_f16_from(const std::int8_t* codes16,
+                                                                 float scale, int4& lo,
+                                                                 int4& hi) {
+    const int4 raw       = load_vec<int4>(codes16);
+    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
+    __half2 p0[4];
+    __half2 p1[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        p0[i] = __floats2half2_rn(static_cast<float>(c[2 * i]) * scale,
+                                  static_cast<float>(c[2 * i + 1]) * scale);
+        p1[i] = __floats2half2_rn(static_cast<float>(c[8 + 2 * i]) * scale,
+                                  static_cast<float>(c[8 + 2 * i + 1]) * scale);
+    }
+    lo = *reinterpret_cast<const int4*>(p0);
+    hi = *reinterpret_cast<const int4*>(p1);
+}
+
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput>
 // minBlocks 3: with one sub-group staged at a time the block is 25,600 B, so three CTAs fit and the
 // register budget becomes 65536/(128*3) = 170. ncu measured 12.5% theoretical occupancy at two CTAs,
 // limited by both registers (213) and shared memory, with 64.8% of cycles having no eligible warp.
+//
+// A fourth CTA is not reachable, so ncu's occupancy rule (which estimates +37.96% from 18.75% ->
+// 25%) cannot be cashed here, and the arithmetic is structural rather than tunable:
+//   * q_s needs its full 32 rows -- volta_qp_get_i() returns threadIdx.x & 31, so the QK A-fragment
+//     addresses rows 0..31 whatever the row capacity is. Shrinking Br to fit a smaller tile reads
+//     rows 24..31 out of the array; compute-sanitizer reports it as an invalid 16-byte __shared__
+//     read past the block's whole window.
+//   * q_s 16,896 + k_s 4,224 + v_s 4,224 + pages 256 = 25,600 B > 98,304/4 = 24,576 B. k_s/v_s are
+//     pinned to StageKeys = 8 by the mma N dimension, and SmemPad is the documented fix for ~21
+//     shared replays per instruction. Pages is the only slack and it is 256 B short.
+//   * registers would also have to fall 166 -> 128 for 4 CTAs, and forcing them down is the move
+//     doc_ilp.md already measured at 15-19% slower on the vec kernel.
+// The 2->3 step above was reachable only because StageKeys 16->8 was allowed by the same mma N
+// constraint, and it measured +3.5..3.9%, not ncu's 37.96%.
 __launch_bounds__(WarpsPerCta * 32, 3) __global__
     void causal_attention_small_t_tc_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
@@ -402,9 +439,25 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
             // and the store. Every key in range is read from the cache, including this tile's
             // own new tokens -- the append block above has already written and __syncthreads()'d
             // them, so there is no need for the bf16 kernel's separate "from_new" source.
-            for (int chunk = tid; chunk < StageKeys * (D / 8); chunk += Threads) {
-                const int key_l = chunk / (D / 8);
-                const int d     = (chunk - key_l * (D / 8)) * 8;
+            // Stage at 16 codes (one int4 load) per iteration instead of 8 (one int2): the bytes
+            // and the arithmetic are unchanged, but the load instruction count halves. ncu before
+            // the change put this kernel's warps on long_scoreboard 103% of issue-active while
+            // DRAM ran at only 22.5% -- waiting on loads, not starved of bandwidth. After: 69.3%
+            // (the freed room shows up as no_instruction 49 -> 89% and mio_throttle 76 -> 86%, so
+            // the stall moved rather than vanished). End to end, bit-identical, measured on
+            // swift15_iq2xs/int8-g64 with two reps each: 128K decode 52.6 -> 53.3 tok/s (+1.33%,
+            // both builds internally identical), 16K 83.17 -> 83.4..84.1 (+0.5..1.1%), prefill
+            // unchanged. Verified K = 1/3/5 including the 5-warp CompactTail path at 128K.
+            //
+            // 16 divides the 64-element quant group, so d never straddles a scale. StageKeys *
+            // D/16 == 128, which is exactly Threads for the shipped 4-warp CTA -- one iteration
+            // per thread; the 5-warp tail CTA (Threads = 160) leaves its last 32 threads idle here,
+            // which is fine because they still meet at the surrounding barriers.
+            static_assert(D % 16 == 0 && kKVCacheInt8Group % 16 == 0);
+            constexpr int kStageStep = 16;
+            for (int chunk = tid; chunk < StageKeys * (D / kStageStep); chunk += Threads) {
+                const int key_l = chunk / (D / kStageStep);
+                const int d     = (chunk - key_l * (D / kStageStep)) * kStageStep;
                 const int key   = key_begin + key_l;
                 half* k_dst     = &k_s[key_l * SmemStride + d];
                 half* v_dst     = &v_s[key_l * SmemStride + d];
@@ -416,11 +469,18 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
                         physical_page, kv_head, d / kKVCacheInt8Group, page_offset);
                     const float ks = __half2float(cache_k_scale[scale_off]);
                     const float vs = __half2float(cache_v_scale[scale_off]);
-                    store_vec(k_dst, causal_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
-                    store_vec(v_dst, causal_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
+                    int4 lo, hi;
+                    causal_kv_dequant_i8x16_f16_from(&cache_k_i8[code_off], ks, lo, hi);
+                    store_vec(k_dst, lo);
+                    store_vec(k_dst + 8, hi);
+                    causal_kv_dequant_i8x16_f16_from(&cache_v_i8[code_off], vs, lo, hi);
+                    store_vec(v_dst, lo);
+                    store_vec(v_dst + 8, hi);
                 } else {
                     store_vec(k_dst, make_int4(0, 0, 0, 0));
+                    store_vec(k_dst + 8, make_int4(0, 0, 0, 0));
                     store_vec(v_dst, make_int4(0, 0, 0, 0));
+                    store_vec(v_dst + 8, make_int4(0, 0, 0, 0));
                 }
             }
         };
