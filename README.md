@@ -147,6 +147,77 @@ there), i.e. the weight route and the harness (`--max-new 128` full-run average 
 `ninfer_bench`'s ten measured rounds after two warmups). On this artifact alone, copying against
 explaining is **92 -> 178 tok/s (+93%)**, and turning thinking back on drops it to 113.
 
+### Three more routes, all measured, one kept
+
+Everything below was tried against the same fixtures and the same md5 gate. Only A ships.
+
+**A — checkpoint pool (shipped as `--max-shared-prefixes 16`).** Twelve *distinct* ~6k-token
+contexts round-robin, two passes, one variable at a time:
+
+| arm | round-2 hits | round-2 TTFT |
+|---|---:|---|
+| shipped default (`--max-shared-prefixes` **4**) | **4 / 12** | 0.14 s hit, **4.9 s miss** |
+| `--max-shared-prefixes 16` | **8 / 12** (reproduced twice) | **0.11-0.14 s** on the hits |
+| `+ --host-state-slots 16` | 1 / 12 (reproduced twice) — **harmful** | |
+| `+ --host-kv-mib 16384` | 8 / 12 — no change | |
+
+The first gate is `shared`, which defaults to `max(max-concurrency, 4)` = **4**: exactly four
+prefixes survived the first pass, matching the log's `| shared 4`. Raising it doubles the hit rate
+and takes a retained prompt from **4.9 s to 0.11 s (~43x)**. The second gate (8 -> 12) was not
+located: `--device-state-slots 12` cannot start on this card (reservation needs 8.29 GB + 1.07 GB
+headroom against 7.81 GB free after weights), and both host knobs are ruled out above. The serve
+runs `--max-shared-prefixes 16`.
+
+**B — GGUF weight repack (reverted).** A block-local regroup of six formats (IQ2_XXS, IQ2_XS,
+IQ2_S, Q2_K, IQ3_XXS, IQ3_S) plus a decoder-only change to IQ1_M, applied on the CPU during load —
+legal because no metadata crosses a block boundary, so the transform round-trips byte-exactly over
+all 401 real tensors. `cuobjdump -sass` proves the instruction count really fell:
+
+| format | emitted loads / `decode()` | | control IQ1_S (not repacked) |
+|---|---:|---|---|
+| Q2_K | 11 -> **4** (−64%) | | 4 -> 4, byte-identical |
+| IQ1_M | 8 -> **3** (−63%) | | |
+| IQ3_S | 9 -> 5 (−44%) | | |
+| IQ2_S / IQ3_XXS | 7 -> 4 (−43%) | | |
+| IQ2_XS / IQ2_XXS | 6 -> 4 / 5 -> 3 | | |
+
+**33-64% fewer load instructions over 68.7% of the weight payload, md5 byte-identical, weights
+8.1506 -> 8.2723 GiB (+1.45%, 14.8 MB of a measured 141.5 MB budget left) — and decode moved
++0.1% / 0.0%.** So this kernel is not instruction-bound: `ncu` puts 34-47% of its cycles in
+`long_scoreboard` waiting on the *last* the dot product depends on, and independent loads only
+shrink issue slots. A single wide load needs 8-byte-aligned records, which cost 387.6 MB = **2.7x
+the budget**, so no subset of the ten is affordable either. Reverted; md5 re-verified.
+
+**C — the fourth CTA (reverted, −5% to −66%).** The 1,024 B that stood between 25,600 and
+98,304/4 was two buffers the file had called untouchable: the row pad `SmemPad 8 -> 0`
+(32+8+8 rows x 16 B = **768 B**) and `physical_pages_s`, a pure prefetch cache of `block_table`
+(**256 B**). **768 + 256 = 1,024 exactly**, with the three arrays then summing to
+16,384+4,096+4,096 = 24,576. An in-row XOR at 8-element groups replaces the pad's bank-conflict
+property. The build confirmed the structure: `SHARED 25,600 -> 24,576` and `REG 168 -> 128`, i.e.
+both limits now admit four CTAs.
+
+It still lost, badly:
+
+| depth | baseline (K=3) | fourth CTA | Δ |
+|---|---:|---:|---:|
+| 4K | 85.3 | 80.9 | **−5.2%** |
+| 16K | 93.5 | 75.6 | **−19.1%** |
+| 128K | 59.9 | 20.2 | **−66.3%** |
+
+The register cut (`__launch_bounds__(…, 4)`) moved the compiler from **STACK 16 to STACK 400 bytes**
+— it bought the 40 registers back with rematerialisation, exactly the failure
+`docs/ternary-port.md` records at 15-19% on the vec kernel and at 3.9% on the reverted int8-V
+attempt. Dropping `physical_pages_s` also left a dependent `block_table` read in the hot loop,
+which is what the 128K column punishes. md5 initially **failed** — `swizzled(k_dst) + 8` is not
+`swizzled(k_dst + 8)`, because XOR does not preserve successor, so `hi` landed in the wrong group
+and every row's K/V was corrupted (the model emitted token 0 repeatedly); fixing both halves
+restored byte-identity, after which the timing was still decisively negative. Reverted.
+
+> **Build hygiene found on the way:** `ninja -t deps <object>` reported `#deps 0` for
+> `small_t.cu.o`, i.e. no header was registered, so editing its `.cuh` produced
+> `ninja: no work to do`. Forcing one rebuild re-registered them. If a header edit seems ignored,
+> check with `ninja -t deps` and `touch` the `.cu`.
+
 ## Models
 
 | Model | Weights | Artifact | Download and model card |

@@ -4774,6 +4774,50 @@ change moved all three, and the kernel is still latency-bound at 56% no-eligible
 that is both shared memory (25,600 x 4 > 98,304) and registers (164 x 128 x 4 > 65,536). On Volta there
 is no async copy to pipeline the staging with: `memory.cuh` records that `cp_async` below sm_80 is a
 synchronous load-and-store, so the bf16 sibling's "async" staging is not async on this hardware either.
+
+### The fourth CTA was reachable and still not worth it (2026-10-06)
+
+The wall quoted above was measured as a wall, but its two halves were each treated as untouchable,
+and together they are exactly the missing 1,024 B:
+
+| | bytes |
+|---|---:|
+| `SmemPad 8 -> 0` on q_s/k_s/v_s (32 + 8 + 8 rows x 16 B) | **768** |
+| `physical_pages_s[64]` — a pure prefetch cache of `block_table`, every entry `block_table[key >> 6]` | **256** |
+| | **1,024 = 25,600 − 24,576** |
+
+The pad's job — an unpadded 512-byte row stride is a whole multiple of the bank array, so every row
+hits the same banks (the 724M-conflicts measurement quoted above) — was replaced by an in-row XOR at
+8-element groups. `cuobjdump` confirmed both limits then admitted four: **`SHARED 25,600 -> 24,576`
+and `REG 168 -> 128`** (the 5-warp CompactTail instantiation stays at 26,752 / 3 CTAs, and its
+`minBlocks` must remain 3).
+
+It lost anyway, and by more than any previous occupancy attempt in this file:
+
+| depth | baseline (K=3) | fourth CTA | Δ |
+|---|---:|---:|---:|
+| 4K | 85.3 | 80.9 | **−5.2%** |
+| 16K | 93.5 | 75.6 | **−19.1%** |
+| 128K | 59.9 | 20.2 | **−66.3%** |
+
+Two mechanisms, both visible. First, `__launch_bounds__(…, 4)` took the compiler from **STACK 16 to
+STACK 400 bytes** — it recovered the 40 registers by rematerialising, which is the same failure this
+file records at 15-19% on the vec kernel and at 3.9% on the reverted int8-V attempt (`b46c0238`), and
+it is why ncu's occupancy estimates are not a budget: the 2->3 step cashed at +3.5..3.9% against
+ncu's +37.96%, and this one cashed at **negative tens**. Second, removing `physical_pages_s` left an
+unprefetched dependent `block_table` read in the hot loop, and the 128K column is exactly where page
+boundaries multiply.
+
+The md5 gate caught a real bug on the way: the staging pointer for the second half of each
+16-element chunk was written as `swz(d) + 8`, but **XOR does not preserve successor** —
+`(g+1)^r != (g^r)+1` — so `hi` landed in the wrong group and every row's K/V was corrupted (the model
+emitted token 0 for every position). Each 8-element half needs its own `swz(d + 8)`. With that fixed
+the output returned to byte-identity, and the timing was still decisively negative.
+
+Reverted. The in-file comment at `small_t_i8_volta.cuh` now records the arithmetic instead of
+asserting unreachability, so the next attempt starts from "reachable, measured, not worth it" rather
+than from a false impossibility.
+
 ### Correction and a new lead: the decode is 80.6% GPU-busy, with a 7-9 ms stall per round (2026-10-05)
 
 An earlier claim in this work -- that the decode's GPU is busy only 23% of the round -- was wrong, and the
