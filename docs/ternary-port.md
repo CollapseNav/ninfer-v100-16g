@@ -4631,16 +4631,31 @@ Each extra draft token costs about 13% of the rate and buys only 0.5 of acceptan
 > | 4 | -- | 86.8 | -- |
 > | 5 | **89.8** | 81.7 | 48.6 |
 >
-> **Window 3 is +12.2% at 16K and +12.4% at 128K over the shipped 2**, for −1.7% at 4K. At 16K the
-> round goes 33.1 -> 38.8 ms while tokens per round go 2.76 -> 3.63, and that is where the net comes
-> from. The curve is not monotone on this artifact — 16K reads 70.2 / 83.3 / **93.5** / 86.8 / 81.7 —
-> so "monotone and steep" above describes the {2, 4, 6} set at 31.2k, not the window axis itself.
-> Nor is wider uniformly better: window 5 collapses at 128K (48.6 tok/s on an 87.0 ms round).
+> **Window 3 is +12.2% at 16K and +12.4% at 128K over the shipped 2**, for −1.7% at 4K — on one
+> fixture. At 16K the round goes 33.1 -> 38.8 ms while tokens per round go 2.76 -> 3.63, and that is
+> where the net comes from. The curve is not monotone on this artifact — 16K reads 70.2 / 83.3 /
+> **93.5** / 86.8 / 81.7 — so "monotone and steep" above describes the {2, 4, 6} set at 31.2k, not
+> the window axis itself. Nor is wider uniformly better: window 5 collapses at 128K (48.6 tok/s on an
+> 87.0 ms round).
 >
-> **Still one fixture.** MTP acceptance is text-sensitive — the `--prefill-chunk` A/B in the same round
-> moved it 2.82 -> 2.65 purely by reordering the reduction and changing the generated text — so
-> `--draft-tokens 3` is recorded here as the measured recommendation for a 128K-capable serve, not as
-> a re-qualified shipped default. A second fixture is the outstanding check.
+> **Second-fixture check (2026-10-06): holds at 128K, does not hold at 16K.** MTP acceptance is
+> text-sensitive — the `--prefill-chunk` A/B in this same round moved it 2.82 -> 2.65 purely by
+> reordering the reduction and changing the generated text — so the comparison was repeated on a
+> disjoint text (`wikitext/01 + pg19/01`, same prefix-slicing and same depths) plus a real-world
+> fixture:
+>
+> | fixture | depth | K=2 | K=3 | Δ |
+> |---|---|---:|---:|---:|
+> | text A (`wikitext/00 + pg19/00`) | 128K | 53.3 | 59.9 | **+12.4%** |
+> | text B (`wikitext/01 + pg19/01`) | 128K | 50.0 | 55.3 | **+10.6%** |
+> | text A | 16K | 83.3 | 93.5 | +12.2% |
+> | text B | 16K | 85.3 | 88.1 | +3.3% |
+> | `prose16k.json` (19,930 tok) | 16K | 68.3 | 67.8 | −0.7% |
+>
+> Two disjoint texts agree at 128K (**+10.6 / +12.4%**); three fixtures disagree at 16K (−0.7% to
+> +12.2%, median +3.3%), which is text luck rather than a speedup. So `--draft-tokens 3` is recorded
+> as the recommendation **for a 128K-capable serve** — its worst measured depth is −1.7% at 4K — and
+> not as a general upgrade or a re-qualified shipped default. It is what `ninfer-serve` runs.
 >
 > **Not a contradiction of `decode-round-2026-10-01.md` Round 13**, which sweeps K = 1..7 on
 > `real_task` and finds K = 2/3/4 a *strictly dominated basin* (64.5 / 54.9 / 49.5 / 45.7 / 64.0 /

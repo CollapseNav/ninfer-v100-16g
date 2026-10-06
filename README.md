@@ -66,25 +66,40 @@ somewhere that sweep never looked:
 | 4 | -- | 86.8 | -- |
 | 5 | **89.8** | 81.7 | 48.6 |
 
-**`--draft-tokens 3` is the value to run** on a serve that must reach 128K: **+12.2% @16K,
-+12.4% @128K**, for −1.7% @4K. Window 5 wins only at 4K and collapses at 128K (48.6 tok/s on an
-87.0 ms round), so wider is not uniformly better. The window axis is also not monotone — 16K reads
-70.2 / 83.3 / **93.5** / 86.8 / 81.7 — which is why `ternary-port.md`'s "monotone and steep"
-conclusion, drawn from the {2, 4, 6} set at 31.2k, does not generalise: **window 3 was never in that
-table.** It also does not conflict with `decode-round-2026-10-01.md` Round 13, which sweeps K = 1..7
-on `real_task` and finds K = 2/3/4 a dominated basin — that sweep runs the **PQ2/QPN** route on
-`bonsai2_27b_swift_pq2`, where the QPN band edge at T = 5 makes K = 4 verify through SIMT while K = 5
-verifies through QPN and comes out 20% cheaper while accepting more. The gguf route has no such band,
-so the two curves are different, not contradictory. Acceptance is text-sensitive (the
-`--prefill-chunk` A/B below moved it 2.82 -> 2.65 purely by reordering the reduction), so this is a
-measured recommendation on one fixture, not a re-qualified default.
+**`--draft-tokens 3` is confirmed at 128K and not at 16K.** The sweep above is one fixture, and MTP
+acceptance is text-sensitive — the `--prefill-chunk` A/B below moved it 2.82 -> 2.65 purely by
+reordering the reduction — so a second, disjoint text (`wikitext/01 + pg19/01`, same prefix-slicing,
+same depths) and a third real-world fixture were run against it:
+
+| fixture | depth | K=2 | K=3 | Δ |
+|---|---|---:|---:|---:|
+| text A (`wikitext/00 + pg19/00`) | 128K | 53.3 | 59.9 | **+12.4%** |
+| text B (`wikitext/01 + pg19/01`) | 128K | 50.0 | 55.3 | **+10.6%** |
+| text A | 16K | 83.3 | 93.5 | +12.2% |
+| text B | 16K | 85.3 | 88.1 | +3.3% |
+| `prose16k.json` (19,930 tok) | 16K | 68.3 | 67.8 | −0.7% |
+| text A | 4K | 86.8 | 85.3 | −1.7% |
+
+**At 128K it holds on both texts (+10.6 / +12.4%); at 16K it does not** — three fixtures span
+−0.7% to +12.2% with a median of +3.3%, which is text luck rather than a speedup. So
+`--draft-tokens 3` is justified **for a serve that must reach 128K** — its worst measured depth is
+−1.7% at 4K — and it is not a general upgrade.
+
+Window 5 wins only at 4K and collapses at 128K (48.6 tok/s on an 87.0 ms round), so wider is not
+uniformly better. The window axis is also not monotone — 16K reads 70.2 / 83.3 / **93.5** / 86.8 /
+81.7 — which is why `ternary-port.md`'s "monotone and steep", drawn from the {2, 4, 6} set at 31.2k,
+does not generalise: **window 3 was never in that table**. Nor does it conflict with
+`decode-round-2026-10-01.md` Round 13, which sweeps K = 1..7 on `real_task` and finds K = 2/3/4 a
+dominated basin — that sweep runs the **PQ2/QPN** route on `bonsai2_27b_swift_pq2`, where the QPN band
+edge at T = 5 makes K = 4 verify through SIMT while K = 5 verifies through QPN and comes out 20%
+cheaper while accepting more. The gguf route has no such band: two routes, two curves.
 
 **Kept (3).**
 
 1. `--prefill-chunk 8192` whenever `max-context <= 16K` is worth **+9.1% prefill @4K** and
    **+8.4% @16K** with decode unchanged — it cannot be used at 128K, see the wall below.
-2. `--draft-tokens 3` for a 128K-capable serve: **+12.2% @16K, +12.4% @128K**, −1.7% @4K (table
-   above).
+2. `--draft-tokens 3` for a 128K-capable serve: **+10.6..12.4% at 128K on two disjoint texts**,
+   −1.7% at 4K, no confirmed gain at 16K (recheck table above). Deployed on `ninfer-serve`.
 3. `small_t_i8_volta.cuh` stages the KV gather 16 codes at a time (one `int4` load replacing two
    `int2`): bit-identical (md5-equal at both depths, K = 1/3/5 including the 5-warp CompactTail path)
    and worth **128K decode 52.6 -> 53.3 tok/s (+1.33%)**. `ncu` attributes the stall this removes to
