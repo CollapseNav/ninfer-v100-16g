@@ -218,6 +218,50 @@ restored byte-identity, after which the timing was still decisively negative. Re
 > `ninja: no work to do`. Forcing one rebuild re-registered them. If a header edit seems ignored,
 > check with `ninja -t deps` and `touch` the `.cu`.
 
+### Deploy
+
+Rebuild after any source change — all three apps, or the server keeps linking a stale file:
+
+```bash
+docker run --rm -v /root/ninfer-v100:/src -w /src ninfer-v100-buildenv:cu128 \
+  bash -lc "cd /src && ninja -C build-sm70 -j\$(nproc) \
+            apps/ninfer apps/ninfer-serve apps/ninfer-perplexity"
+```
+
+Then start it. Every flag below is a decision the sections above paid for:
+
+```bash
+docker run -d --name ninfer-serve --restart unless-stopped \
+  --gpus all --shm-size 64m -p 8080:8080 \
+  -e NINFER_TERNARY_ROTATE_SPLIT=16 \
+  -e NINFER_MTP_LOOKUP_MATCH=6 \
+  -v /root/ninfer-v100:/src \
+  -v /root/ms:/models:ro \
+  ninfer-v100-buildenv:cu128 \
+  /src/build-sm70/apps/ninfer-serve /models/swift15_iq2xs_mtp.ninfer \
+    --host 0.0.0.0 --port 8080 --cors \
+    --max-context 131072 --kv-capacity auto \
+    --kv-dtype int8 --prefill-chunk 3072 \
+    --spec mtp --draft-tokens 3 --max-shared-prefixes 16
+```
+
+| flag | why (all measured on this artifact) |
+|---|---|
+| `--draft-tokens 3` | **+11.6% @16K, +12.2% @128K** against the shipped 2, and the peak on *both* workloads — prose 93.5 and agent-shaped 81.6 (K2 80.6 / K4 79.2 / K5 67.9). Window 5 also collapses at 128K: 48.6 on an 87.0 ms round |
+| `--max-shared-prefixes 16` | the default resolves to `max(max-concurrency, 4)` = **4**; on a 12-context round-robin that caps pass-2 hits at **4/12**. Raising it gives **8/12** and takes a retained prompt from **4.9 s to 0.11 s (~43×)** |
+| `--prefill-chunk 3072` | memory-capped at `--max-context 131072`: chunk 4096 needs **+108 MB** that the card does not have, and 1024 costs **−14%** on cold prefill (4.07 s vs 3.50 s for the same 3.7k prompt) |
+| `--kv-dtype int8` | `fp8` is **−65..90%** on both phases — Volta has no fp8 path |
+| `--max-context 131072` | speed-neutral by itself (mc 8192 ≡ mc 131072 at 4K); sized to the workload, and it is what pins the chunk to 3072 |
+| *(absent)* `--lm-head-draft` | collapses acceptance to **1.00** — decode 92.4 → 33.5 (**−64%**) |
+| *(absent)* `--no-thinking` | worth **+17.4%** decode, rejected on output quality |
+| `NINFER_TERNARY_ROTATE_SPLIT=16` | carried over from the ternary artifact's sweep (51.1 vs 48.7 unset); **not re-measured on gguf-mixed** |
+| `NINFER_MTP_LOOKUP_MATCH=6` | carried over for copy-heavy traffic (documented +20%); **inert on this traffic — 0 of 14 real requests hit lookup** |
+| `--host-state-slots 8` / `--host-kv-mib 8192` (defaults) | raising `--host-state-slots` to 16 **halved** pass-2 hits (8/12 → 1/12, reproduced twice) |
+
+Prefix reuse itself is already fast where it lands: a 100% hit returns first token in
+**7 / 23 / 43 / 52 ms** for 4K / 16K / 32K / 60K retained prefixes — so the tuning above is the
+whole of what the deployment side currently offers.
+
 ## Models
 
 | Model | Weights | Artifact | Download and model card |
