@@ -14,6 +14,7 @@ namespace ninfer::ops::gguf {
 
 // The block type's id in a GGUF tensor directory (ggml_type).
 enum class GgmlType : int {
+    Q4_0    = 2,
     Q8_0    = 8,
     Q2_K    = 10,
     Q3_K    = 11,
@@ -42,7 +43,9 @@ struct BlockShape {
 [[nodiscard]] int multiprocessor_count();
 
 // Whether the integer tensor-core prefill kernel exists for the type. IQ1_M has none (nor does it in
-// llama.cpp); its wide products dequantize and take a BF16 GEMM.
+// llama.cpp), and neither does Q4_0: it is only ever a built-in MTP head here, whose wide products are
+// rare, and the FP16 dequantize-and-GEMM arm below measured faster than the integer kernel at this
+// card's shapes for every format that has both.
 [[nodiscard]] bool has_matrix_kernel(GgmlType type);
 
 // Columns the vector kernel takes in one launch; wider products take the matrix kernel.

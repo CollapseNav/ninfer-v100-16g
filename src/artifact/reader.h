@@ -45,6 +45,11 @@ enum class NumericFormat {
     GGUF_IQ3_XXS,
     GGUF_IQ3_S,
     GGUF_IQ4_XS,
+    // The two the Coder390 GGUF packages add: Q5_K is ggml's 5.5-bit superblock and is what their
+    // token embedding and output head declare; Q4_0 is the legacy 32-weight block their built-in MTP
+    // heads are quantized with.
+    GGUF_Q5_K,
+    GGUF_Q4_0,
 };
 
 enum class StorageLayout {

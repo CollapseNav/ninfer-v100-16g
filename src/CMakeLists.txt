@@ -347,6 +347,7 @@ add_library(ninfer_ggml_quants STATIC
   ops/linear/gguf/ggml_mmq_q6_k.cu
   ops/linear/gguf/ggml_mmq_q8_0.cu
   ops/linear/gguf/ggml_vec_q8_0.cu
+  ops/linear/gguf/ggml_vec_q4_0.cu
   ops/linear/gguf/ggml_vec_q2_k.cu
   ops/linear/gguf/ggml_vec_q3_k.cu
   ops/linear/gguf/ggml_vec_q4_k.cu

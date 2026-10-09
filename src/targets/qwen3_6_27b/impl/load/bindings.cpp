@@ -380,6 +380,8 @@ bool is_gguf_format(NumericFormat format) {
     case NumericFormat::GGUF_IQ3_XXS:
     case NumericFormat::GGUF_IQ3_S:
     case NumericFormat::GGUF_IQ4_XS:
+    case NumericFormat::GGUF_Q5_K:
+    case NumericFormat::GGUF_Q4_0:
         return true;
     default:
         return false;
@@ -798,15 +800,21 @@ void bind_gguf_text_layers(artifact::Binder& binder, BindingPlan& out,
             // separate objects. gate and value are separate on every layer and their formats differ,
             // so the projection is always four parts and only the first two sometimes share an object.
             GgufAttentionProjectionPlan projection;
-            // The artifact's own v3 bindings say which of query/key are row ranges of one object:
-            // two of the sixteen full layers store them that way and the rest store them apart.
             const artifact::ObjectSlice* q_slice = binder.find_slice(prefix + "attention/query");
             const artifact::ObjectSlice* k_slice = binder.find_slice(prefix + "attention/key");
+            // The artifact's own v3 bindings decide how the projections are stored, and an object may
+            // carry query|key, gate|value, or -- the Coder390 packages -- all four as row ranges. The
+            // binder refuses to hand out one object twice, so the second pair reuses the first pair's
+            // binding when they name the same object.
+            const artifact::ObjectDescriptor* shared_object = nullptr;
+            WeightPlan shared_plan;
             if (q_slice != nullptr && k_slice != nullptr && q_slice->object == k_slice->object) {
                 const auto& object = *q_slice->object;
                 const auto rows = static_cast<std::int32_t>(
                     std::get<artifact::TensorDescriptor>(object).shape[0]);
-                const WeightPlan shared = bind_gguf_object(binder, object);
+                shared_object = &object;
+                shared_plan   = bind_gguf_object(binder, object);
+                const WeightPlan shared = shared_plan;
                 projection.parts.push_back(GgufProjectionPartPlan{
                     .weight      = shared,
                     .object_rows = rows,
@@ -844,7 +852,8 @@ void bind_gguf_text_layers(artifact::Binder& binder, BindingPlan& out,
                 const auto& object = *g_slice->object;
                 const auto rows    = static_cast<std::int32_t>(
                     std::get<artifact::TensorDescriptor>(object).shape[0]);
-                const WeightPlan shared = bind_gguf_object(binder, object);
+                const WeightPlan shared = shared_object == &object ? shared_plan
+                                                                   : bind_gguf_object(binder, object);
                 projection.parts.push_back(GgufProjectionPartPlan{
                     .weight      = shared,
                     .object_rows = rows,
@@ -990,16 +999,25 @@ void bind_gguf_artifact(artifact::Binder& binder, BindingPlan& out,
     out.output_head     = bind_gguf_weight(binder, "text/output_head", {248320, 5120});
 
     // proposal/head and proposal/token_ids arrive under the v3 logical layer's fork renames as
-    // text/draft_head and text/draft_head_token_ids.
-    const artifact::TensorPlacement proposal_placement =
-        features.optimized_proposal() ? artifact::TensorPlacement::Device
-                                      : artifact::TensorPlacement::ValidateOnly;
-    out.draft_head =
-        bind_gguf_weight(binder, "text/draft_head", {131072, 5120}, proposal_placement).object;
-    out.draft_head_token_ids = artifact::bind_tensor(binder, "text/draft_head_token_ids",
-                                                     NumericFormat::I32, {131072},
-                                                     proposal_placement);
-    validate_draft_ids(binder, out.draft_head_token_ids);
+    // text/draft_head and text/draft_head_token_ids. A package that ships no built-in DFlash draft
+    // -- the Coder390 GGUF-NInfer exports keep DFlash2 outside the container -- omits them, and the
+    // runtime reads them only when the feature is on, so bind them only when the artifact has them.
+    const bool has_proposal = binder.contains("text/draft_head");
+    if (features.optimized_proposal() && !has_proposal) {
+        throw artifact::ArtifactError(
+            "the optimized proposal head was selected but the artifact has no text/draft_head");
+    }
+    if (has_proposal) {
+        const artifact::TensorPlacement proposal_placement =
+            features.optimized_proposal() ? artifact::TensorPlacement::Device
+                                          : artifact::TensorPlacement::ValidateOnly;
+        out.draft_head =
+            bind_gguf_weight(binder, "text/draft_head", {131072, 5120}, proposal_placement).object;
+        out.draft_head_token_ids = artifact::bind_tensor(binder, "text/draft_head_token_ids",
+                                                         NumericFormat::I32, {131072},
+                                                         proposal_placement);
+        validate_draft_ids(binder, out.draft_head_token_ids);
+    }
 
     const artifact::TensorPlacement mtp_placement =
         features.mtp() ? artifact::TensorPlacement::Device : artifact::TensorPlacement::ValidateOnly;
@@ -1028,18 +1046,27 @@ void bind_gguf_artifact(artifact::Binder& binder, BindingPlan& out,
     out.mtp.final_norm  = artifact::bind_device_tensor(binder, "mtp/final_norm",
                                                        NumericFormat::BF16, {5120});
 
-    const artifact::TensorPlacement vision_placement =
-        features.vision ? artifact::TensorPlacement::Device
-                        : artifact::TensorPlacement::ValidateOnly;
-    out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
-    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
-    out.vision_merger_fc2 =
-        bind_weight(binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608},
-                    vision_placement)
-            .object;
-    out.vision_merger_fc2_bias = artifact::bind_tensor(
-        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
-    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
+    // The vision tower is an optional component: a text-only package -- the Coder390 GGUF-NInfer
+    // exports keep it in a separate vision-bf16.safetensors beside the .ninfer -- declares no vision
+    // component and carries none of these objects. Bind them only when the artifact has them.
+    const bool has_vision = binder.contains("vision/patch_embedding");
+    if (features.vision && !has_vision) {
+        throw artifact::ArtifactError("vision was enabled but the artifact has no vision weights");
+    }
+    if (has_vision) {
+        const artifact::TensorPlacement vision_placement =
+            features.vision ? artifact::TensorPlacement::Device
+                            : artifact::TensorPlacement::ValidateOnly;
+        out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
+        out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
+        out.vision_merger_fc2 =
+            bind_weight(binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608},
+                        vision_placement)
+                .object;
+        out.vision_merger_fc2_bias = artifact::bind_tensor(
+            binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
+        out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
+    }
 }
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
@@ -1077,14 +1104,22 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
     out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
-    const artifact::TensorPlacement proposal_placement =
-        features.optimized_proposal() ? artifact::TensorPlacement::Device
-                                      : artifact::TensorPlacement::ValidateOnly;
-    out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
-                                           {131072, 5120}, proposal_placement);
-    out.draft_head_token_ids = artifact::bind_tensor(
-        binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
-    validate_draft_ids(binder, out.draft_head_token_ids);
+    const bool has_proposal = binder.contains("text/draft_head");
+    if (features.optimized_proposal() && !has_proposal) {
+        throw artifact::ArtifactError(
+            "the optimized proposal head was selected but the artifact has no text/draft_head");
+    }
+    if (has_proposal) {
+        const artifact::TensorPlacement proposal_placement =
+            features.optimized_proposal() ? artifact::TensorPlacement::Device
+                                          : artifact::TensorPlacement::ValidateOnly;
+        out.draft_head = artifact::bind_tensor(binder, "text/draft_head",
+                                               NumericFormat::Q4G64_F16S, {131072, 5120},
+                                               proposal_placement);
+        out.draft_head_token_ids = artifact::bind_tensor(
+            binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
+        validate_draft_ids(binder, out.draft_head_token_ids);
+    }
 
     const artifact::TensorPlacement mtp_placement = features.mtp()
                                                         ? artifact::TensorPlacement::Device
@@ -1118,16 +1153,22 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         .format = NumericFormat::W8G32_F16S};
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 
-    const artifact::TensorPlacement vision_placement =
-        features.vision ? artifact::TensorPlacement::Device
-                        : artifact::TensorPlacement::ValidateOnly;
-    out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
-    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
-    out.vision_merger_fc2   = artifact::bind_tensor(
-        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, vision_placement);
-    out.vision_merger_fc2_bias = artifact::bind_tensor(
-        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
-    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
+    const bool has_vision = binder.contains("vision/patch_embedding");
+    if (features.vision && !has_vision) {
+        throw artifact::ArtifactError("vision was enabled but the artifact has no vision weights");
+    }
+    if (has_vision) {
+        const artifact::TensorPlacement vision_placement =
+            features.vision ? artifact::TensorPlacement::Device
+                            : artifact::TensorPlacement::ValidateOnly;
+        out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
+        out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
+        out.vision_merger_fc2   = artifact::bind_tensor(
+            binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, vision_placement);
+        out.vision_merger_fc2_bias = artifact::bind_tensor(
+            binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
+        out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
+    }
 
     const bool has_dflash2 = binder.contains("dflash2/feature_projection");
     if (features.dflash2() && !has_dflash2) {

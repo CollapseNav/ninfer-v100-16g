@@ -38,6 +38,8 @@ StorageLayout storage_layout_for(NumericFormat format) {
     case NumericFormat::GGUF_IQ3_XXS:
     case NumericFormat::GGUF_IQ3_S:
     case NumericFormat::GGUF_IQ4_XS:
+    case NumericFormat::GGUF_Q5_K:
+    case NumericFormat::GGUF_Q4_0:
         return StorageLayout::GgufBlocksV1;
     }
     throw std::logic_error("unhandled numeric format");
@@ -91,6 +93,10 @@ QType qtype_for(NumericFormat format) {
         return QType::GGUF_IQ3_S;
     case NumericFormat::GGUF_IQ4_XS:
         return QType::GGUF_IQ4_XS;
+    case NumericFormat::GGUF_Q5_K:
+        return QType::GGUF_Q5_K;
+    case NumericFormat::GGUF_Q4_0:
+        return QType::GGUF_Q4_0;
     }
     throw std::logic_error("unhandled numeric format");
 }

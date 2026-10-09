@@ -59,10 +59,14 @@ enum class QType : std::uint16_t {
     GGUF_IQ1_M           = 23,
     GGUF_IQ4_NL          = 24,
     GGUF_IQ4_XS          = 25,
+    // llama.cpp's legacy 32-weight block with one FP16 scale. It shares IQ4_NL's geometry (32
+    // weights, 18 bytes) but not its values: Q4_0 stores (code - 8) * d, IQ4_NL a table lookup. The
+    // built-in MTP heads of the Coder390 GGUF packages are Q4_0.
+    GGUF_Q4_0            = 26,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
-    return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_IQ4_XS;
+    return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q4_0;
 }
 
 // One ggml superblock: how many weights it holds and how many stored bytes it occupies. The values
@@ -90,6 +94,7 @@ struct GgufBlockShape {
     case QType::GGUF_IQ1_M: return {256, 56};
     case QType::GGUF_IQ4_NL: return {32, 18};
     case QType::GGUF_IQ4_XS: return {256, 136};
+    case QType::GGUF_Q4_0: return {32, 18};
     default: return {};
     }
 }

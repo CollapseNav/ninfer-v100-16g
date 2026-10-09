@@ -18,6 +18,7 @@ add_library(ninfer_ggml_quants STATIC
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_q6_k.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_q8_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q8_0.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q4_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q2_k.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q3_k.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q4_k.cu"

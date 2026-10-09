@@ -119,6 +119,8 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "GGUF_IQ3_XXS") { return NumericFormat::GGUF_IQ3_XXS; }
     if (name == "GGUF_IQ3_S") { return NumericFormat::GGUF_IQ3_S; }
     if (name == "GGUF_IQ4_XS") { return NumericFormat::GGUF_IQ4_XS; }
+    if (name == "GGUF_Q5_K") { return NumericFormat::GGUF_Q5_K; }
+    if (name == "GGUF_Q4_0") { return NumericFormat::GGUF_Q4_0; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 
@@ -163,6 +165,8 @@ std::string_view map_v3_format(std::string_view value) {
     if (value == "gguf_iq3_xxs") { return "GGUF_IQ3_XXS"; }
     if (value == "gguf_iq3_s") { return "GGUF_IQ3_S"; }
     if (value == "gguf_iq4_xs") { return "GGUF_IQ4_XS"; }
+    if (value == "gguf_q5_k") { return "GGUF_Q5_K"; }
+    if (value == "gguf_q4_0") { return "GGUF_Q4_0"; }
     // "t2_g128_fp16" is deliberately NOT mapped onto PQ2_0_G128. The container geometry is
     // identical (32 code bytes + 2 scale bytes per 128 weights) but the 2-bit dictionaries differ:
     // T2 is two's-complement signed (00->0, 01->+1, 11->-1) while PQ2_0 is code-1 over {0,1,2}.

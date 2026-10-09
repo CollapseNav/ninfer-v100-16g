@@ -127,6 +127,28 @@ struct Decoder<GGML_TYPE_IQ4_NL> {
     }
 };
 
+// llama.cpp's legacy 32-weight block: four-bit codes biased by 8 and one FP16 scale, in the same
+// (32 weights, 18 bytes) geometry IQ4_NL has. The codes are linear rather than a table, so the -8
+// comes off through the activation's sum, exactly as ggml's own vec_dot_q4_0_q8_1 does it.
+template <>
+struct Decoder<GGML_TYPE_Q4_0> {
+    static constexpr int kBlockElems = 32, kBlockBytes = 18, kTableWords = 0;
+    __device__ static const std::uint32_t* table() { return nullptr; }
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int, const std::uint32_t*,
+                                                  Slice& s) {
+        s.f[0] = half_at(b);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const std::uint32_t q = u32_a2(b + 2 + 4 * j);
+            s.w[j]                = int(q & 0x0F0F0F0Fu);
+            s.w[j + 4]            = int((q >> 4) & 0x0F0F0F0Fu);
+        }
+    }
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float sum) {
+        return s.f[0] * (d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0))) - 8.0f * sum);
+    }
+};
+
 template <>
 struct Decoder<GGML_TYPE_IQ4_XS> {
     static constexpr int kBlockElems = 256, kBlockBytes = 136, kTableWords = 0;

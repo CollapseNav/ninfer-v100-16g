@@ -85,6 +85,7 @@ VectorLaunch vector_launch(GgmlType type) {
     case GgmlType::IQ1_M: return vec_launch<GGML_TYPE_IQ1_M>;
     case GgmlType::IQ4_NL: return vec_launch<GGML_TYPE_IQ4_NL>;
     case GgmlType::IQ4_XS: return vec_launch<GGML_TYPE_IQ4_XS>;
+    case GgmlType::Q4_0: return vec_launch<GGML_TYPE_Q4_0>;
     }
     throw std::invalid_argument("gguf vector product: unsupported block type");
 }
@@ -217,6 +218,17 @@ __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int
             const block_q8_0& b = blocks[i / QK8_0];
             y[i] = ggml_cuda_cast<dst_t>(__half2float(b.d) * b.qs[i % QK8_0]);
         }
+    } else if constexpr (type == GGML_TYPE_Q4_0) {
+        // ggml's dequantize_row_q4_0: element j of a block is the low nibble of qs[j] and element
+        // j + 16 its high nibble, each biased by 8 and scaled by the block's single FP16 delta.
+        const block_q4_0* blocks = static_cast<const block_q4_0*>(x) + blockIdx.x * (QK_K / QK4_0);
+        for (int i = threadIdx.x; i < QK_K; i += threads) {
+            const block_q4_0& b  = blocks[i / QK4_0];
+            const int lane       = i % QK4_0;
+            const std::uint8_t q = b.qs[lane % (QK4_0 / 2)];
+            const int v          = (lane < QK4_0 / 2 ? (q & 0x0F) : (q >> 4)) - 8;
+            y[i] = ggml_cuda_cast<dst_t>(float(v) * __half2float(b.d));
+        }
     } else if constexpr (type == GGML_TYPE_Q2_K) {
         dequantize_q2_K(x, blockIdx.x, y, threadIdx.x);
     } else if constexpr (type == GGML_TYPE_Q3_K) {
@@ -265,6 +277,7 @@ void dispatch_dequantize(GgmlType type, const void* weight, std::int64_t row_byt
                          const std::int32_t* row_ids, int rows, dst_t* out,
                          std::int64_t out_row_stride, cudaStream_t stream) {
     switch (type) {
+    case GgmlType::Q4_0: return launch_dequantize<GGML_TYPE_Q4_0, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     case GgmlType::Q8_0: return launch_dequantize<GGML_TYPE_Q8_0, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     case GgmlType::Q2_K: return launch_dequantize<GGML_TYPE_Q2_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     case GgmlType::Q3_K: return launch_dequantize<GGML_TYPE_Q3_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
@@ -289,6 +302,7 @@ void dispatch_dequantize(GgmlType type, const void* weight, std::int64_t row_byt
 
 BlockShape block_shape(GgmlType type) {
     switch (type) {
+    case GgmlType::Q4_0: return {32, 18};
     case GgmlType::Q8_0: return {32, 34};
     case GgmlType::Q2_K: return {256, 84};
     case GgmlType::Q3_K: return {256, 110};
@@ -308,7 +322,9 @@ BlockShape block_shape(GgmlType type) {
     throw std::invalid_argument("gguf: unsupported block type");
 }
 
-bool has_matrix_kernel(GgmlType type) { return type != GgmlType::IQ1_M; }
+bool has_matrix_kernel(GgmlType type) {
+    return type != GgmlType::IQ1_M && type != GgmlType::Q4_0;
+}
 
 int multiprocessor_count() { return detail::device_facts().sm_count; }
 
@@ -406,6 +422,7 @@ std::size_t matrix_fixup_bytes(GgmlType type, int rows, int columns) {
     case GgmlType::IQ4_NL: return detail::matrix_fixup_bytes_impl<GGML_TYPE_IQ4_NL>(rows, columns);
     case GgmlType::IQ4_XS: return detail::matrix_fixup_bytes_impl<GGML_TYPE_IQ4_XS>(rows, columns);
     case GgmlType::IQ1_M: break;
+    case GgmlType::Q4_0: break;
     }
     throw std::invalid_argument("gguf matrix product: no integer kernel for this block type");
 }
@@ -435,6 +452,8 @@ void matrix_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
         NINFER_GGUF_MATRIX_CASE(IQ4_NL);
         NINFER_GGUF_MATRIX_CASE(IQ4_XS);
     case GgmlType::IQ1_M:
+        break;
+    case GgmlType::Q4_0:
         break;
     }
 #undef NINFER_GGUF_MATRIX_CASE

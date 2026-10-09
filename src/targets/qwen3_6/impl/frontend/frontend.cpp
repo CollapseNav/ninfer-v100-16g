@@ -919,7 +919,8 @@ public:
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          processor(processor_options(resources)), vision_enabled(options.vision_enabled),
+          processor(options.vision_enabled ? processor_options(resources) : fi::ProcessorOptions{}),
+          vision_enabled(options.vision_enabled),
           max_context(options.max_context) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
@@ -940,7 +941,9 @@ public:
                 options.media_preprocess_threads, static_cast<std::size_t>(minimum_live));
         }
         if (registered_checkpoint) {
-            validate_registered_processor(processor);
+            // The registered pixel bounds can only be checked against a parsed vision processor, which
+            // a text-only run does not have; the tokenizer contract holds either way.
+            if (vision_enabled) { validate_registered_processor(processor); }
             validate_registered_tokenizer(*tokenizer);
         }
         for (const int token : tokenizer->default_stop_token_ids()) {

@@ -162,6 +162,7 @@ gguf::GgmlType gguf_type(QType format) {
     case QType::GGUF_IQ1_M: return gguf::GgmlType::IQ1_M;
     case QType::GGUF_IQ4_NL: return gguf::GgmlType::IQ4_NL;
     case QType::GGUF_IQ4_XS: return gguf::GgmlType::IQ4_XS;
+    case QType::GGUF_Q4_0: return gguf::GgmlType::Q4_0;
     default: break;
     }
     throw std::invalid_argument("gguf: not a GGUF block format");

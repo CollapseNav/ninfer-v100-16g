@@ -101,6 +101,12 @@ GgufBlockGeometry gguf_block_geometry(NumericFormat format) {
         return {256, 110};
     case NumericFormat::GGUF_IQ4_XS:
         return {256, 136};
+    // Q5_K is 256 weights in 176 bytes; Q4_0 is the legacy 32-weight block in 18, the same geometry
+    // IQ4_NL has.
+    case NumericFormat::GGUF_Q5_K:
+        return {256, 176};
+    case NumericFormat::GGUF_Q4_0:
+        return {32, 18};
     default:
         throw ArtifactError("gguf_blocks_v1 requires a GGUF block-quantized format");
     }
@@ -154,6 +160,10 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "GGUF_IQ3_S";
     case NumericFormat::GGUF_IQ4_XS:
         return "GGUF_IQ4_XS";
+    case NumericFormat::GGUF_Q5_K:
+        return "GGUF_Q5_K";
+    case NumericFormat::GGUF_Q4_0:
+        return "GGUF_Q4_0";
     }
     return {};
 }
