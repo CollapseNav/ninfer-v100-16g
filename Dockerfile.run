@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1
+# NInfer V100 直接可用镜像（精简版）：ubuntu:24.04 底 + 仅打包二进制 ldd 闭包里的 4 个 CUDA 库
+#   cublas 116MB + cublasLt 752MB + cudart 0.7MB + OpenCL 30KB ≈ 869MB
+# 其余 cufft/cusolver/cusparse/npp/compat 等 runtime 死重不带。
+# 注意 COPY --from 会把符号链接解引用成实体，所以只拷真实文件，链接用 ln -s 建。
+#   docker build -f Dockerfile.run -t ninfer-v100:cu128 build-sm70/apps
+# 改源码后先 ninja -C build-sm70 apps/ninfer-serve 再构建。
+#
+# 只打包 ninfer-serve。这是一个服务镜像：
+#   ninfer       本地 CLI（一次性生成等），服务场景用不到，省约 393MB
+#   ninfer-perplexity  离线困惑度评测，不是服务端点，同样不放
+# 需要这两个工具就在宿主机上跑 build-sm70/apps 里的二进制。
+
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS cuda-libs
+
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        libavcodec60 \
+        libavformat60 \
+        libavutil58 \
+        libcurl4t64 \
+        libswscale7 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=cuda-libs /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.4.1 \
+                      /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublasLt.so.12.8.4.1 \
+                      /usr/local/cuda-12.8/targets/x86_64-linux/lib/libcudart.so.12.8.90 \
+                      /usr/local/cuda-12.8/targets/x86_64-linux/lib/libOpenCL.so.1.0.0 \
+                      /usr/local/cuda-12.8/targets/x86_64-linux/lib/
+RUN cd /usr/local/cuda-12.8/targets/x86_64-linux/lib \
+    && ln -s libcublas.so.12.8.4.1 libcublas.so.12 \
+    && ln -s libcublasLt.so.12.8.4.1 libcublasLt.so.12 \
+    && ln -s libcudart.so.12.8.90 libcudart.so.12 \
+    && ln -s libOpenCL.so.1.0.0 libOpenCL.so.1 \
+    && ln -s cuda-12.8 /usr/local/cuda \
+    && ln -s targets/x86_64-linux/lib /usr/local/cuda-12.8/lib64
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
+
+COPY ninfer-serve /usr/local/bin/ninfer-serve
+
+WORKDIR /workspace
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+
+CMD ["ninfer-serve", "--help"]
