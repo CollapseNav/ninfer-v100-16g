@@ -1,268 +1,238 @@
-# NInfer
+# NInfer — `v100-16g` fork
 
-> Up to 219 decode tok/s from Qwen 3.8 27B on a single V100.  With software NVFP4 on Volta.
+> Up to 219 decode tok/s from Qwen 3.8 27B on a single V100. With software NVFP4 on Volta.
 
-NInfer is a from-scratch C++/CUDA inference engine optimized for selected Qwen checkpoints on NVIDIA Tesla V100.
+**Upstream:** [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100) — NInfer, a from-scratch
+C++/CUDA inference engine optimized for selected Qwen checkpoints on NVIDIA Tesla V100.
+**This fork:** [CollapseNav/ninfer-v100-16g](https://github.com/CollapseNav/ninfer-v100-16g), branch
+`v100-16g` — 157 commits on top of upstream, aimed at running larger models and longer contexts on a
+single **V100-SXM2-16GB**.
 
-It supports text, image, and video input through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime is intentionally narrow: one GPU, one resident model, 1–8 active requests.
+Text, image, and video input through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The
+runtime is intentionally narrow: one GPU, one resident model, 1–8 active requests.
 
-## V100-16GB ternary port (branch `v100-16g`)
+---
 
-This branch adds the **PQ2_0_G128** (2-bit ternary) path used by community requantized artifacts --
-the reference one here is `bonsai2_27b_swift_pq2.ninfer` (artifact identity `qwen3.8-27b` /
-`groupwise-int`, 7.45 GiB of weights), sized so the model plus KV fits a single **V100-SXM2-16GB**.
+## Upstream vs this fork
 
-The upstream tables below are NVFP4 and groupwise-int results on 32GB cards and do **not** apply to
-this artifact: Volta has no NVFP4 route (that kernel is inside `#ifndef NINFER_VOLTA_BUILD`), the
-weights are 2-bit ternary rather than 4-bit, and this decode is issue/latency-bound rather than
-HBM-bound. Measured on the 16GB SXM2, greedy, INT8 KV, one resident model:
+Read this first: it decides which numbers apply to you and which code you are looking at.
 
-| scenario | prefill | decode | speculation |
-|---|---:|---:|---|
-| natural prose, no speculation | 1.21-1.23k tok/s @4k | **51.1 tok/s** with `NINFER_TERNARY_ROTATE_SPLIT=16`, 48.7 with no environment variables | -- |
-| ordinary engineering task, thinking on | 1.13-1.15k tok/s | 49.8-51.4 tok/s | **K=1: 59.3-61.7 tok/s**, draft acceptance 58.5-73.9% |
-| context reproduction (repetitive text) | -- | -- | K=7: **122-124 tok/s**, acceptance 97.1% |
+| Area | Upstream | `v100-16g` |
+|---|---|---|
+| Engine core — scheduler, chunked prefill, CUDA-graph decode, FIFO ingress | ✅ | tuned for `sm_70` |
+| KV storage formats (BF16 / INT8 / FP8), offline perplexity CLI | ✅ | — |
+| **Device/Host KV tiering, context cache, pressure planner** | ✅ | **extended — see [KVMem](#kvmem-device-pool-smaller-than-the-context-this-fork)** |
+| Volta attention and prefill kernels | ✅ | **+ KVMem mask plumbing** |
+| MTP, DFlash, DFlash2 speculative decoding | ✅ | — |
+| NVFP4 weights (not available on Volta) | ✅ | — |
+| 32GB-class artifacts (Qwen3.6-27B, Qwen3.8-27B, Qwen3.6-35B-A3B) | ✅ | — |
+| **PQ2_0_G128 ternary weights** | — | ✅ |
+| **GGUF mixed-format linear layers** — IQ1_S/M, IQ2_S/XS/XXS, IQ3_S/XXS, IQ4_NL/XS, Q2_K–Q6_K, Q4_0, Q8_0 | — | ✅ |
+| **KVMem: a device KV pool smaller than the logical context** | — | ✅ |
+| **16GB-class artifacts, their context ceilings and throughput** | — | ✅ |
 
-Against the pre-port snapshot recorded in `docs/ternary-port.md`: decode **44.6 -> 51.1 tok/s
-(+14.6%)** on the same route, prose MTP K=1 **51.8 -> 64.1**, context lookup **83.7 -> 122-124**, and
-the marginal cost of one verified token **0.60 -> 0.30-0.37** of a decode step. What was measured,
-what was refuted, and what is still open lives in `docs/ternary-port.md`; the remote build/run
-recipe is in `docs/e5-ssh-workflow.md`.
+Two things follow from that table:
+
+- **KVMem is an extension, not a replacement.** Upstream already tiers KV between the Device and a
+  pinned Host arena (see [Resource-aware long-context reuse](#resource-aware-long-context-reuse-upstreamkvmem-extends-it)).
+  KVMem adds the ability to size the *device* pool below the logical context, plus relevance-aware
+  retention and cross-owner reclaim on top of that tiering.
+- **Upstream performance tables do not transfer to this fork's artifacts.** The NVFP4 and
+  groupwise-int figures below are 32GB-card results; Volta has no NVFP4 route, the 16GB artifacts use
+  2-bit ternary or mixed GGUF weights, and this decode is issue/latency-bound rather than HBM-bound.
+  Use the [16GB tables](#throughput-this-fork).
+
+---
+
+## Build
 
 ```bash
 cmake -S . -B build-sm70 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70
 cmake --build build-sm70 --parallel 8
-./build-sm70/apps/ninfer-serve models/bonsai2_27b_swift_pq2.ninfer \
-    --host 0.0.0.0 --port 8080 --cors --max-context 131072 --kv-capacity auto \
-    --kv-dtype int8 --prefill-chunk 4096 --spec mtp --draft-tokens 1 --lm-head-draft
 ```
 
-The binaries link `libavformat.so.60`, which the host here does not provide, so they are run through
-the `ninfer-v100-buildenv:cu128` image as `docs/e5-ssh-workflow.md` describes.
-
-## V100-16GB gguf-mixed tuning round (2026-10-05/06)
-
-A tuning round over the *other* 16GB artifact — `swift15_iq2xs_mtp.ninfer` (identity
-`qwen3.8-27b` / `gguf-mixed`, 8.15 GiB, 11 GGUF formats mixed across 401 tensors) — on the
-V100-SXM2-16GB with `--kv-dtype int8` group-64, MTP K=2, greedy, `--max-new 128`, CUDA graphs, one
-resident model. The three arms are prefixes of a single text (`wikitext/00` + `pg19/00`), so they
-differ only in depth; two repetitions each.
-
-| context | prompt | prefill | decode | MTP acceptance |
-|---|---:|---:|---:|---:|
-| short | 4,084 | 1,075 tok/s | **92.3 tok/s** | 2.82 tok/round |
-| medium | 16,351 | 1,055 tok/s | **83.2 tok/s** | 2.76 |
-| long | 130,771 | 557.7 tok/s | **52.6 tok/s** | 2.80 |
-
-The baseline row is at `--draft-tokens 2`, which is the value `ternary-port.md` ships. Sweeping the
-window afterwards — same fixture, same settings, only `--draft-tokens` varying — puts the peak
-somewhere that sweep never looked:
-
-| `--draft-tokens` | 4K decode | 16K decode | 128K decode |
-|---:|---:|---:|---:|
-| 1 | -- | 70.2 | -- |
-| **2 (shipped)** | 86.8 | 83.3 | 53.3 |
-| **3** | 85.3 | **93.5** | **59.9** |
-| 4 | -- | 86.8 | -- |
-| 5 | **89.8** | 81.7 | 48.6 |
-
-**`--draft-tokens 3` is confirmed at 128K and not at 16K.** The sweep above is one fixture, and MTP
-acceptance is text-sensitive — the `--prefill-chunk` A/B below moved it 2.82 -> 2.65 purely by
-reordering the reduction — so a second, disjoint text (`wikitext/01 + pg19/01`, same prefix-slicing,
-same depths) and a third real-world fixture were run against it:
-
-| fixture | depth | K=2 | K=3 | Δ |
-|---|---|---:|---:|---:|
-| text A (`wikitext/00 + pg19/00`) | 128K | 53.3 | 59.9 | **+12.4%** |
-| text B (`wikitext/01 + pg19/01`) | 128K | 50.0 | 55.3 | **+10.6%** |
-| text A | 16K | 83.3 | 93.5 | +12.2% |
-| text B | 16K | 85.3 | 88.1 | +3.3% |
-| `prose16k.json` (19,930 tok) | 16K | 68.3 | 67.8 | −0.7% |
-| text A | 4K | 86.8 | 85.3 | −1.7% |
-
-**At 128K it holds on both texts (+10.6 / +12.4%); at 16K it does not** — three fixtures span
-−0.7% to +12.2% with a median of +3.3%, which is text luck rather than a speedup. So
-`--draft-tokens 3` is justified **for a serve that must reach 128K** — its worst measured depth is
-−1.7% at 4K — and it is not a general upgrade.
-
-Window 5 wins only at 4K and collapses at 128K (48.6 tok/s on an 87.0 ms round), so wider is not
-uniformly better. The window axis is also not monotone — 16K reads 70.2 / 83.3 / **93.5** / 86.8 /
-81.7 — which is why `ternary-port.md`'s "monotone and steep", drawn from the {2, 4, 6} set at 31.2k,
-does not generalise: **window 3 was never in that table**. Nor does it conflict with
-`decode-round-2026-10-01.md` Round 13, which sweeps K = 1..7 on `real_task` and finds K = 2/3/4 a
-dominated basin — that sweep runs the **PQ2/QPN** route on `bonsai2_27b_swift_pq2`, where the QPN band
-edge at T = 5 makes K = 4 verify through SIMT while K = 5 verifies through QPN and comes out 20%
-cheaper while accepting more. The gguf route has no such band: two routes, two curves.
-
-**Kept (3).**
-
-1. `--prefill-chunk 8192` whenever `max-context <= 16K` is worth **+9.1% prefill @4K** and
-   **+8.4% @16K** with decode unchanged — it cannot be used at 128K, see the wall below.
-2. `--draft-tokens 3` for a 128K-capable serve: **+10.6..12.4% at 128K on two disjoint texts**,
-   −1.7% at 4K, no confirmed gain at 16K (recheck table above). Deployed on `ninfer-serve`.
-3. `small_t_i8_volta.cuh` stages the KV gather 16 codes at a time (one `int4` load replacing two
-   `int2`): bit-identical (md5-equal at both depths, K = 1/3/5 including the 5-warp CompactTail path)
-   and worth **128K decode 52.6 -> 53.3 tok/s (+1.33%)**. `ncu` attributes the stall this removes to
-   `long_scoreboard`, 103.5% -> 69.3% of issue-active.
-
-**Refuted on measurement (10).** The documented 7-9 ms per-round stall does not reproduce — five
-configurations measure 95.9-97.4% GPU-busy and the only hole above 1 ms sits on the
-prefill→decode boundary. `--lm-head-draft` collapses acceptance to **1.00** on this artifact
-(decode 92.4 -> 33.5), so the "every number used Optimized" note in `decode-round` does not apply
-here. `--kv-dtype fp8` is 65-90% slower; `NINFER_CAUSAL_WAVE_ALIGN`'s default already wins against
-0/2/3; `NINFER_GGUF_F16_PREFILL=0` fails at startup; lowering `NINFER_GGUF_DEQUANT_SCRATCH_MIB`
-costs more than the chunk it buys. The 128K prefill's flash-attention is at its roofline — ncu reads
-**DRAM 81.5% (735 of 902 GB/s)** on the kernel that is 53.8% of that prefill. And
-shared-staging the vec kernel's weight blocks (the universal form of the per-format repack) is
-bit-identical but **-17..-29%**: it relocates `decode`'s loads instead of removing them — 192
-global loads become 66 global **plus** 192 shared.
-
-**Two walls.** The runtime reservation follows `--max-context`, not the prompt: at 131072 tokens of
-int8 KV, `--prefill-chunk 4096` is 108 MB over budget and `--lm-head-draft` 59 MB over, so at 128K
-the chunk is pinned to 3072 and the optimized proposal head cannot be loaded. `--max-context` itself
-is speed-neutral (mc 8192 and mc 131072 measure identically at 4K). And the KV attention kernel's
-**18.4% occupancy with 55.9% of cycles holding no eligible warp** is not improvable: `q_s` must keep
-its 32 rows because `volta_qp_get_i()` returns `threadIdx.x & 31` (the QK fragment addresses rows
-0..31 whatever the row capacity is), `k_s`/`v_s` are pinned to `StageKeys = 8` by the mma N
-dimension, and 25,600 B > 98,304/4. Shrinking `Br` past that faults with an invalid `__shared__`
-read that `compute-sanitizer` pins to `small_t_i8_volta.cuh:472`. The "+37.96%" ncu attaches to that
-kernel is an occupancy heuristic, not a budget — the same class of estimate cashed at only
-**+3.5..3.9%** on the previous 2→3 CTA step (`51632bfb`).
-
-**Copying vs explaining.** The 219 tok/s at the top of this file is a *context-lookup* number: a
-round cannot commit more than ~16 tokens, and 219 tok/s at the documented 64 ms round needs 12.91 of
-them. The same mechanism measured here on `lookup10`/`lookup16` ("repeat this sentence ..."):
-
-| prompt | K | decode | acceptance |
-|---|---:|---:|---:|
-| natural prose, 4K | 2 | 92.3 | 2.82 tok/round |
-| `lookup10` | 2 / 5 / **7** | 149.4 / 175.1 / **171.5** | 7.27 / 10.90 / **12.11** |
-| `lookup16` | **7** | **178.4** | **12.70** |
-| `lookup10`, thinking on | 2 | 113.0 | 3.85 |
-
-At K=7 the acceptance is **12.11 / 12.70 — identical to the values recorded in
-`docs/decode-round-2026-10-01.md`** for a different artifact on a different card, so the mechanism
-and the tokens-per-round agree exactly; what differs is round cost (70.6 ms here against 51.6 ms
-there), i.e. the weight route and the harness (`--max-new 128` full-run average against
-`ninfer_bench`'s ten measured rounds after two warmups). On this artifact alone, copying against
-explaining is **92 -> 178 tok/s (+93%)**, and turning thinking back on drops it to 113.
-
-### Three more routes, all measured, one kept
-
-Everything below was tried against the same fixtures and the same md5 gate. Only A ships.
-
-**A — checkpoint pool (shipped as `--max-shared-prefixes 16`).** Twelve *distinct* ~6k-token
-contexts round-robin, two passes, one variable at a time:
-
-| arm | round-2 hits | round-2 TTFT |
-|---|---:|---|
-| shipped default (`--max-shared-prefixes` **4**) | **4 / 12** | 0.14 s hit, **4.9 s miss** |
-| `--max-shared-prefixes 16` | **8 / 12** (reproduced twice) | **0.11-0.14 s** on the hits |
-| `+ --host-state-slots 16` | 1 / 12 (reproduced twice) — **harmful** | |
-| `+ --host-kv-mib 16384` | 8 / 12 — no change | |
-
-The first gate is `shared`, which defaults to `max(max-concurrency, 4)` = **4**: exactly four
-prefixes survived the first pass, matching the log's `| shared 4`. Raising it doubles the hit rate
-and takes a retained prompt from **4.9 s to 0.11 s (~43x)**. The second gate (8 -> 12) was not
-located: `--device-state-slots 12` cannot start on this card (reservation needs 8.29 GB + 1.07 GB
-headroom against 7.81 GB free after weights), and both host knobs are ruled out above. The serve
-runs `--max-shared-prefixes 16`.
-
-**B — GGUF weight repack (reverted).** A block-local regroup of six formats (IQ2_XXS, IQ2_XS,
-IQ2_S, Q2_K, IQ3_XXS, IQ3_S) plus a decoder-only change to IQ1_M, applied on the CPU during load —
-legal because no metadata crosses a block boundary, so the transform round-trips byte-exactly over
-all 401 real tensors. `cuobjdump -sass` proves the instruction count really fell:
-
-| format | emitted loads / `decode()` | | control IQ1_S (not repacked) |
-|---|---:|---|---|
-| Q2_K | 11 -> **4** (−64%) | | 4 -> 4, byte-identical |
-| IQ1_M | 8 -> **3** (−63%) | | |
-| IQ3_S | 9 -> 5 (−44%) | | |
-| IQ2_S / IQ3_XXS | 7 -> 4 (−43%) | | |
-| IQ2_XS / IQ2_XXS | 6 -> 4 / 5 -> 3 | | |
-
-**33-64% fewer load instructions over 68.7% of the weight payload, md5 byte-identical, weights
-8.1506 -> 8.2723 GiB (+1.45%, 14.8 MB of a measured 141.5 MB budget left) — and decode moved
-+0.1% / 0.0%.** So this kernel is not instruction-bound: `ncu` puts 34-47% of its cycles in
-`long_scoreboard` waiting on the *last* the dot product depends on, and independent loads only
-shrink issue slots. A single wide load needs 8-byte-aligned records, which cost 387.6 MB = **2.7x
-the budget**, so no subset of the ten is affordable either. Reverted; md5 re-verified.
-
-**C — the fourth CTA (reverted, −5% to −66%).** The 1,024 B that stood between 25,600 and
-98,304/4 was two buffers the file had called untouchable: the row pad `SmemPad 8 -> 0`
-(32+8+8 rows x 16 B = **768 B**) and `physical_pages_s`, a pure prefetch cache of `block_table`
-(**256 B**). **768 + 256 = 1,024 exactly**, with the three arrays then summing to
-16,384+4,096+4,096 = 24,576. An in-row XOR at 8-element groups replaces the pad's bank-conflict
-property. The build confirmed the structure: `SHARED 25,600 -> 24,576` and `REG 168 -> 128`, i.e.
-both limits now admit four CTAs.
-
-It still lost, badly:
-
-| depth | baseline (K=3) | fourth CTA | Δ |
-|---|---:|---:|---:|
-| 4K | 85.3 | 80.9 | **−5.2%** |
-| 16K | 93.5 | 75.6 | **−19.1%** |
-| 128K | 59.9 | 20.2 | **−66.3%** |
-
-The register cut (`__launch_bounds__(…, 4)`) moved the compiler from **STACK 16 to STACK 400 bytes**
-— it bought the 40 registers back with rematerialisation, exactly the failure
-`docs/ternary-port.md` records at 15-19% on the vec kernel and at 3.9% on the reverted int8-V
-attempt. Dropping `physical_pages_s` also left a dependent `block_table` read in the hot loop,
-which is what the 128K column punishes. md5 initially **failed** — `swizzled(k_dst) + 8` is not
-`swizzled(k_dst + 8)`, because XOR does not preserve successor, so `hi` landed in the wrong group
-and every row's K/V was corrupted (the model emitted token 0 repeatedly); fixing both halves
-restored byte-identity, after which the timing was still decisively negative. Reverted.
-
-> **Build hygiene found on the way:** `ninja -t deps <object>` reported `#deps 0` for
-> `small_t.cu.o`, i.e. no header was registered, so editing its `.cuh` produced
-> `ninja: no work to do`. Forcing one rebuild re-registered them. If a header edit seems ignored,
-> check with `ninja -t deps` and `touch` the `.cu`.
-
-### Deploy
-
-Rebuild after any source change — all three apps, or the server keeps linking a stale file:
+The binaries link `libavformat.so.60`, which some hosts do not provide. Either install FFmpeg or build
+and run through the container images (see [Docker](#docker)):
 
 ```bash
 docker run --rm -v /root/ninfer-v100:/src -w /src ninfer-v100-buildenv:cu128 \
-  bash -lc "cd /src && ninja -C build-sm70 -j\$(nproc) \
-            apps/ninfer apps/ninfer-serve apps/ninfer-perplexity"
+  ninja -C build-sm70 apps/ninfer apps/ninfer-serve apps/ninfer-perplexity
 ```
 
-Then start it. Every flag below is a decision the sections above paid for:
+Rebuild **all** the apps after a source change — otherwise the server keeps linking a stale binary.
+
+---
+
+## Run on a 16GB V100 *(this fork)*
+
+A complete 16GB-V100 profile with KVMem enabled. Every flag is a decision the measurements paid for;
+the justification cites the artifact the number came from.
 
 ```bash
 docker run -d --name ninfer-serve --restart unless-stopped \
   --gpus all --shm-size 64m -p 8080:8080 \
-  -e NINFER_TERNARY_ROTATE_SPLIT=16 \
-  -e NINFER_MTP_LOOKUP_MATCH=6 \
+  -e NINFER_KV_WINDOW=16384 \
   -v /root/ninfer-v100:/src \
   -v /root/ms:/models:ro \
   ninfer-v100-buildenv:cu128 \
   /src/build-sm70/apps/ninfer-serve /models/swift15_iq2xs_mtp.ninfer \
     --host 0.0.0.0 --port 8080 --cors \
-    --max-context 131072 --kv-capacity auto \
-    --kv-dtype int8 --prefill-chunk 3072 \
-    --spec mtp --draft-tokens 3 --max-shared-prefixes 16
+    --max-context 262144 --kv-capacity 24576 \
+    --kv-dtype int8 --host-kv-mib 12288 \
+    --prefill-chunk 512 \
+    --max-concurrency 1 \
+    --spec mtp --draft-tokens 3
 ```
 
-| flag | why (all measured on this artifact) |
+| flag | what it does | why this value |
+|---|---|---|
+| `NINFER_KV_WINDOW` | **enables KVMem** and sets the resident window in tokens | Unset, the engine behaves exactly as upstream (the dense path is bit-identical). Set, the pool may be smaller than the context. `16384` is the validated window |
+| `--max-context` | logical context limit per sequence | `262144` is the native cap of the Qwen3.8-27B variant; larger values are rejected at startup |
+| `--kv-capacity` | device KV pool, in tokens | With KVMem the pool only has to hold the resident window: the minimum is `window + prefill-chunk + 8 pages`. `24576` (384 pages) leaves headroom |
+| `--host-kv-mib` | Host-tier KV arena (the demotion target) | 262,144 tokens needs ~8.9 GiB of Host KV; `12288` fits it. The upstream default is 8192 |
+| `--kv-dtype int8` | KV storage format | `fp8` is −65..90% on both phases (Volta has no fp8 path). **KVMem requires `int8`** — it is the only storage whose Volta attention kernels honour the retrieval mask; other values are refused at startup |
+| `--prefill-chunk` | tokens per prefill step | Larger is faster (+26% going 768 → 3072 on swift15) but costs workspace VRAM; `512` keeps a 262K context startable |
+| `--max-concurrency 1` | simultaneous requests | **KVMem supports one sequence.** A second concurrent request is refused |
+| `--draft-tokens 3` | MTP speculative window | +11.6% @16K and +12.2% @128K against the shipped 2, and the peak on both prose and agent-shaped traffic |
+| *(absent)* `--lm-head-draft` | LM-head draft head | Adding it collapses acceptance to 1.00 — decode 92.4 → 33.5 (−64%) |
+| *(absent)* `--no-thinking` | forces non-thinking mode | Worth +17.4% decode, but rejected on output quality |
+
+Startup prints the resolved layout — check it before trusting a profile:
+
+```
+capacity | KV 24,576 tokens, int8, explicit | pages 384/4,096 | runtime 2.67 GiB | free 213.5 MiB
+```
+
+`384/4,096` is the whole point: **384 device pages serving a 4,096-page logical context (10.7×)**.
+
+---
+
+## KVMem: device pool smaller than the context *(this fork)*
+
+A 16GB V100 cannot hold the KV for a 262,144-token context. KVMem keeps only a resident window on the
+device and demotes the rest to the pinned Host arena, then attends over the resident set. When the pool
+fills, retention chooses *which* pages leave by relevance to the current query rather than by age, so
+the pages a request actually needs stay resident. Device pages still held by an earlier cached turn are
+reclaimed when a new request needs room.
+
+Enable it with one environment variable, and size the pool to the **window**, not to the context:
+
+```bash
+-e NINFER_KV_WINDOW=16384
+--max-context 262144 --kv-capacity 24576 --host-kv-mib 12288 --kv-dtype int8 --max-concurrency 1
+```
+
+### Measured cost
+
+Same prompt, same chunk, 128K context, `swift15_iq2xs_mtp.ninfer`:
+
+| | dense | KVMem |
+|---|---:|---:|
+| device pool | 2,048 pages = 131,072 tokens | **384 pages = 24,576 tokens** |
+| runtime VRAM | 5.79 GiB | **2.23 GiB** |
+| free VRAM | 1.29 GiB | **4.85 GiB** |
+| prefill | 525.4 tok/s | 520.3 tok/s (−1.0%) |
+| decode | 59.6 tok/s | 59.5 tok/s (−0.2%) |
+| answer (needle at the start of a 124K prompt) | correct | correct |
+
+**About 1% slower for 3.56 GiB back**, and the context ceiling moves from ~164K to 262K.
+
+### Limits
+
+- **One sequence.** `--max-concurrency 1`. The ring cannot reclaim another lane's device pages.
+- **INT8 KV only.** Other storages are refused at startup.
+- **Retention, not recall.** A relevant page is *kept resident*, so a single-turn long prompt whose
+  question comes last works. In a *multi-turn* conversation, a page that only a later turn makes
+  relevant cannot be brought back.
+- **Prefill slows with depth**, as one would expect: ~680 tok/s at 32K, ~460 tok/s at 128K.
+- **No quality measurement yet.** Every number above is throughput. No perplexity has been run, so how
+  small the resident window can go before output quality degrades is an open question.
+
+---
+
+## Models on a 16GB V100 *(this fork)*
+
+Three Qwen3.8-27B requantizations, all verified to run on this card. They share one geometry —
+64 layers = 16 full-attention (paged KV) + 48 GDN (recurrent state), `kv_heads=4`, `head_dim=256`,
+64-token pages — so 33,792 bytes of paged KV per token at INT8.
+
+| model | weights | file | artifact |
+|---|---:|---|---|
+| `swift15_iq2xs_mtp.ninfer` | 8.15 GiB | 9.42 GB | `gguf-mixed` / IQ2_XS |
+| `bonsai2_27b_swift_pq2.ninfer` | 7.12 GiB | 8.31 GB | `groupwise-int` / PQ2_0_G128 |
+| `Qwen3.8-27B-Coder390-…-Q2LynnStyle-MTP.ninfer` | 12.3 GiB | 13.27 GB | `gguf-mixed` / Q2-LynnStyle |
+
+### Context ceiling
+
+| model | dense (KV all resident) | with KVMem |
+|---|---|---|
+| swift15 | 163,840 works / 180,224 fails | **262,144** |
+| bonsai2 | 180,224 works / 196,608 fails | **262,144** |
+| coder390 | 57,344 works / 61,440 fails | **262,144** |
+
+262,144 is the variant's native context (`qwen3_6_27b/impl/config.h`, `kNativeContext`). Dense mode is
+capped by VRAM and varies with weight size; **coder390 gains 4.6× from KVMem.**
+
+### Throughput *(this fork)*
+
+KVMem profile (`NINFER_KV_WINDOW=16384`, pool 24,576, `--prefill-chunk 512`, 256 output tokens, greedy):
+
+| model | depth | prompt | prefill | TTFT | decode | MTP acceptance |
+|---|---|---:|---:|---:|---:|---:|
+| swift15 | short | 1,049 | 681.9 tok/s | 1.5 s | 110.9 tok/s | — |
+| | medium | 32,049 | 679.8 tok/s | 47.1 s | 89.2 tok/s | 89.4% |
+| | long | 128,049 | 461.3 tok/s | 277.6 s | 55.0 tok/s | — |
+| bonsai2 | short | 1,049 | 727.6 tok/s | 1.4 s | 92.0 tok/s | — |
+| | medium | 32,049 | 690.7 tok/s | 46.4 s | 64.3 tok/s | 74.1% |
+| | long | 128,049 | 467.0 tok/s | 274.2 s | 55.9 tok/s | — |
+| coder390 | short | 1,049 | 688.1 tok/s | 1.5 s | 108.2 tok/s | — |
+| | medium | 32,049 | 684.8 tok/s | 46.8 s | 93.1 tok/s | 100.0% |
+| | long | 128,049 | 463.8 tok/s | 276.1 s | 62.9 tok/s | — |
+
+Prefill is flat to 32K and falls to ~460 tok/s at 128K; decode falls with depth. All three curves have
+the same shape (same architecture and KV geometry). Speculation payoff is model-dependent — coder390
+accepts 100%, swift15 89.4%, bonsai2 74.1%, and decode tracks it.
+
+### Where the artifacts come from
+
+| model | source |
 |---|---|
-| `--draft-tokens 3` | **+11.6% @16K, +12.2% @128K** against the shipped 2, and the peak on *both* workloads — prose 93.5 and agent-shaped 81.6 (K2 80.6 / K4 79.2 / K5 67.9). Window 5 also collapses at 128K: 48.6 on an 87.0 ms round |
-| `--max-shared-prefixes 16` | the default resolves to `max(max-concurrency, 4)` = **4**; on a 12-context round-robin that caps pass-2 hits at **4/12**. Raising it gives **8/12** and takes a retained prompt from **4.9 s to 0.11 s (~43×)** |
-| `--prefill-chunk 3072` | memory-capped at `--max-context 131072`: chunk 4096 needs **+108 MB** that the card does not have, and 1024 costs **−14%** on cold prefill (4.07 s vs 3.50 s for the same 3.7k prompt) |
-| `--kv-dtype int8` | `fp8` is **−65..90%** on both phases — Volta has no fp8 path |
-| `--max-context 131072` | speed-neutral by itself (mc 8192 ≡ mc 131072 at 4K); sized to the workload, and it is what pins the chunk to 3072 |
-| *(absent)* `--lm-head-draft` | collapses acceptance to **1.00** — decode 92.4 → 33.5 (**−64%**) |
-| *(absent)* `--no-thinking` | worth **+17.4%** decode, rejected on output quality |
-| `NINFER_TERNARY_ROTATE_SPLIT=16` | carried over from the ternary artifact's sweep (51.1 vs 48.7 unset); **not re-measured on gguf-mixed** |
-| `NINFER_MTP_LOOKUP_MATCH=6` | carried over for copy-heavy traffic (documented +20%); **inert on this traffic — 0 of 14 real requests hit lookup** |
-| `--host-state-slots 8` / `--host-kv-mib 8192` (defaults) | raising `--host-state-slots` to 16 **halved** pass-2 hits (8/12 → 1/12, reproduced twice) |
+| swift15 | [fyb423/Swift-1.5-Qwen3.8-27B-GSQ-RCO-NInfer](https://modelscope.cn/models/fyb423/Swift-1.5-Qwen3.8-27B-GSQ-RCO-NInfer) |
+| bonsai2 | [fyb423/Swift-Bonsai-2-27B-NInfer](https://modelscope.cn/models/fyb423/Swift-Bonsai-2-27B-NInfer) |
+| coder390 | [Merkyor/Qwen3.8-27B-Coder390-…-MTP-DFlash2](https://modelscope.cn/models/Merkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-MTP-DFlash2) |
 
-Prefix reuse itself is already fast where it lands: a 100% hit returns first token in
-**7 / 23 / 43 / 52 ms** for 4K / 16K / 32K / 60K retained prefixes — so the tuning above is the
-whole of what the deployment side currently offers.
+Sibling quantizations are published alongside each of them (for coder390: Q2/Q3/Q4/Q6_K/Q8_0
+LynnStyle and W4A4 NVFP4 builds).
 
-## Models
+---
+
+## Quick start
+
+```bash
+# 1. Build (see Build above), then package a slim runtime image
+docker build -f Dockerfile.run -t ninfer-v100:cu128-kvmem build-sm70/apps
+
+# 2. Start the server (see Run on a 16GB V100 above), then check it
+curl -s http://127.0.0.1:8080/v1/models
+
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"swift15","messages":[{"role":"user","content":"Say OK."}],"max_tokens":8}'
+```
+
+Useful log lines while a request runs:
+
+```
+[ring] spill: mapped=464 keep_from=208 candidates=129 taking=6       # demotion to the Host tier
+[ring] grow: own pages exhausted (…), reclaimed N from other owners  # room reclaimed from a cached turn
+req#1 done | prompt 128,049 | output 256 | TTFT 277.6s | prefill 461.3 tok/s | decode 55.0 tok/s | mtp accepted …
+```
+
+---
+
+## Models *(upstream)*
+
+Upstream registered artifacts, for 32GB-class cards:
 
 | Model | Weights | Artifact | Download and model card |
 |---|---|---|---|
@@ -274,190 +244,31 @@ whole of what the deployment side currently offers.
 
 Artifacts contain the exact model weights, tokenizer, chat template, and required media frontend resources.
 
-## Performance
+## Performance *(upstream)*
 
 Qwen3.8-27B NVFP4 reaches **218.98 decode tok/s** at K=1, with 99.2% MTP draft acceptance.
-That result is on a V100-PCIe-32GB, not SXM. The equivalent SXM2 card is roughly 7% faster; decode is predominantly HBM-bound, so PCIe bandwidth and host performance have little effect.
+That result is on a V100-PCIe-32GB, not SXM. The equivalent SXM2 card is roughly 7% faster; decode is
+predominantly HBM-bound, so PCIe bandwidth and host performance have little effect.
 
-### Tesla V100: software NVFP4 and groupwise inference
+The upstream NVFP4 and groupwise-int tables do **not** transfer to this fork's 16GB artifacts, for the
+reasons in [Upstream vs this fork](#upstream-vs-this-fork). Use the 16GB tables instead.
 
-The Qwen3.8-27B NVFP4 short-context target round, retested after the width-6+ verify fix below,
-peaks at K=1 draft tokens: **219.0 decode tok/s** at 99.2% draft acceptance -- narrow windows win
-outright on this corpus; see the full K sweep below.
-
-The single-request sweep uses the public Engine benchmark on a Tesla V100-PCIe-32GB with CUDA
-12.8 and INT8 group-64 KV. Prefill is an isolated `pp2048` run; decode is `pp2048+tg256` with CUDA
-Graphs and the optimized proposal head. Each result uses one discarded warmup and three measured
-repetitions. On the DFlash window sweep in the V100 notes the preferred V100-SXM2-32GB ran about
-7% faster per round; this decode workload is HBM-bound, so the host and PCIe bus barely matter.
-
-| Model profile | K | Prefill tok/s | Decode tok/s | Draft acceptance |
-|---|---:|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` MTP | 4 | 1,085.0 | 54.54 | 66.5% |
-| Qwen3.6-27B `nvfp4` MTP | 5 | 223.8 | 55.22 | 54.4% |
-| Qwen3.8-27B `groupwise-int` MTP | 5 | 1,083.9 | 130.96 | 97.1% |
-| Qwen3.8-27B `nvfp4` MTP | 5 | 1,100.3 | 199.58 | 97.1% |
-| Qwen3.8-27B `groupwise-int` DFlash2 | 7 | 1,044.2 | 77.84 | 100% |
-| Qwen3.8-27B `nvfp4` DFlash2 | 7 | 1,059.0 | 126.32 | 100% |
-| Qwen3.6-35B-A3B `groupwise-int` DFlash | 4 | 686.2 | 139.58 | 90.9% |
-
-
-Full Qwen3.8-27B `nvfp4` MTP draft-window sweep on this same corpus-continuation shape, now that
-the width-6+ fix removes the sm_70 cap at four:
-
-| K | Prefill tok/s | Decode tok/s | Draft acceptance |
-|---:|---:|---:|---:|
-| 1 | 1,102.5 | **218.98** | 99.2% |
-| 2 | 1,097.4 | 213.99 | 98.3% |
-| 3 | 1,094.9 | 209.24 | 97.5% |
-| 4 | 1,096.6 | 204.02 | 97.9% |
-| 5 | 1,100.3 | 199.58 | 97.1% |
-| 6 | 1,089.6 | 178.47 | 92.5% |
-| 7 | 1,087.2 | 180.74 | 93.3% |
-
-This corpus is a deterministic continuation with unusually high, near-ceiling acceptance at every
-K, so narrow windows win outright: round-verify cost dominates once there's little more accepted
-length to buy. Treat these as a synthetic-corpus ceiling, not a general-generation rate -- on real,
-less predictable text the practical production sweet spot is K=3 (see the long-context sweep
-elsewhere in this repo's history).
-
-Decode throughput depends strongly on draft acceptance -- see the MTP sweep above for how much.
-The sm_70 width-6+ target-verify regression is fixed (see below), so `--spec mtp` now accepts the
-same [1,7] window upstream does, no Volta-specific cap. `--spec dflash2` peaks at K=7 on this same
-corpus-continuation shape (a 3-10 sweep falls off on both sides); MTP still leads DFlash2 here at
-every K tried.
-
-The Qwen3.8-27B artifacts also bundle DFlash2, the upstream masked-block speculative decoder
-(`--spec dflash2`). MTP remains the recommended Volta backend for general decoding. On a varied,
-non-repetitive corpus, DFlash2 K=7 narrowly beat the best MTP window at 2K and 32K context, while
-MTP led at 8K, 16K, and 150K. DFlash2 K=7 is its strongest static default; acceptance-driven
-window adaptation can favor K=3 on difficult continuations. See the full comparison in the
-[V100 port notes](docs/v100.md#varied-context-dflash2-sweep).
-
-MTP automatically extends verification up to fifteen draft tokens when the generated suffix
-exactly matches an earlier 16-token span and the learned proposal agrees with the lookup
-continuation. On a 172-token verbatim-copy prompt, Qwen3.8-27B NVFP4 produced the exact
-continuation at **201.0 tok/s**, averaging 12.91 output tokens per round. This is a
-context-reproduction fast path; ordinary generation continues to use the normal MTP window and
-the general decode results above.
-
-Context-lookup MTP was inspired by
-[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090).
-
-On Volta, NVFP4 is decoded and executed in software using tuned FP16 tensor-core and SIMT kernels.
-Dense MLP gate/up payloads are prepacked in place during model load for the QPN decode layout; the
-artifact on disk is unchanged and inference does not perform runtime weight repacking. The Volta
-QPN prepacking work was inspired by
-[dnv2003/v100-skinny](https://github.com/dnv2003/v100-skinny).
-
-The 35B-A3B production DFlash round at a 2,048-token context uses K=3: **125.9 tok/s** and 3.8
-mean output tokens per round over ten measured rounds after two warmups.
-
-## Quick start
-
-NInfer requires 64-bit Linux, a Tesla V100 with CUDA Toolkit 12.8, CMake 3.28 or newer, a C++20
-host compiler, Ninja, `pkg-config`, FFmpeg
-development libraries (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and
-`libswscale >= 7`), and `libcurl >= 7.85`. This port builds for `sm_70`.
-
-Select CUDA 12.8 and Volta explicitly:
-
-```bash
-cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
-  -DCMAKE_CUDA_ARCHITECTURES=70
-cmake --build build-v100 -j
-```
-
-The same five `.ninfer` artifacts use the public Engine/CLI/serving routes. See the
-[V100 port notes](docs/v100.md) for qualification and the preferred-GPU launcher.
-
-On Volta, loading an NVFP4 artifact repacks each dense MLP gate/up and down payload in place on the
-GPU into the QPN fragment order used by the decode kernels. Row-scaled FP8 payloads are likewise
-permuted into their native Volta QPN stream. The `.ninfer` file and host-side artifact bytes
-are unchanged, the device allocation remains the same size, and temporary repack storage is
-released before inference. These device-resident weights are therefore deliberately mutated at
-load; the V100 path does not retain checkpoint-native immutable layout for those payloads.
-
-Tests, benchmarks, and maintainer tools are excluded from the default build. There is no install
-target or packaged binary distribution; run NInfer from its source build tree.
-
-Download the artifact used by this example with the Hugging Face CLI:
-
-```bash
-hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
-  qwen3_8_27b_nvfp4.ninfer \
-  --local-dir models
-```
-
-Start a long-running text/vision agent server with one active-request lane and Device/Host
-checkpoint retention:
-
-```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
-  --max-context 240000 \
-  --prefill-chunk 2048 \
-  --kv-capacity auto \
-  --max-concurrency 1 \
-  --kv-dtype int8 \
-  --device-state-slots 1 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 4 \
-  --lm-head-draft \
-  --preserve-thinking \
-  --vision
-```
-
-Each request has a 240,000-token logical ceiling. The Device KV pool is sized from the memory left
-after weights, workspace, state, Vision, and graph allocations. The cache tiers provide one Device
-checkpoint slot, eight pinned Host State slots, and 8 GiB of pinned Host KV.
-
-Send an OpenAI-style request:
-
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen3.8-27b",
-    "messages": [{"role": "user", "content": "Reply with one short sentence."}],
-    "max_tokens": 64
-  }'
-```
-
-Run a one-shot CLI request with a 32,768-token allocation:
-
-```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
-  --prompt "Explain prefill and decode, then give a concise conclusion." \
-  --max-context 32768 \
-  --max-new 8192 \
-  --kv-dtype fp8 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
-```
-
-Answer content is written to stdout. Structured startup/runtime-error records and the CLI-owned
-reasoning, timing, throughput, memory, and speculative-decoding report are written to stderr;
-reasoning and the result report remain unprefixed product output. On a terminal, weight
-materialization additionally uses one transient progress line. Redirected stderr receives only
-persistent structured phase records, including rate-limited progress for long loads. Option and
-local input errors remain direct command diagnostics. Use `--messages FILE` and `--vision` for
-structured image/video input; see the [CLI guide](docs/cli.md) and
-[committed examples](examples/cli/).
-
-## Resource-aware long-context reuse
+## Resource-aware long-context reuse *(upstream; KVMem extends it)*
 
 A reusable prefix checkpoint contains KV and the complete continuation state for its exact prompt
 frontier. A Device-resident checkpoint resumes directly. Under pressure, the planner weighs Device
 retention, pinned Host State/KV, and eviction by immediate restore work and later reuse cost. Active
 requests retain their completion reservations.
 
+KVMem builds on this: it relaxes the "device pool ≥ logical context" rule and adds relevance-aware
+retention plus cross-owner reclaim. See
+[KVMem](#kvmem-device-pool-smaller-than-the-context-this-fork).
+
 See [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
 for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot
 reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
 
-## Evaluation
+## Evaluation *(upstream)*
 
 Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
 enabled, MTP3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
@@ -476,7 +287,10 @@ limit. Text evaluation used 262,144 tokens except Qwen3.8-27B NVFP4, which used 
 its measured memory envelope. Each score is one sample per problem; model cards contain the
 correct/total counts and evaluation notes.
 
-## Startup notes
+These are upstream results on upstream artifacts. **No capability evaluation has been run on the
+16GB-class artifacts in this fork**, and KVMem has no quality measurement at all.
+
+## Startup notes *(upstream)*
 
 GPU residency is fixed at process startup. `--spec` selects speculative decoding residency, and
 `--vision` selects Vision residency. DFlash is available for text-only Qwen3.6-35B-A3B execution,
@@ -490,7 +304,7 @@ Build the runtime image on a host with the NVIDIA Container Toolkit:
 docker build --tag ninfer:local .
 ```
 
-Mount the downloaded model and run the same example server profile:
+Mount the downloaded model and run the same example server profile *(upstream)*:
 
 ```bash
 docker run --rm \
@@ -513,9 +327,12 @@ docker run --rm \
   --vision
 ```
 
+This fork also ships `Dockerfile.run` (a slim runtime image built from `build-sm70/apps`),
+`Dockerfile.sm70`, and `Dockerfile.env`.
+
 ## Capabilities and limits
 
-All registered model IDs support:
+All registered model IDs support *(upstream)*:
 
 - text generation with thinking and non-thinking prompt modes;
 - image, multi-image, video, and mixed multimodal messages;
@@ -529,6 +346,14 @@ All registered model IDs support:
 - model-aware sampling defaults and explicit sampler overrides;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,
   tools, local response state, token counting, and usage accounting.
+
+Added by this fork:
+
+- **PQ2_0_G128 ternary weights** and **GGUF mixed-format linear layers**:
+  IQ1_S, IQ1_M, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, Q2_K, Q3_K, Q4_0, Q4_K,
+  Q5_K, Q6_K, Q8_0 (MMQ and/or vec kernels per format);
+- **KVMem**, which with `NINFER_KV_WINDOW` set changes two upstream rules: the device KV pool may be
+  smaller than `--max-context`, and `--max-concurrency` must be 1.
 
 The 35B-A3B target additionally supports text-only DFlash with draft windows from one to fifteen.
 
@@ -556,6 +381,7 @@ capacities remain fixed for the process lifetime.
 - [V100 qualification and performance](docs/v100.md)
 - [Perplexity evaluation](docs/perplexity.md)
 - [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
+- [V100-16GB port tuning log](docs/v100-16g-tuning.md) *(this fork)*
 - [Serve TTFT benchmark](tools/bench/ttft/)
 - [CLI examples](examples/cli/)
 - [Contributing](CONTRIBUTING.md)
@@ -576,3 +402,6 @@ The Qwen3.8-27B NVFP4 artifact also uses the fixed mixed FP8/NVFP4 weights from
 [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). These source
 repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
 under `third_party/`.
+
+The 16GB-class artifacts referenced by this fork are distributed by their own authors — see
+[Where the artifacts come from](#where-the-artifacts-come-from).
