@@ -11081,9 +11081,34 @@ void ProgramImplCore::ring_grow(KVAddressSpaceStore& addresses, LogicalKVPageSto
             // store's source pinning needs it clear. These pages are outside the resident window,
             // so giving up the writer is what makes them movable at all.
             pages.set_writer(page, false);
+            // A page can carry BOTH replicas. A turn-closure checkpoint's pages are host-resident, and
+            // adopting that checkpoint restores some of them to the Device -- so the victim is often
+            // device-resident AND host-resident at once. `extents.prepare` REFUSES such a page
+            // (`host_resident(page)` is one of its rejection conditions), so treating that refusal as
+            // "the arena is full" and breaking out was wrong twice over: the spill returned zero, the
+            // growth saw no room and no victim, and the request died with bad_alloc even though the
+            // Host copy it needed already existed. Dropping the Device replica IS the whole spill.
+            if (pages.host_replica_current(page)) {
+                if (!pages.drop_device_replica(page)) { break; }
+                ++spilled;
+                continue;
+            }
             const std::array<LogicalKVPageHandle, 1> one{page};
             std::optional<HostKVExtentReservation> reserved = extents.prepare(pages, one);
-            if (!reserved) { break; }  // Host arena full: nothing more can be moved
+            if (!reserved) {
+                // Host arena full: nothing more can be moved. Say WHICH limit ran out -- bytes or
+                // page descriptors -- because the two need different fixes, and the callers above
+                // only report the spill as zero.
+                if (host_kv_arena != nullptr) {
+                    std::fprintf(stderr,
+                                 "[ring] spill: prepare FAILED | arena %.2f/%.2f GiB used\n",
+                                 static_cast<double>(host_kv_arena->occupied_bytes()) / 1073741824.0,
+                                 static_cast<double>(host_kv_arena->capacity_bytes()) / 1073741824.0);
+                } else {
+                    std::fprintf(stderr, "[ring] spill: prepare FAILED (no arena)\n");
+                }
+                break;
+            }
             const std::vector<DeviceKVPageHandle> sources = extents.device_sources(*reserved);
             // On the COMPUTE stream: the D2H must be ordered after the kernels that wrote this page,
             // and the Device slot is recyclable the instant the replica is dropped. No sync is
