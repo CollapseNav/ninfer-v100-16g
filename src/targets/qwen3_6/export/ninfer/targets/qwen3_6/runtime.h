@@ -925,6 +925,11 @@ public:
     [[nodiscard]] DiscardResult<Variant> abort_pending(PendingBatch<Variant>&& pending) noexcept;
     [[nodiscard]] FinishResult<Variant> finish(SequenceHandle<Variant> sequence) noexcept;
     [[nodiscard]] AbortResult<Variant> abort(SequenceHandle<Variant> sequence) noexcept;
+    // Whether a sequence handle still names a live binding. The engine needs this on a failure path:
+    // the execution entry points (`advance_prefill`, `decode`, ...) release a failing lane THEMSELVES
+    // before rethrowing, so by the time the engine sees the exception the handle is stale by design
+    // and there is nothing left to abort.
+    [[nodiscard]] bool valid_sequence(SequenceHandle<Variant> sequence) const noexcept;
     [[nodiscard]] ReleaseResult<Variant>
     release_continuation(ContinuationHandle<Variant>&& continuation) noexcept;
     [[nodiscard]] ReleaseResult<Variant>

@@ -531,6 +531,11 @@ AbortResult<Variant> Program<Variant>::abort(SequenceHandle<Variant> sequence) n
 }
 
 template <>
+bool Program<Variant>::valid_sequence(SequenceHandle<Variant> sequence) const noexcept {
+    return impl_->valid_sequence(sequence);
+}
+
+template <>
 ReleaseResult<Variant>
 Program<Variant>::release_continuation(ContinuationHandle<Variant>&& continuation) noexcept {
     return impl_->release_continuation(std::move(continuation));

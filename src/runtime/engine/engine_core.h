@@ -1922,6 +1922,86 @@ private:
         publish_runtime_stats();
     }
 
+    // KVMem ring: a capacity failure is a PER-REQUEST condition, not an engine fault, so fail only
+    // the ACTIVE requests and keep serving. Before this, one spilled-pool hiccup ran through
+    // `fail_all_locked` and took the whole server down until a restart -- measured twice on a real
+    // deployment (HTTP 500 on the request that hit it, then HTTP 503 on everything afterwards, while
+    // `/v1/models` still reported healthy).
+    //
+    // The per-lane release used here is not new: `cancel_active_requests` performs exactly this
+    // sequence for cancellation, and the program-side primitive it reaches (`clear_lane_best_effort`)
+    // is the same one `fail_all_cleanup` loops over. What is new is only the entry point.
+    //
+    // Returns false -- meaning the caller MUST do the wholesale `fail_all_locked` -- whenever the
+    // targeted recovery cannot be trusted: the error is not a capacity failure, a context transaction
+    // owns global topology, a capture is pending, a lane binding is malformed, or a release throws.
+    // The failure mode therefore stays "clean death" and never becomes silent corruption.
+    [[nodiscard]] bool recover_capacity_failure(std::exception_ptr error) noexcept {
+        bool capacity_failure = false;
+        try {
+            std::rethrow_exception(error);
+        } catch (const std::bad_alloc&) {
+            capacity_failure = true;
+        } catch (...) {
+        }
+        if (!capacity_failure) {
+            return false;
+        }
+        // A context transaction owns global KV topology; only the wholesale teardown unwinds it.
+        if (instance_.program->has_context_transaction()) {
+            return false;
+        }
+        try {
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                const std::shared_ptr<Request>& request = slots_[lane];
+                if (request == nullptr) { continue; }
+                if (request->capture_pending) { return false; }
+                if (!request->sequence || !request->lane || request->lane->value != lane) {
+                    return false;
+                }
+                // The execution entry points release a failing lane themselves before rethrowing:
+                // `advance_prefill` (and `decode`, `commit`, `abort_pending`) wrap their body in a
+                // catch that calls `clear_execution_failure_lanes(lane)`, which clears the lane's
+                // sequence AND bumps its epoch. So when a mid-execution failure arrives here the
+                // handle is stale by design and there is nothing left to release -- asking the
+                // resource manager to abort it is precisely what failed with "Program did not
+                // consume aborted sequence" and forced the wholesale teardown. Ask first; only
+                // release a binding that is still live.
+                if (instance_.program->valid_sequence(*request->sequence)) {
+                    (void)resources_.abort(*instance_.program, *request->lane,
+                                           *request->sequence);
+                } else {
+                    // The program already released this lane, so only the ENGINE's bookkeeping is
+                    // left. `release_cancelled_lane` is exactly that half of `abort` -- the
+                    // reference release, the catalog entry and the lane state -- without the
+                    // program-side consume. Skipping it instead left the lane catalogued and the
+                    // next request failed with "isolated-feasible request is blocked in an idle
+                    // Engine" (HTTP 500) against a server that was in fact still alive.
+                    resources_.release_cancelled_lane(*request->lane);
+                }
+                if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
+                complete_error(request, error);
+                remove_completed_slot(lane);
+            }
+        } catch (const std::exception& release_error) {
+            // The per-lane release refused. Report why and let the caller take the wholesale path:
+            // a capacity failure is meant to cost one request, so a silent fallback here would hide
+            // the exact reason the recovery could not be trusted.
+            std::fprintf(stderr, "[recover] per-request release refused: %s\n",
+                         release_error.what());
+            return false;
+        } catch (...) {
+            std::fprintf(stderr, "[recover] per-request release refused (non-std exception)\n");
+            return false;
+        }
+        // Stats are diagnostics: a failure here must not undo an otherwise good recovery.
+        try {
+            publish_runtime_stats();
+        } catch (...) {
+        }
+        return true;
+    }
+
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
         for (;;) {
@@ -2011,12 +2091,17 @@ private:
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
                 HostPhaseMeasurement cleanup   = begin_host_phase();
-                fail_all_locked(error);
+                // A recoverable capacity failure fails its own request and the loop continues.
+                // Anything else -- or any doubt about the targeted recovery -- takes the old path.
+                if (!recover_capacity_failure(error)) {
+                    fail_all_locked(error);
+                    finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                    try {
+                        publish_runtime_stats();
+                    } catch (...) {}
+                    return;
+                }
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
-                try {
-                    publish_runtime_stats();
-                } catch (...) {}
-                return;
             }
             execution_lock.unlock();
             std::unique_lock wait_lock(queue_mutex_);

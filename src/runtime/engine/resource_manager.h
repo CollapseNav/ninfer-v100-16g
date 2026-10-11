@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/context_cost.h"
+#include "runtime/engine/kv_window.h"
 #include "runtime/engine/materialization_planner.h"
 #include "runtime/engine/shared_capture_planner.h"
 
@@ -395,7 +396,19 @@ public:
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand);
-        if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
+        if (!selected) {
+            // KVMem ring: with the ring on, a request larger than the Device pool is ADMITTED (its
+            // reservation is a logical promise) but cannot be SCHEDULED yet -- the ring's demotion
+            // of resident pages during growth is not implemented, so nothing can relieve the pool.
+            // TemporarilyBlocked would make an idle Engine throw "isolated-feasible request is
+            // blocked in an idle Engine" (HTTP 500) for a condition that is really a capacity limit.
+            // Report it as the capacity failure it is, which is also what the dense configuration
+            // reports for the same request, so the ring is never WORSE than dense.
+            if (runtime::kv_ring_requested()) {
+                return {.readiness = Readiness::PermanentlyInfeasible};
+            }
+            return {.readiness = Readiness::TemporarilyBlocked};
+        }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
             .choice    = std::move(selected),
@@ -990,6 +1003,24 @@ public:
         reset_active_entry(active);
         lanes_[lane.value] = LogicalLaneState::Free;
         return result;
+    }
+
+    // The ENGINE-side half of `abort`, for the case where the program has ALREADY released the lane
+    // itself: an execution entry point (`advance_prefill`, `decode`, `commit`, `abort_pending`) runs
+    // `clear_execution_failure_lanes` in its own catch before rethrowing, which clears the lane's
+    // sequence and bumps its epoch -- so the sequence handle the engine holds is stale by design and
+    // `program.abort` would refuse. The engine's bookkeeping still has to be released, or the lane
+    // stays catalogued and the next request is refused against a server that is in fact still alive.
+    void release_cancelled_lane(LaneId lane) {
+        if (lane.value >= lane_count_ || !active_[lane.value].occupied ||
+            (lanes_[lane.value] != LogicalLaneState::Active &&
+             lanes_[lane.value] != LogicalLaneState::TerminalPending)) {
+            throw std::logic_error("cancelled lane has no logical active owner");
+        }
+        release_active_references(lane);
+        clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
+        reset_active_entry(active_[lane.value]);
+        lanes_[lane.value] = LogicalLaneState::Free;
     }
 
     [[nodiscard]] AbortResult abort(Program& program, LaneId lane, SequenceHandle sequence) {
@@ -3147,17 +3178,6 @@ private:
         active.shared_sources.clear();
     }
 
-    void release_cancelled_lane(LaneId lane) {
-        if (lane.value >= lane_count_ || !active_[lane.value].occupied ||
-            (lanes_[lane.value] != LogicalLaneState::Active &&
-             lanes_[lane.value] != LogicalLaneState::TerminalPending)) {
-            throw std::logic_error("cancelled lane has no logical active owner");
-        }
-        release_active_references(lane);
-        clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
-        reset_active_entry(active_[lane.value]);
-        lanes_[lane.value] = LogicalLaneState::Free;
-    }
 
     [[nodiscard]] static std::uint64_t session_hash(const CacheSessionKey& key) noexcept {
         std::uint64_t hash = 1469598103934665603ULL;
