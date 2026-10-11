@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
+#include "runtime/engine/kv_window.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -337,12 +338,22 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    // KVMem ring (NINFER_KV_WINDOW): with the ring on, --kv-capacity sizes the DEVICE pool while
+    // --max-context stays the LOGICAL limit, so the pool may legitimately be smaller. With the ring
+    // off this is the dense configuration and a too-small pool is still refused, exactly as before.
+    if (!runtime::kv_ring_requested() && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+        throw std::invalid_argument(
+            "--kv-capacity must be at least --max-context "
+            "(set NINFER_KV_WINDOW=<window tokens> to allow the experimental ring)");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
+    }
+    // The ring reclaims Device pages by demoting the pages of ONE sequence; it cannot reclaim
+    // another lane's. Refuse the combination loudly rather than serve it wrongly.
+    if (runtime::kv_ring_requested() && options.max_concurrency != 1) {
+        throw std::invalid_argument("NINFER_KV_WINDOW (KVMem ring) requires --max-concurrency 1");
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");

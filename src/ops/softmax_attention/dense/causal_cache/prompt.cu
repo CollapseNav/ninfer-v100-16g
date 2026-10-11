@@ -101,7 +101,10 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
         causal_attention_prompt_fp8_attention_launch(q, positions, scale, cache, out, stream);
         return;
     }
-    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
+    const PagedKVDirectMetadata metadata{
+        .table           = static_cast<const std::int32_t*>(cache.block_table.data),
+        .selected_blocks = cache.selected_blocks,
+    };
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(q, positions, scale, cache,
                                                                        metadata, out, stream);
@@ -141,8 +144,9 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
             .valid_columns =
                 Masked ? static_cast<const std::int32_t*>(valid_row.data) : nullptr,
-            .table_rows   = static_cast<const std::int32_t*>(table_row.data),
-            .table_stride = cache.block_tables.ne[0],
+            .table_rows      = static_cast<const std::int32_t*>(table_row.data),
+            .table_stride    = cache.block_tables.ne[0],
+            .selected_blocks = cache.selected_blocks,
         };
         if (q_row.ne[1] == CausalD256H24Kv4::QHeads) {
             causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
@@ -175,8 +179,9 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
             .valid_columns =
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
-            .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
-            .table_stride = cache.block_tables.ne[0],
+            .table_rows      = static_cast<const std::int32_t*>(table_rows.data),
+            .table_stride    = cache.block_tables.ne[0],
+            .selected_blocks = cache.selected_blocks,
         };
         if (q.ne[1] == CausalD256H24Kv4::QHeads) {
             causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(

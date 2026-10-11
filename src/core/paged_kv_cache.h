@@ -24,6 +24,9 @@ struct PagedKVLayerView {
     Tensor k_scale_pages;
     Tensor v_scale_pages;
     Tensor block_table;
+    // KVMem ring: optional per-logical-page attention mask (bit p of word p>>5). nullptr means every
+    // page is attended, which is the dense default. See ops/kernel/paged_kv_address.cuh.
+    const std::uint32_t* selected_blocks = nullptr;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
@@ -36,6 +39,7 @@ struct PagedKVBatchLayerView {
     Tensor k_scale_pages;
     Tensor v_scale_pages;
     Tensor block_tables;
+    const std::uint32_t* selected_blocks = nullptr;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
@@ -69,6 +73,13 @@ struct KVPageGeometry {
 
 struct DeviceKVPagePoolSpec {
     std::uint32_t page_group_count = 0;
+    // KVMem ring: when the LOGICAL KV capacity is larger than this pool, the pool cannot back a
+    // reservation for the whole logical context. The reservation then becomes a LOGICAL promise --
+    // bounded only by the logical page count -- while the physical allocation stays bounded by
+    // `page_group_count`, and the ring recycles resident pages (demoting them to the Host tier) to
+    // honour it. Without this flag a reservation larger than the pool is refused outright, which is
+    // what keeps the dense configuration's "device pool >= logical context" invariant.
+    bool allow_logical_reservation = false;
     KVPageGeometry geometry;
 };
 
@@ -201,10 +212,21 @@ public:
     [[nodiscard]] std::uint32_t allocated_pages() const noexcept;
     [[nodiscard]] std::uint32_t reserved_pages() const noexcept;
     [[nodiscard]] std::uint32_t available_pages() const noexcept;
+    // True when this pool's reservations are logical promises rather than physical page counts, i.e.
+    // the KVMem ring is backing a logical context larger than the pool. Callers that ask "can this
+    // ever fit?" must compare against the LOGICAL page capacity in that case, not capacity_pages().
+    [[nodiscard]] bool allows_logical_reservation() const noexcept {
+        return spec_.allow_logical_reservation;
+    }
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
     [[nodiscard]] std::uint32_t
     contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const;
+
+    // The pool slot a page handle names. Public because publishing an execution row for an address
+    // space whose pages are partly Host-resident needs the slot of the pages that still have one.
+    [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
+
 
     [[nodiscard]] std::optional<DeviceKVPageReservation> reserve(std::uint32_t pages) noexcept;
 
@@ -243,7 +265,6 @@ private:
     friend class KVExecutionTablePool;
 
     [[nodiscard]] bool valid_handle(DeviceKVPageHandle handle) const noexcept;
-    [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
     void validate_distinct_pages(std::span<const DeviceKVPageHandle> pages,
                                  const char* duplicate_message) const;
     void consume_free_run(std::size_t run_index, std::int32_t begin, std::uint32_t count) noexcept;
@@ -348,6 +369,17 @@ public:
                  std::span<const DeviceKVPageLease> pages, cudaStream_t stream = nullptr);
     void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
                           cudaStream_t stream = nullptr);
+
+    // Publish already-resolved physical indices for a row. A NEGATIVE index marks a slot whose page
+    // has no Device replica (the KVMem ring spilled it): the ring's attention mask excludes such a
+    // slot, and a later restore republishes the row, so the value is never read as a page.
+    void publish_raw(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                     std::span<const std::int32_t> indices, cudaStream_t stream = nullptr);
+
+    // The physical index last published for a slot, from the host shadow of the table. A spilled page
+    // has no Device replica to name, and this is the stale-but-in-bounds value its slot already holds.
+    [[nodiscard]] std::int32_t published_index(KVExecutionRowHandle handle,
+                                               std::uint32_t logical) const;
 
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
 

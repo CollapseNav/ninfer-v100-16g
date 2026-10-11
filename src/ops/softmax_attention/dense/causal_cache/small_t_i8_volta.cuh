@@ -138,7 +138,8 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    float* partial_acc, float* partial_m, float* partial_l) {
+    float* partial_acc, float* partial_m, float* partial_l,
+    const std::uint32_t* selected_blocks) {
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
     static_assert(WarpsPerCta == 4 || WarpsPerCta == 5);
 
@@ -561,7 +562,8 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
                     const bool lo   = (l & 2) == 0;
                     const int qabs  = lo ? qabs_lo : qabs_hi;
                     const bool ok =
-                        row < worker_rows && key >= split_start && key < split_end && key <= qabs;
+                        row < worker_rows && key >= split_start && key < split_end && key <= qabs &&
+                        paged_kv_block_selected(selected_blocks, key);
                     d_score[l] = ok ? d_score[l] * scale : -CUDART_INF_F;
                 }
 

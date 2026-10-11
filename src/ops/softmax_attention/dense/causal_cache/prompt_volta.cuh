@@ -82,6 +82,21 @@ causal_attention_prompt_volta_kernel(
     float row_sum = 0.0f;
     float acc     = 0.0f;
     for (int key = 0; key <= last_key; ++key) {
+        // KVMem ring: a demoted page's Device slot is recycled, so its K/V must not be read.
+        // The predicate depends only on the loop index and a block-uniform pointer, so every thread
+        // takes the same branch and the __syncthreads() below stays convergent.
+        //
+        // JUMP THE WHOLE PAGE, do not merely `continue`. The loop bound is the token's own position,
+        // so at a 200k-token context every token would otherwise iterate 200k times even with every
+        // page masked out -- and that iteration, not the arithmetic, is what cost the ring its
+        // prefill speed (measured: 200k prompt, 991 tok/s at 30k fell to 368). Selection is
+        // page-granular, so the rest of an unselected page contributes nothing and can be skipped in
+        // one step.
+        if (!paged_kv_block_selected(metadata.selected_blocks, key)) {
+            key = ((key >> kPagedKVPageShift) << kPagedKVPageShift) +
+                  static_cast<int>(kPagedKVPageSize) - 1;
+            continue;
+        }
         const int physical_page = paged_kv_physical_page(block_table, key);
         const int page_offset   = key & kPagedKVPageMask;
         const std::int64_t cache_index = Int8
@@ -171,6 +186,13 @@ causal_attention_prompt_fp8_volta_kernel(
     float row_sum = 0.0f;
     float acc     = 0.0f;
     for (int key = 0; key <= last_key; ++key) {
+        // KVMem ring mask; see the int8 kernel above for why the branch is convergent and why the
+        // whole page is skipped rather than just this key.
+        if (!paged_kv_block_selected(metadata.selected_blocks, key)) {
+            key = ((key >> kPagedKVPageShift) << kPagedKVPageShift) +
+                  static_cast<int>(kPagedKVPageSize) - 1;
+            continue;
+        }
         const int physical_page = paged_kv_physical_page(block_table, key);
         const int page_offset   = key & kPagedKVPageMask;
         const std::int64_t code_index =

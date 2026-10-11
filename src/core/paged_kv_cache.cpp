@@ -4,6 +4,7 @@
 #include "core/host_kv_arena.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -61,9 +62,16 @@ PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cac
         .k_scale_pages = cache.k_scale_pages,
         .v_scale_pages = cache.v_scale_pages,
         .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
-        .head_dim      = cache.head_dim,
-        .num_kv_heads  = cache.num_kv_heads,
-        .storage       = cache.storage,
+        // The KVMem selection mask MUST survive this rebind. A designated initialiser that omits a
+        // field is not a compile error, so dropping this line silently defaults the mask to nullptr
+        // and the route runs DENSE over pages the ring has already demoted -- reading a recycled
+        // Device slot as if it still held that page's K/V. The reference project shipped exactly
+        // this defect and recorded it (paged_kv_cache.cpp, "ring mask" fix, 2026-10-02); the
+        // NINFER_KV_MASK_CONTROL=prefill negative control here reproduces it.
+        .selected_blocks = cache.selected_blocks,
+        .head_dim        = cache.head_dim,
+        .num_kv_heads    = cache.num_kv_heads,
+        .storage         = cache.storage,
     };
 }
 
@@ -243,7 +251,11 @@ std::uint32_t DeviceKVPagePool::allocated_pages() const noexcept { return alloca
 std::uint32_t DeviceKVPagePool::reserved_pages() const noexcept { return reserved_pages_; }
 
 std::uint32_t DeviceKVPagePool::available_pages() const noexcept {
-    return capacity_pages() - allocated_pages_ - reserved_pages_;
+    // Under a logical reservation `reserved_pages_` may exceed `capacity_pages_`, so this must not
+    // be written as a bare subtraction: unsigned underflow would report a huge free count and the
+    // next allocation would walk off the page table.
+    const std::uint32_t used = allocated_pages_ + reserved_pages_;
+    return used >= capacity_pages() ? 0U : capacity_pages() - used;
 }
 
 std::size_t DeviceKVPagePool::plane_count() const noexcept { return planes_.size(); }
@@ -272,6 +284,9 @@ std::optional<DeviceKVPageReservation> DeviceKVPagePool::reserve(std::uint32_t p
 bool DeviceKVPagePool::can_resize_reservation(const DeviceKVPageReservation& reservation,
                                               std::uint32_t new_reserved_pages) const noexcept {
     if (!reservation.belongs_to(*this) || reservation.pages_ > reserved_pages_) { return false; }
+    // KVMem ring: the reservation is a logical promise; only the physical allocation is bounded by
+    // the pool, and the ring frees physical pages on demand by demoting resident ones.
+    if (spec_.allow_logical_reservation) { return true; }
     const std::uint64_t used = static_cast<std::uint64_t>(allocated_pages_) +
                                static_cast<std::uint64_t>(reserved_pages_ - reservation.pages_) +
                                new_reserved_pages;
@@ -305,6 +320,17 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
     }
     if (count == 0) { return; }
     if (count > capacity_pages() - allocated_pages_) {
+        // Under a logical reservation (the KVMem ring) a full pool is an EXPECTED condition: the
+        // caller spills resident pages and retries. A std::logic_error would report it as a broken
+        // invariant, which the worker treats as fatal and turns into a 500 for the request. Report
+        // the capacity failure it is. Dense keeps the invariant error, where the reservation really
+        // does guarantee that this cannot happen.
+        if (spec_.allow_logical_reservation) {
+            std::fprintf(stderr,
+                         "[ring] materialize: count=%u capacity=%u allocated=%u reserved=%u\n",
+                         count, capacity_pages(), allocated_pages_, reserved_pages_);
+            throw std::bad_alloc();
+        }
         throw std::logic_error("Paged KV reservation invariant was violated");
     }
 
@@ -382,6 +408,15 @@ DeviceKVPageLease DeviceKVPagePool::materialize_one(DeviceKVPageReservation& res
         throw std::invalid_argument("Paged KV single-page materialization exceeds reservation");
     }
     if (free_page_runs_.empty()) {
+        // Same classification as the batch path: under a logical reservation (the KVMem ring) a full
+        // pool is an EXPECTED condition that the caller relieves by spilling, not a broken invariant.
+        if (spec_.allow_logical_reservation) {
+            std::fprintf(stderr,
+                         "[ring] materialize_one: no free page; capacity=%u allocated=%u "
+                         "reserved=%u\n",
+                         capacity_pages(), allocated_pages_, reserved_pages_);
+            throw std::bad_alloc();
+        }
         throw std::logic_error("Paged KV reservation invariant was violated");
     }
     FreePageRun& run        = free_page_runs_.front();
@@ -830,6 +865,30 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
     auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
     CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
                                cudaMemcpyHostToDevice, stream));
+}
+
+void KVExecutionTablePool::publish_raw(KVExecutionRowHandle row_handle, std::uint32_t logical_begin,
+                                      std::span<const std::int32_t> indices, cudaStream_t stream) {
+    if (!valid_handle(row_handle) || logical_begin > logical_page_capacity() ||
+        indices.size() > logical_page_capacity() - logical_begin) {
+        throw std::invalid_argument("Paged KV raw publication is outside its execution row");
+    }
+    if (indices.empty()) { return; }
+    auto* shadow = static_cast<std::int32_t*>(host_shadow_.data()) +
+                   static_cast<std::size_t>(row_handle.row_) * logical_page_capacity() +
+                   logical_begin;
+    std::copy(indices.begin(), indices.end(), shadow);
+    publish_indices(row_handle, logical_begin, indices, stream);
+}
+
+std::int32_t KVExecutionTablePool::published_index(KVExecutionRowHandle handle,
+                                                   std::uint32_t logical) const {
+    if (!valid_handle(handle) || logical >= logical_page_capacity()) {
+        throw std::invalid_argument("Paged KV published index is outside its execution row");
+    }
+    const auto* shadow = static_cast<const std::int32_t*>(host_shadow_.data()) +
+                         static_cast<std::size_t>(handle.row_) * logical_page_capacity() + logical;
+    return *shadow;
 }
 
 Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {

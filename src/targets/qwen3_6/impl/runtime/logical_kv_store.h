@@ -1,11 +1,13 @@
 #pragma once
 
 #include "core/paged_kv_cache.h"
+#include "runtime/engine/kv_window.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -508,9 +510,16 @@ public:
     [[nodiscard]] bool can_drop_device_replica(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
+        // KVMem ring: a page the ring spills stays MAPPED by its active address space, so it must
+        // keep its active reference -- that reference means "mapped", not "resident", and deactivate()
+        // releases exactly one per mapped page. Releasing it here instead would make deactivate()
+        // throw, and unbind_sequence_kv() swallows that, leaving the address ACTIVE after the turn --
+        // which is what made the NEXT request fail its eviction check.
+        const bool ring = runtime::kv_ring_requested();
         return page.device_replica && host_replica_current(handle) &&
                !page.pending_device_replica && page.writer_references == 0 &&
-               page.active_references == 0 && page.source_pins == 0 && !page.destination_pinned;
+               (ring || page.active_references == 0) && page.source_pins == 0 &&
+               !page.destination_pinned;
     }
 
     void retain_active_reference(LogicalKVPageHandle handle) {
@@ -946,6 +955,9 @@ public:
 
     [[nodiscard]] DeviceKVPageReservation& page_reservation(KVActivationReservation& activation) {
         if (activation.owner_ != this || !valid(activation.address_)) {
+            std::fprintf(stderr, "[ring] page_reservation STALE: owner_ok=%d addr_valid=%d\n",
+                         static_cast<int>(activation.owner_ == this),
+                         static_cast<int>(valid(activation.address_)));
             throw std::logic_error("KV activation reservation is stale");
         }
         return activation.page_reservation_;
@@ -972,12 +984,17 @@ public:
         const std::uint32_t expected = activation.requested_entitlement_ > address.page_count
                                            ? activation.requested_entitlement_ - address.page_count
                                            : 0U;
+        // KVMem ring: the reservation is a logical promise, and a checkpoint larger than the pool
+        // deliberately leaves its oldest pages on the Host tier, so neither the reservation size nor
+        // full Device residency can be demanded here.
+        const bool ring = runtime::kv_ring_requested();
         if (!activation.page_reservation_.belongs_to(pages_->physical_pool()) ||
-            activation.page_reservation_.pages() != expected) {
+            (!ring && activation.page_reservation_.pages() != expected)) {
             throw std::logic_error("KV activation capacity reservation changed");
         }
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
+            if (ring && !pages_->device_resident(logical)) { continue; }
             if (!pages_->device_resident(logical) || (pages_->address_references(logical) == 1 &&
                                                       !pages_->can_set_writer(logical, true))) {
                 throw std::logic_error("KV activation has an unavailable Device page");
@@ -988,9 +1005,20 @@ public:
         activation.row_.reset();
         address.active              = true;
         address.checkpoint_frontier = 0;
-        activation.owner_           = nullptr;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
+            if (ring && !pages_->device_resident(logical)) {
+                // Left on the Host tier. It is still MAPPED, so it must hold exactly one active
+                // reference -- but a page that already holds one (kept from the sequence that produced
+                // the checkpoint) must NOT be retained twice: retain_active_reference throws, and the
+                // throw used to land after the activation was consumed, which turned a recoverable
+                // failure into terminate(). deactivate() releases exactly one per mapped page, so
+                // "retain only when none is held" keeps the books balanced either way.
+                if (pages_->active_address_references(logical) == 0) {
+                    pages_->retain_active_reference(logical);
+                }
+                continue;
+            }
             if (pages_->address_references(logical) == 1) {
                 pages_->clear_protection(logical);
                 pages_->set_writer(logical, true);
@@ -998,6 +1026,9 @@ public:
             pages_->retain_active_reference(logical);
         }
         publish_membership(address, stream);
+        // Consumed only once every fallible step is done, so a throw above leaves the reservation
+        // usable by the transaction rollback instead of terminating the process.
+        activation.owner_ = nullptr;
     }
 
     void deactivate(KVAddressSpaceHandle handle) {
@@ -1476,6 +1507,156 @@ public:
         address.page_count = target;
     }
 
+    // KVMem ring. Grows `handle` to `tokens`, spilling this address space's OWN oldest pages to the
+    // Host tier whenever the Device pool has no room for the next segment, and keeping the newest
+    // `window_pages` resident. Returns how many pages were spilled.
+    //
+    // WHY THE GROWTH IS SEGMENTED. A prefill asks for its whole prompt in one call, so without
+    // segmentation the pool is demanded all at once and nothing is old enough to spill. The segment
+    // size is bounded by the pool's free ALLOCATION room -- capacity minus allocated, not
+    // available_pages(), which subtracts the logical reservation and is therefore always zero here.
+    //
+    // `spill` does the Host side (copy, publish, drop the Device replica) and returns the number of
+    // pages it actually spilled; it lives in the caller because HostKVExtentStore includes this
+    // header and cannot be named here.
+    template <class ScoreFn, class SpillFn, class ReclaimFn>
+    std::uint32_t grow_with_ring(KVAddressSpaceHandle handle, std::uint32_t tokens,
+                                 std::uint32_t window_pages, ScoreFn&& score, SpillFn&& spill,
+                                 ReclaimFn&& reclaim, cudaStream_t stream = nullptr) {
+        Address& address = require_active(handle);
+        const std::uint32_t target = pages_for_tokens(tokens);
+        if (target > entitlement(address)) {
+            throw std::invalid_argument("KV ring growth exceeds the active entitlement");
+        }
+        std::uint32_t spilled = 0;
+        while (address.page_count < target) {
+            const std::uint32_t room =
+                pages_->physical_pool().capacity_pages() - pages_->physical_pool().allocated_pages();
+            if (room == 0) {
+                const std::uint32_t want = target - address.page_count;
+                std::uint32_t freed =
+                    spill_least_relevant_pages(handle, window_pages, want, score, spill);
+                if (freed == 0) {
+                    // Nothing of our OWN to give up: `keep_from` is `mapped - window`, so a sequence
+                    // shorter than the window has no candidate at all. The room is held by a CACHED
+                    // continuation from an earlier request, so reclaim from there.
+                    freed = reclaim(want);
+                    std::fprintf(stderr,
+                                 "[ring] grow: own pages exhausted (mapped=%u window=%u want=%u), "
+                                 "reclaimed %u from other owners\n",
+                                 address.page_count, window_pages, want, freed);
+                }
+                std::fprintf(stderr,
+                             "[ring] grow: mapped=%u target=%u window=%u room=0 spilled=%u\n",
+                             address.page_count, target, window_pages, freed);
+                if (freed == 0) {
+                    // Nothing left outside the window: the resident window itself does not fit the
+                    // pool. That is a capacity failure, not an invariant violation.
+                    throw std::bad_alloc();
+                }
+                spilled += freed;
+                continue;
+            }
+            const std::uint32_t mapped = address.page_count;
+            const std::uint32_t step   = std::min(target - mapped, room);
+            ensure_mapped_to_tokens(
+                handle, (mapped + step) * static_cast<std::uint32_t>(kPagedKVPageSize), stream);
+        }
+        return spilled;
+    }
+
+    // KVMem ring: spill up to `wanted` Device-resident pages of an INACTIVE address space to the
+    // Host tier, oldest first. Used when the sequence that needs room has nothing of its own to give
+    // up because the pool is held by a CACHED continuation from an earlier request.
+    //
+    // Measured failure without this: a second request after a long one died with
+    //   [ring] grow: mapped=0 target=1 window=256 room=0 spilled=0  ->  std::bad_alloc
+    // i.e. it could not map even its first page, because the previous request's turn-closure
+    // checkpoint still owned all 384 Device pages.
+    template <class SpillFn>
+    std::uint32_t spill_inactive_pages(KVAddressSpaceHandle handle, std::uint32_t wanted,
+                                       SpillFn&& spill) {
+        if (wanted == 0) { return 0; }
+        Address& address = require(handle);
+        if (address.active) { return 0; }
+        std::vector<LogicalKVPageHandle> victims;
+        victims.reserve(wanted);
+        for (std::uint32_t page = 0; page < address.page_count && victims.size() < wanted; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (!pages_->valid(logical) || !pages_->device_resident(logical)) { continue; }
+            if (pages_->committed_columns(logical) != static_cast<std::uint32_t>(kPagedKVPageSize)) {
+                continue;
+            }
+            if (pages_->source_pins(logical) != 0 || pages_->writer_references(logical) != 0) {
+                continue;
+            }
+            victims.push_back(logical);
+        }
+        if (victims.empty()) { return 0; }
+        return spill(std::span<const LogicalKVPageHandle>(victims.data(), victims.size()));
+    }
+
+    // KVMem ring retrieval. Picks the `wanted` pages to give up among those outside the resident
+    // window, LEAST RELEVANT FIRST, so the pages the query actually needs stay on the Device and stay
+    // in the attention mask. `score(page_index)` is the caller's relevance model; ties fall back to
+    // the oldest page, which keeps the dense-like behaviour when nothing is relevant.
+    //
+    // WHY RETENTION RATHER THAN RESTORE: bringing a spilled page back would need a second transfer
+    // path (reserve a Device page, H2D, re-publish the block-table slot, re-retain the reference).
+    // Choosing better victims needs none of that and reaches the same end state for a prompt whose
+    // query is known up front -- the relevant pages are simply never evicted. The limitation is real
+    // and deliberate: a page spilled before its relevance could be known cannot be recalled.
+    template <class ScoreFn, class SpillFn>
+    std::uint32_t spill_least_relevant_pages(KVAddressSpaceHandle handle, std::uint32_t window_pages,
+                                             std::uint32_t wanted, ScoreFn&& score,
+                                             SpillFn&& spill) {
+        Address& address            = require_active(handle);
+        const std::uint32_t mapped  = address.page_count;
+        const std::uint32_t keep_from = mapped > window_pages ? mapped - window_pages : 0;
+        if (keep_from == 0) { return 0; }
+        std::vector<std::pair<double, std::uint32_t>> ranked;
+        ranked.reserve(keep_from);
+        for (std::uint32_t offset = 0; offset < keep_from; ++offset) {
+            const LogicalKVPageHandle page = membership(address, offset);
+            if (!pages_->valid(page) || !pages_->device_resident(page)) { continue; }
+            // Only a FULLY committed page may leave. A partially committed page's coverage is the
+            // lower bound the next commit advances, so dropping its Device replica would make the
+            // committed coverage go backwards -- the reference recorded that failure as
+            // "logical KV committed coverage is not monotonic".
+            if (pages_->committed_columns(page) != static_cast<std::uint32_t>(kPagedKVPageSize)) {
+                continue;
+            }
+            // A live sequence keeps a writer reference on every mapped page, so this cannot require
+            // writer_references == 0; the spill clears it right before the transfer, which is what
+            // the Host extent store's source pinning needs.
+            if (pages_->source_pins(page) != 0) { continue; }
+            ranked.emplace_back(score(offset), offset);
+        }
+        if (ranked.empty()) {
+            std::fprintf(stderr,
+                         "[ring] spill: mapped=%u window=%u keep_from=%u candidates=0 "
+                         "(filter rejected every page)\n",
+                         mapped, window_pages, keep_from);
+            return 0;
+        }
+        // Least relevant first; ties oldest first, so with no relevance model this degenerates to
+        // the original oldest-first eviction.
+        std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
+            if (left.first != right.first) { return left.first < right.first; }
+            return left.second < right.second;
+        });
+        const std::size_t take = std::min<std::size_t>(wanted == 0 ? ranked.size() : wanted,
+                                                      ranked.size());
+        std::vector<LogicalKVPageHandle> victims;
+        victims.reserve(take);
+        for (std::size_t index = 0; index < take; ++index) {
+            victims.push_back(membership(address, ranked[index].second));
+        }
+        std::fprintf(stderr, "[ring] spill: mapped=%u keep_from=%u candidates=%zu taking=%zu\n",
+                     mapped, keep_from, ranked.size(), victims.size());
+        return spill(std::span<const LogicalKVPageHandle>(victims.data(), victims.size()));
+    }
+
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
         Address& address = require_active(handle);
         if (frontier < address.committed_frontier ||
@@ -1845,11 +2026,19 @@ private:
 
     void publish_membership(const Address& address, cudaStream_t stream = nullptr) {
         if (!address.row) { throw std::logic_error("KV address space has no execution row"); }
-        publish_scratch_.clear();
+        publish_indices_.clear();
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
-            publish_scratch_.push_back(pages_->physical(membership(address, page)));
+            const LogicalKVPageHandle logical = membership(address, page);
+            // KVMem ring: a page the ring spilled has no Device replica to name. Its slot already
+            // holds a stale but in-bounds index, and the ring's attention mask (residency) keeps it
+            // out of attention until a restore republishes this row -- so carry that value forward
+            // rather than demanding a Device page that does not exist.
+            publish_indices_.push_back(
+                pages_->device_resident(logical)
+                    ? pages_->physical_pool().physical_index(pages_->physical(logical))
+                    : tables_->published_index(address.row->handle(), page));
         }
-        tables_->publish(address.row->handle(), 0, publish_scratch_, stream);
+        tables_->publish_raw(address.row->handle(), 0, publish_indices_, stream);
     }
 
     LogicalKVPageStore* pages_    = nullptr;
@@ -1859,6 +2048,7 @@ private:
     std::vector<std::uint32_t> free_;
     std::vector<LogicalKVPageHandle> memberships_;
     std::vector<DeviceKVPageHandle> publish_scratch_;
+    std::vector<std::int32_t> publish_indices_;
     std::uint32_t free_count_ = 0;
 };
 

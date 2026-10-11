@@ -1,5 +1,7 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 
+#include "runtime/engine/kv_window.h"
+
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -23,7 +25,12 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     const PagedKVStorageLayout layer_storage = paged_kv_storage_layout(storage, head_dim);
 
     const std::uint32_t logical_pages = page_count(capacity);
-    if (physical_page_groups < logical_pages) {
+    // The Device pool and the logical descriptor table are already separate objects
+    // (DeviceKVPagePoolSpec::page_group_count vs KVExecutionTableSpec::logical_page_capacity).
+    // Dense mode requires the pool to cover the whole logical context; with the KVMem ring on, the
+    // pool holds only the resident window and the rest of the logical pages live on the Host tier,
+    // so a pool below the logical capacity is the intended configuration.
+    if (physical_page_groups < logical_pages && !runtime::kv_ring_requested()) {
         throw std::invalid_argument("Paged KV physical pages are below logical capacity");
     }
 
@@ -43,10 +50,13 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                                        layer_storage.value.scale_leading_extent, kv_heads, 256});
         }
     }
+    const bool ring_pool = runtime::kv_ring_requested() && physical_page_groups < logical_pages;
     return PagedKVCacheLayout{
         .pages = plan_device_kv_page_pool(
-            builder, DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
-                                          .geometry         = std::move(geometry)}),
+            builder,
+            DeviceKVPagePoolSpec{.page_group_count          = physical_page_groups,
+                                 .allow_logical_reservation = ring_pool,
+                                 .geometry                  = std::move(geometry)}),
         .execution_tables = plan_kv_execution_tables(
             builder,
             KVExecutionTableSpec{.logical_page_capacity = logical_pages, .table_rows = table_rows}),
@@ -82,6 +92,38 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     }
 }
 
+PagedKVCache::~PagedKVCache() {
+    if (selection_device_ != nullptr) {
+        (void)cudaFree(selection_device_);
+        selection_device_ = nullptr;
+        selected_blocks_  = nullptr;
+    }
+}
+
+void PagedKVCache::install_selection(std::span<const std::uint32_t> words) {
+    const std::uint32_t pages = execution_tables_.logical_page_capacity();
+    const std::size_t required = (static_cast<std::size_t>(pages) + 31U) / 32U;
+    if (words.empty()) {
+        clear_selection();
+        return;
+    }
+    if (words.size() < required) {
+        throw std::invalid_argument("KV selection mask does not cover the logical page capacity");
+    }
+    if (selection_device_ == nullptr) {
+        void* allocated = nullptr;
+        if (cudaMalloc(&allocated, required * sizeof(std::uint32_t)) != cudaSuccess) {
+            throw std::bad_alloc();
+        }
+        selection_device_ = static_cast<std::uint32_t*>(allocated);
+    }
+    if (cudaMemcpy(selection_device_, words.data(), required * sizeof(std::uint32_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        throw std::runtime_error("KV selection mask upload failed");
+    }
+    selected_blocks_ = selection_device_;
+}
+
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
 
@@ -109,28 +151,30 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
     const std::size_t v_scale_index =
         k_scale_index + static_cast<std::size_t>(layer_storage_.key.has_scale());
     return PagedKVLayerView{
-        .k_pages       = pages_.plane(base),
-        .v_pages       = pages_.plane(base + 1),
-        .k_scale_pages = layer_storage_.key.has_scale() ? pages_.plane(k_scale_index) : Tensor(),
-        .v_scale_pages = layer_storage_.value.has_scale() ? pages_.plane(v_scale_index) : Tensor(),
-        .block_table   = block_table,
-        .head_dim      = layer_storage_.head_dim,
-        .num_kv_heads  = kv_heads_,
-        .storage       = layer_storage_.storage,
+        .k_pages         = pages_.plane(base),
+        .v_pages         = pages_.plane(base + 1),
+        .k_scale_pages   = layer_storage_.key.has_scale() ? pages_.plane(k_scale_index) : Tensor(),
+        .v_scale_pages   = layer_storage_.value.has_scale() ? pages_.plane(v_scale_index) : Tensor(),
+        .block_table     = block_table,
+        .selected_blocks = selected_blocks_,
+        .head_dim        = layer_storage_.head_dim,
+        .num_kv_heads    = kv_heads_,
+        .storage         = layer_storage_.storage,
     };
 }
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
     const PagedKVLayerView direct = layer_view(layer, Tensor());
     return PagedKVBatchLayerView{
-        .k_pages       = direct.k_pages,
-        .v_pages       = direct.v_pages,
-        .k_scale_pages = direct.k_scale_pages,
-        .v_scale_pages = direct.v_scale_pages,
-        .block_tables  = execution_tables_.matrix(),
-        .head_dim      = direct.head_dim,
-        .num_kv_heads  = direct.num_kv_heads,
-        .storage       = direct.storage,
+        .k_pages         = direct.k_pages,
+        .v_pages         = direct.v_pages,
+        .k_scale_pages   = direct.k_scale_pages,
+        .v_scale_pages   = direct.v_scale_pages,
+        .block_tables    = execution_tables_.matrix(),
+        .selected_blocks = selected_blocks_,
+        .head_dim        = direct.head_dim,
+        .num_kv_heads    = direct.num_kv_heads,
+        .storage         = direct.storage,
     };
 }
 

@@ -559,6 +559,10 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    // Public because the engine's failure path needs it: an execution entry point releases a failing
+    // lane itself before rethrowing, so the engine must be able to tell a live binding from a stale
+    // handle instead of asking the resource manager to abort one that is already gone.
+    [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
@@ -733,6 +737,52 @@ private:
     mutable std::vector<std::uint8_t> pressure_shared_owner_scratch_;
     mutable std::vector<std::vector<runtime::CheckpointRef>> pressure_private_drop_scratch_;
     mutable std::vector<PressureSelectedState> pressure_state_scratch_;
+
+    // KVMem ring: scratch for the selection-mask negative control (apply_kv_mask_control).
+    mutable std::vector<std::uint32_t> mask_control_words_;
+
+    // KVMem ring: the residency bitmap handed to the attention kernels. Bit p is set iff logical page
+    // p currently has a Device replica, so a page the ring spilled is never read.
+    mutable std::vector<std::uint32_t> residency_mask_;
+
+    // KVMem ring retrieval: the lexical query window (the prompt's last tokens) and the per-token
+    // document frequency that weights it. A page scores as the summed IDF of the query tokens it
+    // contains, so a rare match (a code, a name, an error string) dominates ordinary function words.
+    mutable std::vector<TokenId> ring_tokens_;  // the prompt, kept for page scoring
+    mutable std::vector<TokenId> ring_query_;
+    mutable std::vector<std::pair<TokenId, std::uint32_t>> ring_query_idf_;  // distinct (token, df)
+    mutable std::uint32_t ring_query_pages_ = 0;
+
+    // Build the query window and its document frequencies from a prompt. Cheap enough to call once
+    // per prefill: O(query * pages * page_size) with a 64-token query.
+    void set_ring_query(std::span<const TokenId> prompt_tokens);
+
+    // Relevance of logical page `page` to the query window. 0 when no query token occurs in it.
+    [[nodiscard]] double ring_page_relevance(std::uint32_t page) const noexcept;
+
+    // KVMem ring: resident window in pages, from NINFER_KV_WINDOW (0 = the whole context).
+    [[nodiscard]] std::uint32_t ring_window_pages() const noexcept;
+
+    // KVMem ring: the initial prompt mapping. Dense maps the whole prompt; the ring maps only the
+    // first chunk, because at this point nothing is committed and therefore nothing is old enough to
+    // spill. The prefill loop grows the rest chunk by chunk as commits create spill candidates.
+    void ensure_initial_kv_mapped(SequenceState& sequence, std::uint32_t prompt_tokens,
+                                  std::uint32_t backend_materialized,
+                                  std::uint32_t initial_mtp_extent);
+
+    // KVMem ring: grow one address space, spilling this sequence's own oldest fully-committed pages
+    // to the Host tier when the Device pool runs out of room.
+    void ring_grow(KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                   KVAddressSpaceHandle address, std::uint32_t tokens, bool backend);
+
+    // Publish the current Device residency as the attention selection mask.
+    void install_residency_mask(const SequenceState& sequence);
+
+    // KVMem ring diagnostic. The selection mask is only correct if the attention kernels actually
+    // honour it, and an inert mask is indistinguishable from a working one in normal operation, so
+    // this makes it turn red on demand. Reads NINFER_KV_MASK_CONTROL = prefill | decode | both, and
+    // is inert unless the ring is on. See the definition for what a red result looks like.
+    void apply_kv_mask_control(bool prefill) const;
 
     void begin_pressure_page_scratch() const noexcept;
     [[nodiscard]] PressurePageScratchSlot& pressure_page_scratch(const LogicalKVPageStore& store,
@@ -1007,7 +1057,6 @@ private:
         std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
         std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
         runtime::ExecutionTiming* failed_timing);
-    [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
     [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
     [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& handle) const noexcept;
     [[nodiscard]] bool valid_capture_offer(const CaptureOffer& offer) const noexcept;

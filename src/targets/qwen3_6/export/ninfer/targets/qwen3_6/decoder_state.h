@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 
 namespace ninfer::targets::qwen3_6 {
 
@@ -58,6 +59,7 @@ private:
 class PagedKVCache {
 public:
     PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
+    ~PagedKVCache();
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -82,6 +84,18 @@ public:
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
+    // KVMem ring: install the per-logical-page attention mask that the attention kernels honour.
+    // `words` holds one bit per logical page, bit p of word (p >> 5), and must cover
+    // execution_tables().logical_page_capacity() pages. Every view produced afterwards carries it.
+    // Passing an empty span is clear_selection(). A selection MUST be installed whenever a page can
+    // be demoted to the Host tier: the page's Device slot is recycled, so an unmasked read would
+    // attend to another page's K/V rather than merely degrade.
+    void install_selection(std::span<const std::uint32_t> words);
+
+    void clear_selection() noexcept { selected_blocks_ = nullptr; }
+
+    [[nodiscard]] const std::uint32_t* selected_blocks() const noexcept { return selected_blocks_; }
+
 private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
@@ -92,6 +106,9 @@ private:
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;
     PagedKVStorageLayout layer_storage_;
+    // Owned Device copy of the selection mask, or nullptr for "attend every page".
+    std::uint32_t* selection_device_ = nullptr;
+    const std::uint32_t* selected_blocks_ = nullptr;
 };
 
 struct DecoderStateLayout {

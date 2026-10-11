@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
+#include "runtime/engine/kv_window.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include <algorithm>
@@ -275,11 +276,28 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
+    // KVMem ring: the LOGICAL entitlement (how many pages this request may map) stays the whole
+    // context -- that is what makes a context larger than the pool legal. But the DEVICE footprint
+    // the plan expects is capped by the pool, because the ring keeps only a resident window and
+    // leaves the rest on the Host tier. Reporting the logical count as the Device expectation makes
+    // the plan demand more Device pages than the pool can ever hold, and every downstream "did
+    // materialization produce what was planned?" check then fails on a state that is working exactly
+    // as designed -- which is what broke reuse.
+    const bool ring = runtime::kv_ring_requested();
+    const std::uint32_t device_main_pages =
+        ring ? std::min(base->text_kv_page_entitlement,
+                        decoder->text_kv.page_pool().capacity_pages())
+             : base->text_kv_page_entitlement;
+    const std::uint32_t device_backend_pages =
+        ring && decoder->mtp_cache() != nullptr
+            ? std::min(base->backend_kv_page_entitlement,
+                       decoder->mtp_cache()->page_pool().capacity_pages())
+            : base->backend_kv_page_entitlement;
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
         .state_slots      = 1U,
-        .main_kv_pages    = base->text_kv_page_entitlement,
-        .backend_kv_pages = base->backend_kv_page_entitlement,
+        .main_kv_pages    = device_main_pages,
+        .backend_kv_pages = device_backend_pages,
     };
     if (prompt.has_media()) {
         if (!workspace_plan.vision) {
@@ -419,10 +437,35 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     }
     root_active.state_slots = 1U;
     const detail::PhysicalResources root_vector{.device = root_active};
+    // KVMem ring: this request demotes everything above its resident window to the Host tier as it
+    // grows, so the plan must DECLARE that Host space. It declared NONE -- `root_vector` carries only
+    // `.device`, so `host.kv_bytes` was always 0 -- and that is a measured, hours-long failure: the
+    // Host arena filled with stale cached continuations, admission saw no Host demand and therefore
+    // never evicted one, and eventually a spill could not be placed
+    // (`HostKVExtentStore::prepare` -> nullopt) -> bad_alloc -> HTTP 500, which then killed the
+    // engine. Declaring the requirement makes the peak fail to fit, which marks the candidate
+    // Infeasible+expandable so the pressure planner evicts instead.
+    //
+    // Only `physical_peak_additional` carries it: `active_entitlement` must stay the Device-only
+    // vector, because the admission check compares that against the sequence's ACTUAL occupancy.
+    detail::PhysicalResources root_peak = root_vector;
+    if (runtime::kv_ring_requested() && host_kv_arena != nullptr) {
+        const std::uint32_t window = ring_window_pages();
+        const auto demotion_bytes  = [&](const LogicalKVPageStore* pages,
+                                        std::uint32_t entitlement) -> std::size_t {
+            if (pages == nullptr || entitlement <= window) { return 0; }
+            const HostKVPageLayout layout =
+                plan_host_kv_page_layout(pages->physical_pool().geometry());
+            return static_cast<std::size_t>(entitlement - window) * layout.page_stride;
+        };
+        root_peak.host.kv_bytes =
+            demotion_bytes(text_kv_pages.get(), base->text_kv_page_entitlement) +
+            demotion_bytes(backend_kv_pages.get(), base->backend_kv_page_entitlement);
+    }
     base->root_demand = detail::PhysicalDemand{
         .active_entitlement       = root_vector,
         .reservation_added        = root_vector,
-        .physical_peak_additional = root_vector,
+        .physical_peak_additional = root_peak,
         .final_added              = root_vector,
     };
     const std::size_t cold_prefill_splits =

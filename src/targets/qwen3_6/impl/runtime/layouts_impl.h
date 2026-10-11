@@ -18,8 +18,10 @@
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
+#include "runtime/engine/kv_window.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -62,6 +64,41 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
 std::uint32_t page_count(std::uint32_t capacity) {
     if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+// Smallest DEVICE pool the KVMem ring can run on, in pages. It is the resident window, plus one
+// prefill chunk (a prefill maps its whole chunk before the ring can demote any of it), plus slack so
+// a restore always finds a free Device page. Clamped to the logical capacity so the ring can never
+// ask for more than the dense pool, and floored at the lane count.
+//
+// This is the ring's counterpart of the dense `max(logical_pages, max_concurrency)`: it is what
+// makes a --kv-capacity below --max-context a legal configuration rather than a rejected one.
+// ponytail: the slack is a fixed 8 pages; raise it if a small window ever reports a restore with no
+// free Device page.
+std::uint32_t ring_resident_pages(std::uint32_t logical_pages, std::uint32_t prefill_chunk,
+                                  std::uint32_t concurrency) {
+    constexpr std::uint32_t kSlackPages = 8;
+    const char* text                    = std::getenv("NINFER_KV_WINDOW");
+    const long window_tokens            = text == nullptr ? 0 : std::strtol(text, nullptr, 10);
+    const std::uint32_t window_pages =
+        window_tokens > 0 ? page_count(static_cast<std::uint32_t>(window_tokens)) : logical_pages;
+    const std::uint32_t chunk_pages = page_count(prefill_chunk == 0 ? 1U : prefill_chunk);
+    const std::uint64_t lanes       = concurrency == 0 ? 1U : concurrency;
+    const std::uint64_t per_lane =
+        std::min<std::uint64_t>(static_cast<std::uint64_t>(window_pages) + chunk_pages,
+                                logical_pages);
+    const std::uint64_t demand = per_lane * lanes + kSlackPages;
+    return static_cast<std::uint32_t>(
+        std::max<std::uint64_t>(std::min<std::uint64_t>(demand, logical_pages), lanes));
+}
+
+// The planner's lower bound on the Main KV pool: the dense logical capacity, or the ring's resident
+// set when the ring is on.
+std::uint32_t minimum_main_page_groups(std::uint32_t logical_pages, std::uint32_t prefill_chunk,
+                                      std::uint32_t concurrency) {
+    return runtime::kv_ring_requested()
+               ? ring_resident_pages(logical_pages, prefill_chunk, concurrency)
+               : std::max(logical_pages, concurrency);
 }
 
 template <class ProfileAllowance>
@@ -686,7 +723,8 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
-    const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
+    const std::uint32_t minimum_pages =
+        minimum_main_page_groups(logical_pages, options.prefill_chunk, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
@@ -694,13 +732,19 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
-        if (options.kv_capacity.explicit_tokens < options.max_context) {
+        // With the ring on, --kv-capacity sizes the DEVICE pool and --max-context stays the logical
+        // limit, so the pool is allowed to be smaller; minimum_pages above is then the ring's
+        // resident set. Off the ring this is the dense check, unchanged.
+        if (!runtime::kv_ring_requested() &&
+            options.kv_capacity.explicit_tokens < options.max_context) {
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
         if (requested_pages < minimum_pages || requested_pages > maximum_pages64) {
             throw std::invalid_argument(
-                "kv_capacity is outside the usable range for max_context and max_concurrency");
+                "kv_capacity is outside the usable range for max_context and max_concurrency "
+                "(minimum " +
+                std::to_string(minimum_pages) + " pages)");
         }
         break;
     }
@@ -733,6 +777,16 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
             throw std::invalid_argument("masked draft window must be in [1,15]");
         }
         break;
+    }
+    // The KVMem ring moves pages to the Host tier and recycles their Device slots, so the attention
+    // kernels MUST consult the selection mask: an unmasked read would silently attend to whatever
+    // page now occupies the recycled slot. On this build only the int8-group64 route has the mask in
+    // BOTH its prefill and its decode kernel, so the ring refuses every other storage rather than
+    // degrade silently.
+    if (runtime::kv_ring_requested() && options.kv_cache != KvCacheStorage::Int8Group64) {
+        throw std::invalid_argument(
+            "NINFER_KV_WINDOW (KVMem ring) requires --kv-dtype int8: it is the only KV storage whose "
+            "attention kernels honour the retrieval mask on this build");
     }
 #ifdef NINFER_VOLTA_BUILD
     if (options.kv_cache == KvCacheStorage::Nvfp4Group16 ||
@@ -847,7 +901,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .context_cache       = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    const std::uint32_t minimum_pages =
+        minimum_main_page_groups(logical_pages, inputs.prefill_chunk, inputs.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {

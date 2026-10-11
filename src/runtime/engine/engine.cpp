@@ -10,6 +10,7 @@
 #include "targets/registry.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -35,6 +36,18 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // scored NLL is bit-identical (verified against the 1024 arm).
         options.prefill_chunk        = 4096;
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
+        // KVMem ring measurement hook. The ring's whole point is a DEVICE pool smaller than the
+        // logical context, and the scorer otherwise sizes the pool to the entire context, so the
+        // ring can never engage under `ninfer-perplexity` and its quality cost cannot be measured.
+        // NINFER_KV_CAPACITY_TOKENS overrides the pool; unset, the default above is untouched.
+        if (const char* text = std::getenv("NINFER_KV_CAPACITY_TOKENS");
+            text != nullptr && text[0] != '\0') {
+            const long tokens = std::strtol(text, nullptr, 10);
+            if (tokens > 0) {
+                options.kv_capacity = KvCapacityPolicy::explicit_capacity(
+                    static_cast<std::uint32_t>(tokens));
+            }
+        }
         options.speculative          = {};
         options.enable_vision        = false;
         options.use_cuda_graph       = false;

@@ -4,6 +4,7 @@
 
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "runtime/engine/kv_window.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
@@ -17,6 +18,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <exception>
 #include <iterator>
 #include <limits>
@@ -3215,6 +3218,12 @@ std::optional<detail::PressureTargetProjection> ProgramImplCore::evaluate_pressu
                                     KVAddressSpaceHandle address,
                                     std::vector<PressureSelectedPage>& selected) {
         if (!addresses.valid(address) || addresses.active(address)) {
+            std::fprintf(stderr,
+                         "[ring] evict-check FAILED: valid=%d active=%d mapped=%u ring=%d\n",
+                         static_cast<int>(addresses.valid(address)),
+                         static_cast<int>(addresses.valid(address) && addresses.active(address)),
+                         addresses.valid(address) ? addresses.mapped_pages(address) : 0U,
+                         static_cast<int>(runtime::kv_ring_requested()));
             throw std::logic_error("evicted KV address is not an inactive publication");
         }
         for (std::uint32_t offset = 0; offset < addresses.mapped_pages(address); ++offset) {
@@ -4597,7 +4606,14 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         advance_resource_revision();
         context_transaction_.emplace<MaterializationTransaction>(std::move(transaction));
         return runtime::ContextTransactionReserveStatus::Reserved;
+    } catch (const std::exception& ex) {
+        // The staging release can itself throw and terminate, which hides THIS exception entirely.
+        // Print it first, or the abort is uninterpretable.
+        std::fprintf(stderr, "[ring] materialization reserve FAILED: %s\n", ex.what());
+        release_materialization_staging(transaction);
+        throw;
     } catch (...) {
+        std::fprintf(stderr, "[ring] materialization reserve FAILED: non-standard exception\n");
         release_materialization_staging(transaction);
         throw;
     }
@@ -5037,16 +5053,42 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             if (mapped > addresses.mapped_pages(address)) {
                 throw std::logic_error("KV activation frontier exceeds address membership");
             }
-            std::uint32_t missing = 0;
+            std::vector<std::uint32_t> missing_pages;
             for (std::uint32_t page = 0; page < mapped; ++page) {
-                if (!pages.device_resident(addresses.logical_page(address, page))) { ++missing; }
+                if (!pages.device_resident(addresses.logical_page(address, page))) {
+                    missing_pages.push_back(page);
+                }
             }
+            // KVMem ring: a checkpoint may cover MORE than the Device pool, so restoring every missing
+            // page is impossible by construction -- that is the whole point of the ring. Restore the
+            // NEWEST pages (the resident window, which local coherence needs) and leave the older ones
+            // on the Host tier; install_residency_mask keeps them out of attention.
+            std::size_t first_restore = 0;
+            if (runtime::kv_ring_requested() && !missing_pages.empty()) {
+                const DeviceKVPagePool& pool = pages.physical_pool();
+                const std::uint32_t room     = pool.capacity_pages() - pool.allocated_pages();
+                if (missing_pages.size() > room) {
+                    first_restore = missing_pages.size() - room;
+                    std::fprintf(stderr,
+                                 "[ring] restore: missing=%zu room=%u -> newest %u only\n",
+                                 missing_pages.size(), room, room);
+                }
+            }
+            const std::size_t to_restore = missing_pages.size() - first_restore;
+            // HOLDING POSITION. Adopting a checkpoint with pages still on the Host tier needs the
+            // Device pages of the outgoing sequence released FIRST; today the adoption happens while
+            // the pool is still full, and letting it through aborts the process
+            // ("KV activation reservation is stale" escaping a noexcept frame, exit 139). Refuse with
+            // a capacity failure until the release-before-adoption ordering is fixed -- a clean error
+            // beats an abort. This guard is expected to be REMOVED by that fix, not kept forever.
+            // TEMPORARY (round 12 diagnosis): adoption is allowed through so the real failure prints.
             if (source_reservation) {
-                pages.physical_pool().resize_reservation(reservation, missing);
+                pages.physical_pool().resize_reservation(reservation,
+                                                         static_cast<std::uint32_t>(to_restore));
             }
-            for (std::uint32_t page = 0; page < mapped; ++page) {
-                const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-                if (pages.device_resident(logical)) { continue; }
+            for (std::size_t index = first_restore; index < missing_pages.size(); ++index) {
+                const LogicalKVPageHandle logical =
+                    addresses.logical_page(address, missing_pages[index]);
                 if (!pages.host_resident(logical) || !host_kv_extents) {
                     throw std::logic_error("checkpoint KV page has no restorable replica");
                 }
@@ -6806,12 +6848,25 @@ ProgramImplCore::owner_exclusive_resources(const SequenceState& sequence) const 
             if (addresses.active(address)) {
                 const std::uint32_t mapped      = addresses.mapped_pages(address);
                 const std::uint32_t entitlement = addresses.entitlement(address);
-                if (entitlement < mapped ||
-                    entitlement - mapped >
-                        std::numeric_limits<std::uint32_t>::max() - device_pages) {
+                if (entitlement < mapped) {
                     throw std::logic_error("owner active KV entitlement is inconsistent");
                 }
-                device_pages += entitlement - mapped;
+                std::uint32_t growth = entitlement - mapped;
+                // KVMem ring: the un-materialized growth is a LOGICAL promise, but the ring only
+                // ever materializes up to the pool -- the rest stays on the Host tier. Counting the
+                // whole growth as Device pages makes an active ring sequence report more Device
+                // pages than the pool can hold, and the admission check that compares this against
+                // the plan then fails on a state that is working exactly as designed.
+                if (runtime::kv_ring_requested()) {
+                    const std::uint32_t capacity  = pages.physical_pool().capacity_pages();
+                    const std::uint32_t free_room =
+                        capacity > device_pages ? capacity - device_pages : 0U;
+                    growth = std::min(growth, free_room);
+                }
+                if (growth > std::numeric_limits<std::uint32_t>::max() - device_pages) {
+                    throw std::logic_error("owner active KV entitlement is inconsistent");
+                }
+                device_pages += growth;
             }
         };
         add_kv(*text_kv_addresses, *text_kv_pages, sequence.kv->text, out.device.main_kv_pages);
@@ -7257,7 +7312,22 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
         if (actual != expected) {
-            throw std::logic_error("materialized sequence does not match its active entitlement");
+            // KVMem ring: the plan's Device expectation is the pool's page count, but another owner
+            // may hold part of that pool, so a ring sequence legitimately ends up with FEWER Device KV
+            // pages than planned -- the remainder is on the Host tier, which is the design. Holding
+            // less is not a fault; holding more is. Compare the KV dimensions with <= under the ring
+            // and keep exact equality on every other dimension and everywhere off the ring.
+            const bool ring = runtime::kv_ring_requested();
+            const bool ring_ok =
+                ring && actual.device.main_kv_pages <= expected.device.main_kv_pages &&
+                actual.device.backend_kv_pages <= expected.device.backend_kv_pages &&
+                actual.device.active_lanes == expected.device.active_lanes &&
+                actual.device.state_slots == expected.device.state_slots &&
+                actual.host.state_slots == expected.host.state_slots &&
+                actual.host.kv_bytes == expected.host.kv_bytes;
+            if (!ring_ok) {
+                throw std::logic_error("materialized sequence does not match its active entitlement");
+            }
         }
         if (details.reuse != ReusePath::Root) {
             if (transaction.state_restored) {
@@ -7500,8 +7570,15 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     const bool publish_private =
         group.rewrite.has_value() ||
         (group.long_anchor && context_cache.max_long_anchors_per_continuation.value_or(0) != 0);
-    const bool publish_shared = group.shared && permit_shared_publication &&
-                                exact_shared == nullptr && shared_prefix_capacity != 0;
+    // KVMem ring: the shared-prefix capture takes an ACTIVE SNAPSHOT of the whole prefix, and that
+    // path requires every full page to have a Device replica (logical_kv_store.h, "active KV snapshot
+    // full page is not stable"). A ring sequence has spilled pages by construction, so it cannot be
+    // captured at all. Cross-request prefix reuse is a separate concern from the ring -- the
+    // reference project gates it behind its own switch (NINFER_KV_REUSE_HOSTBACKED) for the same
+    // reason -- so a ring sequence simply does not publish shared checkpoints.
+    const bool publish_shared = !runtime::kv_ring_requested() && group.shared &&
+                                permit_shared_publication && exact_shared == nullptr &&
+                                shared_prefix_capacity != 0;
 
     CaptureAssessment assessment;
     assessment.shortlist_key   = group.identity->shortlist_key;
@@ -7892,6 +7969,15 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     const CaptureAssessment assessment = inspect_capture(
         offer, exact_shared, replacement, private_replacement, permit_shared_publication);
     if (!assessment.publishes_private && !assessment.publishes_shared) {
+        // A skipped capture leaves the sequence's KV address ACTIVE. The pressure planner later
+        // assumes an evicted continuation's KV is an inactive publication (program_impl.h,
+        // "evicted KV address is not an inactive publication"), so a skip here is what breaks the
+        // NEXT request. Say so, because the failure surfaces one request later and looks unrelated.
+        std::fprintf(stderr,
+                     "[ring] capture SKIPPED: ring=%d private=%d shared=%d frontier=%u\n",
+                     static_cast<int>(runtime::kv_ring_requested()),
+                     static_cast<int>(assessment.publishes_private),
+                     static_cast<int>(assessment.publishes_shared), assessment.frontier);
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -8396,7 +8482,8 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
                                                         : prefill.initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prefill.prompt_tokens
                                                                 : 0U;
-        ensure_sequence_kv_mapped(sequence, prefill.prompt_tokens, backend_materialized);
+        ensure_initial_kv_mapped(sequence, prefill.prompt_tokens, backend_materialized,
+                                 prefill.initial_mtp_extent);
     }
 
     detail::PhysicalResources removed = transaction.capacity_preparation_removed;
@@ -9047,6 +9134,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
             while (cursor < end) {
                 const std::uint32_t count           = std::min(prefill_chunk, end - cursor);
                 const StateImageSelectors selectors = state_selectors(sequence);
+                apply_kv_mask_control(true);
                 schedule::PrefillContext schedule_state{
                     {device, model, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -9504,13 +9592,29 @@ void ProgramImplCore::fail_all_cleanup() noexcept {
 
 detail::PhysicalResources ProgramImplCore::admission_capacity() const noexcept {
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    std::uint32_t main_pages             = decoder->text_kv.page_pool().capacity_pages();
+    std::uint32_t backend_pages =
+        backend != nullptr ? backend->page_pool().capacity_pages() : 0U;
+    // KVMem ring: a logical reservation is a promise the ring honours by spilling resident pages to
+    // the Host tier, so the pool's page count is NOT the ceiling the planner must fit inside.
+    // Reporting it here -- rather than patching each consumer -- keeps admission, the materialization
+    // planner's residual search and the pressure guidance all consistent: they must prove the request
+    // fits the LOGICAL entitlement, and the physical relief is the ring's job at growth time.
+    // Without this every request larger than the resident pool is refused at admission, which is
+    // exactly the request the ring exists to serve.
+    if (decoder->text_kv.page_pool().allows_logical_reservation()) {
+        main_pages = decoder->text_kv.execution_tables().logical_page_capacity();
+        if (backend != nullptr && backend->page_pool().allows_logical_reservation()) {
+            backend_pages = backend->execution_tables().logical_page_capacity();
+        }
+    }
     return detail::PhysicalResources{
         .device =
             {
                 .active_lanes     = max_concurrency,
                 .state_slots      = static_cast<std::uint32_t>(state_images->slot_count()),
-                .main_kv_pages    = decoder->text_kv.page_pool().capacity_pages(),
-                .backend_kv_pages = backend != nullptr ? backend->page_pool().capacity_pages() : 0U,
+                .main_kv_pages    = main_pages,
+                .backend_kv_pages = backend_pages,
             },
         .host =
             {
@@ -10042,7 +10146,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
-        ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        ensure_initial_kv_mapped(sequence, prompt_tokens, backend_materialized,
+                                 initial_mtp_extent);
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -10913,11 +11018,194 @@ void ProgramImplCore::ensure_sequence_kv_mapped(SequenceState& sequence, std::ui
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
+    if (runtime::kv_ring_requested()) {
+        std::fprintf(stderr, "[ring] ensure: main=%u backend=%u\n", main_tokens, backend_tokens);
+        ring_grow(*text_kv_addresses, *text_kv_pages, sequence.kv->text, main_tokens, false);
+        if (backend_tokens != 0) {
+            ring_grow(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend, backend_tokens, true);
+        }
+        // Attention must not read a page the ring just spilled: its Device slot is already reusable,
+        // so an unmasked read would attend to whatever page occupies it now.
+        install_residency_mask(sequence);
+        return;
+    }
     text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {
         backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
                                                       device.stream);
     }
+}
+
+// Resident window in pages, from NINFER_KV_WINDOW. 0 (unset) means the whole context, i.e. no spill.
+std::uint32_t ProgramImplCore::ring_window_pages() const noexcept {
+    const char* text  = std::getenv("NINFER_KV_WINDOW");
+    const long tokens = text == nullptr ? 0 : std::strtol(text, nullptr, 10);
+    if (tokens <= 0) { return 0; }
+    return 1U + (static_cast<std::uint32_t>(tokens) - 1U) /
+                    static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+void ProgramImplCore::ensure_initial_kv_mapped(SequenceState& sequence,
+                                               std::uint32_t prompt_tokens,
+                                               std::uint32_t backend_materialized,
+                                               std::uint32_t initial_mtp_extent) {
+    if (!runtime::kv_ring_requested()) {
+        ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        return;
+    }
+    const std::uint32_t initial_main =
+        std::min(prompt_tokens, std::max(prefill_chunk, 1U));
+    const std::uint32_t initial_backend =
+        backend_materialized == 0
+            ? 0U
+            : std::min(backend_materialized,
+                       initial_main + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent));
+    ensure_sequence_kv_mapped(sequence, initial_main, initial_backend);
+}
+
+void ProgramImplCore::ring_grow(KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                KVAddressSpaceHandle address, std::uint32_t tokens, bool backend) {
+    if (!host_kv_extents) {
+        // The ring's only demotion target is the Legacy Host KV tier. Without it the pool cannot be
+        // relieved, so say so instead of failing later with an unexplained allocation error.
+        std::fprintf(stderr, "[ring] grow: no Host KV extent store to spill into\n");
+        throw std::bad_alloc();
+    }
+    HostKVExtentStore& extents = *host_kv_extents;
+    const std::uint32_t window = ring_window_pages();
+    // One spill routine, used both for this sequence's own pages and for a cached continuation's.
+    const auto spill_pages = [&](std::span<const LogicalKVPageHandle> victims) -> std::uint32_t {
+        std::uint32_t spilled = 0;
+        for (const LogicalKVPageHandle page : victims) {
+            // A live sequence keeps a writer reference on every mapped page, and the Host extent
+            // store's source pinning needs it clear. These pages are outside the resident window,
+            // so giving up the writer is what makes them movable at all.
+            pages.set_writer(page, false);
+            const std::array<LogicalKVPageHandle, 1> one{page};
+            std::optional<HostKVExtentReservation> reserved = extents.prepare(pages, one);
+            if (!reserved) { break; }  // Host arena full: nothing more can be moved
+            const std::vector<DeviceKVPageHandle> sources = extents.device_sources(*reserved);
+            // On the COMPUTE stream: the D2H must be ordered after the kernels that wrote this page,
+            // and the Device slot is recyclable the instant the replica is dropped. No sync is
+            // needed: every later use of the freed page is issued on the same stream.
+            pages.physical_pool().copy_to_host(sources, extents.writable_view(*reserved),
+                                              device.stream);
+            (void)extents.publish(std::move(*reserved));
+            // The active reference is deliberately NOT released: the page is still mapped by its
+            // address space, and deactivate() releases exactly one per mapped page.
+            if (!pages.drop_device_replica(page)) { break; }
+            ++spilled;
+        }
+        return spilled;
+    };
+
+    // Reclaim from a CACHED continuation when this sequence has nothing of its own to give up.
+    // Without this the ring could only ever free its OWN pages, and a second request after a long
+    // one failed with `[ring] grow: mapped=0 target=1 room=0 spilled=0` -> bad_alloc: the previous
+    // request's turn-closure checkpoint still owned every Device page in the pool.
+    const auto reclaim_from_cached_owners = [&](std::uint32_t want) -> std::uint32_t {
+        std::uint32_t freed = 0;
+        for (std::uint32_t index = 0; index < continuation_capacity && freed < want; ++index) {
+            if (continuation_slots[index].role == ContinuationSlotRole::Free) { continue; }
+            const SequenceState& other = continuation_states[index];
+            if (!other.kv) { continue; }
+            if (backend) {
+                if (!other.kv->backend) { continue; }
+                freed += addresses.spill_inactive_pages(*other.kv->backend, want - freed, spill_pages);
+            } else {
+                freed += addresses.spill_inactive_pages(other.kv->text, want - freed, spill_pages);
+            }
+        }
+        return freed;
+    };
+
+    (void)addresses.grow_with_ring(
+        address, tokens, window, [&](std::uint32_t page) { return ring_page_relevance(page); },
+        spill_pages, reclaim_from_cached_owners, device.stream);
+}
+
+// KVMem ring retrieval: the lexical query window. The reference project's own measurement is that
+// a NARROW tail wins -- at its pool 4000 multi-needle fixture a 64-token window scored 6/6 while a
+// 256-token one scored 2/6, because the wider window is mostly filler plus the previous turn's
+// answer. So the window is fixed at 64 tokens rather than tunable.
+void ProgramImplCore::set_ring_query(std::span<const TokenId> prompt_tokens) {
+    constexpr std::size_t kQueryTailTokens = 64;
+    ring_query_.clear();
+    ring_query_idf_.clear();
+    ring_tokens_.clear();
+    ring_query_pages_ = 0;
+    if (prompt_tokens.empty()) { return; }
+    ring_tokens_.assign(prompt_tokens.begin(), prompt_tokens.end());
+    const std::size_t begin = prompt_tokens.size() > kQueryTailTokens
+                                  ? prompt_tokens.size() - kQueryTailTokens
+                                  : 0;
+    ring_query_.assign(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(begin),
+                       prompt_tokens.end());
+    const std::uint32_t page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
+    ring_query_pages_ = 1U + (static_cast<std::uint32_t>(prompt_tokens.size()) - 1U) / page_tokens;
+    for (const TokenId token : ring_query_) {
+        const bool seen = std::any_of(ring_query_idf_.begin(), ring_query_idf_.end(),
+                                      [token](const auto& item) { return item.first == token; });
+        if (seen) { continue; }
+        std::uint32_t document_frequency = 0;
+        for (std::uint32_t page = 0; page < ring_query_pages_; ++page) {
+            const std::size_t lo = static_cast<std::size_t>(page) * page_tokens;
+            const std::size_t hi = std::min<std::size_t>(lo + page_tokens, prompt_tokens.size());
+            if (std::find(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(lo),
+                          prompt_tokens.begin() + static_cast<std::ptrdiff_t>(hi),
+                          token) != prompt_tokens.begin() + static_cast<std::ptrdiff_t>(hi)) {
+                ++document_frequency;
+            }
+        }
+        ring_query_idf_.emplace_back(token, document_frequency);
+    }
+}
+
+double ProgramImplCore::ring_page_relevance(std::uint32_t page) const noexcept {
+    // NINFER_KV_RETRIEVE=0 is the negative control: with no relevance every page ties and the ring
+    // falls back to oldest-first eviction. Without a way to switch it off, "relevance-aware
+    // retrieval" and "spill the oldest" are indistinguishable from the outside -- which is how a
+    // retrieval feature ships doing nothing at all.
+    const char* retrieve = std::getenv("NINFER_KV_RETRIEVE");
+    if (retrieve != nullptr && retrieve[0] == '0' && retrieve[1] == '\0') { return 0.0; }
+    if (ring_query_pages_ == 0 || ring_query_idf_.empty()) { return 0.0; }
+    const auto& ledger = ring_tokens_;
+    const std::uint32_t page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::size_t lo = static_cast<std::size_t>(page) * page_tokens;
+    if (lo >= ledger.size()) { return 0.0; }
+    const std::size_t hi = std::min<std::size_t>(lo + page_tokens, ledger.size());
+    double score = 0.0;
+    for (const auto& [token, document_frequency] : ring_query_idf_) {
+        if (document_frequency == 0) { continue; }
+        if (std::find(ledger.begin() + static_cast<std::ptrdiff_t>(lo),
+                      ledger.begin() + static_cast<std::ptrdiff_t>(hi),
+                      token) == ledger.begin() + static_cast<std::ptrdiff_t>(hi)) {
+            continue;
+        }
+        score += std::log(1.0 + static_cast<double>(ring_query_pages_) /
+                                    static_cast<double>(document_frequency));
+    }
+    return score;
+}
+
+void ProgramImplCore::install_residency_mask(const SequenceState& sequence) {
+    if (!sequence.kv) { return; }
+    const std::uint32_t logical =
+        decoder->text_kv.execution_tables().logical_page_capacity();
+    const std::size_t words = (static_cast<std::size_t>(logical) + 31U) / 32U;
+    if (residency_mask_.size() < words) { residency_mask_.assign(words, 0U); }
+    std::fill(residency_mask_.begin(), residency_mask_.begin() + static_cast<std::ptrdiff_t>(words),
+              0U);
+    const std::uint32_t mapped = text_kv_addresses->mapped_pages(sequence.kv->text);
+    for (std::uint32_t page = 0; page < mapped && page < logical; ++page) {
+        const LogicalKVPageHandle logical_page =
+            text_kv_addresses->logical_page(sequence.kv->text, page);
+        if (text_kv_pages->device_resident(logical_page)) {
+            residency_mask_[page >> 5] |= 1U << (page & 31U);
+        }
+    }
+    decoder->text_kv.install_selection(
+        std::span<const std::uint32_t>(residency_mask_.data(), words));
 }
 
 void ProgramImplCore::commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
@@ -11005,6 +11293,24 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& seq
         throw std::logic_error("sequence has no active KV execution mapping");
     }
     return decoder->text_kv.execution_view(text_kv_addresses->execution_row(sequence.kv->text));
+}
+
+// NINFER_KV_MASK_CONTROL=prefill | decode | both installs an ALL-ZERO selection before that phase.
+// An all-zero mask attends no key at all, so every attention output collapses and the completion
+// changes beyond recognition. That is the red result. The control exists because the mask's failure
+// mode is silence: if the pointer never reaches a kernel, nothing errors and the run looks normal --
+// right up until a demoted page's recycled Device slot is read as if it were still that page. So a
+// completion that is UNCHANGED under this control means that phase's kernel is not honouring the
+// mask, and the ring must not demote anything until it does.
+void ProgramImplCore::apply_kv_mask_control(bool prefill) const {
+    const char* mode = std::getenv("NINFER_KV_MASK_CONTROL");
+    if (mode == nullptr || mode[0] == '\0' || !runtime::kv_ring_requested()) { return; }
+    if ((mode[0] == 'p' && !prefill) || (mode[0] == 'd' && prefill)) { return; }
+    const std::uint32_t pages = decoder->text_kv.execution_tables().logical_page_capacity();
+    const std::size_t words   = (static_cast<std::size_t>(pages) + 31U) / 32U;
+    if (mask_control_words_.size() < words) { mask_control_words_.assign(words, 0U); }
+    decoder->text_kv.install_selection(
+        std::span<const std::uint32_t>(mask_control_words_.data(), words));
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
@@ -11607,6 +11913,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             };
         }
         StateImageSelectors selectors = state_selectors(sequence);
+        apply_kv_mask_control(true);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
         if (staged.next_capture < staged.capture_groups.size()) {
@@ -11662,6 +11969,16 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         if (staged.cursor < staged.prompt_tokens) {
             const std::uint32_t nominal =
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // KVMem ring: the chunk about to run writes tokens [cursor, cursor+nominal), so their
+            // pages must exist before it starts. Growing here instead of once up front is what lets
+            // the ring spill pages the earlier chunks have already committed.
+            if (runtime::kv_ring_requested()) {
+                // The whole prompt is in hand here, so the query window is known before the first
+                // spill -- which is what lets the ring keep the pages the query needs.
+                set_ring_query(staged.prompt.token_ids);
+                ensure_sequence_kv_mapped(sequence, staged.cursor + nominal,
+                                          backend_kv_cache() ? staged.cursor + nominal : 0U);
+            }
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
@@ -11875,6 +12192,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
+    apply_kv_mask_control(false);
     if (speculative_backend != SpeculativeBackend::None) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
     }
@@ -12008,6 +12326,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     nvtx::ScopedRange round_range(nvtx::Name::DecodeMtpRound, nvtx::Category::Mtp,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
+    apply_kv_mask_control(false);
     if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
         decoder->mtp_cache() == nullptr) {
         throw std::logic_error("MTP batch execution requires the MTP backend");
@@ -12259,6 +12578,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     nvtx::ScopedRange round_range(nvtx::Name::DecodeDFlashRound, nvtx::Category::DFlash,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
+    apply_kv_mask_control(false);
     if (!is_masked_draft_backend(speculative_backend) || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
     }
