@@ -25,6 +25,7 @@
 //   DeviceKVPagePool::resize_reservation (core/paged_kv_cache.cpp). That failure is the next
 //   step's work, not a regression -- with the ring OFF nothing here is reachable.
 
+#include <cstdint>
 #include <cstdlib>
 
 namespace ninfer::runtime {
@@ -33,6 +34,29 @@ namespace ninfer::runtime {
     const char* text = std::getenv("NINFER_KV_WINDOW");
     if (text == nullptr || text[0] == '\0') { return false; }
     return std::strtol(text, nullptr, 10) > 0;
+}
+
+// The head of the context that the ring may NEVER demote: the attention sink.
+//
+// MEASURED FAILURE THIS ADDRESSES. A ~37.5k context served with a 16,384-token window, asked
+// "继续" (an empty continuation query with no lexical overlap with anything), degenerated into
+// 400 tokens of the single phrase `"继续。" and ` repeated 76 times. The SAME prompt with the
+// context fully resident produced coherent reasoning. The cause is not the window size by itself:
+// retention is lexical, so a query with no signal retains nothing, and once the first tokens --
+// the task statement -- are demoted too, the model has no anchor left at all and collapses.
+// With a lexically RICH query the same window recalled a needle from the start of the prompt, so
+// this is specifically the lexically-empty case.
+//
+// StreamingLLM reaches the same conclusion for sliding windows: keeping a few initial tokens as
+// attention sinks is what stops the model from collapsing once the context outgrows the window.
+// Four pages is 256 tokens: enough to hold a task statement, and ~8 MiB of a ~1.7 GiB pool.
+// NINFER_KV_SINK_TOKENS overrides it; 0 restores the previous behaviour (spill the head too).
+[[nodiscard]] inline std::uint32_t kv_ring_sink_tokens() noexcept {
+    constexpr std::uint32_t kDefaultSinkTokens = 256;
+    const char* text = std::getenv("NINFER_KV_SINK_TOKENS");
+    if (text == nullptr || text[0] == '\0') { return kDefaultSinkTokens; }
+    const long value = std::strtol(text, nullptr, 10);
+    return value > 0 ? static_cast<std::uint32_t>(value) : 0U;
 }
 
 } // namespace ninfer::runtime

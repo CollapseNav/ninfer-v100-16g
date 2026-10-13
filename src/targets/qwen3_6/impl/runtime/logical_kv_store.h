@@ -1614,9 +1614,17 @@ public:
         const std::uint32_t mapped  = address.page_count;
         const std::uint32_t keep_from = mapped > window_pages ? mapped - window_pages : 0;
         if (keep_from == 0) { return 0; }
+        // The head of the context is the attention sink and is never a spill candidate. See
+        // kv_ring_sink_tokens() for the measured collapse this prevents: without an anchor the model
+        // has nothing to continue from, and a lexically-empty query like "继续" degenerates into a
+        // repetition loop once the head is demoted along with everything else outside the window.
+        const std::uint32_t sink_pages =
+            (runtime::kv_ring_sink_tokens() + kPagedKVPageSize - 1U) /
+            static_cast<std::uint32_t>(kPagedKVPageSize);
         std::vector<std::pair<double, std::uint32_t>> ranked;
         ranked.reserve(keep_from);
         for (std::uint32_t offset = 0; offset < keep_from; ++offset) {
+            if (offset < sink_pages) { continue; }
             const LogicalKVPageHandle page = membership(address, offset);
             if (!pages_->valid(page) || !pages_->device_resident(page)) { continue; }
             // Only a FULLY committed page may leave. A partially committed page's coverage is the
