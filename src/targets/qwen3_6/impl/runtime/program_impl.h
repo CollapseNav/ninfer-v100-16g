@@ -5075,16 +5075,23 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
                 }
             }
             const std::size_t to_restore = missing_pages.size() - first_restore;
-            // HOLDING POSITION. Adopting a checkpoint with pages still on the Host tier needs the
-            // Device pages of the outgoing sequence released FIRST; today the adoption happens while
-            // the pool is still full, and letting it through aborts the process
-            // ("KV activation reservation is stale" escaping a noexcept frame, exit 139). Refuse with
-            // a capacity failure until the release-before-adoption ordering is fixed -- a clean error
-            // beats an abort. This guard is expected to be REMOVED by that fix, not kept forever.
-            // TEMPORARY (round 12 diagnosis): adoption is allowed through so the real failure prints.
             if (source_reservation) {
-                pages.physical_pool().resize_reservation(reservation,
-                                                         static_cast<std::uint32_t>(to_restore));
+                // KVMem ring: the reservation must cover the whole LOGICAL membership, not just the
+                // pages being restored to the Device. Under a logical reservation a mapped page does
+                // not need a Device replica -- the unrestored ones simply stay on the Host tier --
+                // but the address's page_count DOES have to reach the checkpoint's frontier, because
+                // commit_frontier rejects a frontier beyond the mapped pages.
+                //
+                // Resizing to `to_restore` left page_count at the restored count while the adopted
+                // frontier needed more, and the commit that follows the adoption threw
+                // "KV committed frontier is invalid". That is a logic_error, so it is fatal by
+                // design: measured on a real agent session as
+                //   [ring] restore: missing=360 room=264 -> newest 264 only
+                //   ERROR req#11 failed during generation | HTTP 500
+                // followed by HTTP 503 on everything after it.
+                const std::uint32_t reserve_pages =
+                    runtime::kv_ring_requested() ? mapped : static_cast<std::uint32_t>(to_restore);
+                pages.physical_pool().resize_reservation(reservation, reserve_pages);
             }
             for (std::size_t index = first_restore; index < missing_pages.size(); ++index) {
                 const LogicalKVPageHandle logical =
