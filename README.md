@@ -92,7 +92,7 @@ docker run -d --name ninfer-serve --restart unless-stopped \
 | `--host-kv-mib` | Host-tier KV arena (the demotion target) | 262,144 tokens needs ~8.9 GiB of Host KV; `12288` fits it. The upstream default is 8192 |
 | `--kv-dtype int8` | KV storage format | `fp8` is −65..90% on both phases (Volta has no fp8 path). **KVMem requires `int8`** — it is the only storage whose Volta attention kernels honour the retrieval mask; other values are refused at startup |
 | `--prefill-chunk` | tokens per prefill step | Larger is faster (+26% going 768 → 3072 on swift15) but costs workspace VRAM; `512` keeps a 262K context startable |
-| `--max-concurrency 1` | simultaneous requests | **KVMem supports one sequence.** A second concurrent request is refused |
+| `--max-concurrency N` | simultaneous requests | `1`..`8`. Every lane keeps its own resident window, so the pool must hold `N × (window + prefill-chunk + sink) + 8` pages — the startup error prints the minimum. `2` measured: two cold 40K prompts, both answered correctly |
 | `--draft-tokens 3` | MTP speculative window | +11.6% @16K and +12.2% @128K against the shipped 2, and the peak on both prose and agent-shaped traffic |
 | *(absent)* `--lm-head-draft` | LM-head draft head | Adding it collapses acceptance to 1.00 — decode 92.4 → 33.5 (−64%) |
 | *(absent)* `--no-thinking` | forces non-thinking mode | Worth +17.4% decode, but rejected on output quality |
@@ -139,7 +139,11 @@ Same prompt, same chunk, 128K context, `swift15_iq2xs_mtp.ninfer`:
 
 ### Limits
 
-- **One sequence.** `--max-concurrency 1`. The ring cannot reclaim another lane's device pages.
+- **Multi-lane is budget-partitioned.** With `--max-concurrency N` each lane holds at most
+  `pool / N` Device pages (window + chunk + sink at minimum); a lane never grows past that and
+  spills its own pages, so lanes cannot starve each other. Retention scoring and the attention mask
+  are per lane. **Prefill is still serialized** (the engine runs one chunked prefill at a time):
+  a second long prompt waits for the first to finish prefill, then both decode together.
 - **INT8 KV only.** Other storages are refused at startup.
 - **Retention, not recall.** A relevant page is *kept resident*, so a single-turn long prompt whose
   question comes last works. In a *multi-turn* conversation, a page that only a later turn makes
@@ -147,6 +151,25 @@ Same prompt, same chunk, 128K context, `swift15_iq2xs_mtp.ninfer`:
 - **Prefill slows with depth**, as one would expect: ~680 tok/s at 32K, ~460 tok/s at 128K.
 - **No quality measurement yet.** Every number above is throughput. No perplexity has been run, so how
   small the resident window can go before output quality degrades is an open question.
+
+### Multi-lane measured *(this fork)*
+
+`coder390`, `NINFER_KV_WINDOW=16384`, `--max-concurrency 2`, pool 544 pages (`--kv-capacity 34816`),
+two cold 40K-token prompts with different needles, sent concurrently:
+
+| | lane 1 | lane 2 |
+|---|---:|---:|
+| prefill | 655 tok/s | 668 tok/s |
+| decode | 77 tok/s | 77 tok/s |
+| answer | own needle ✅ | own needle ✅ |
+
+Prefill is serialized (lane 2's TTFT includes the wait: ~61 s queue), decode overlaps. Five cold
+pairs — ten concurrent requests with different needles — all answered with their own needle, and a
+cached repeat restored its checkpoint in 1 s. Single-lane profiles are unchanged
+(`ring_lane_budget_pages` returns the whole pool when N = 1): the 77K needle still answers correctly
+at 574 tok/s prefill / 62 tok/s decode. CUDA graphs stay enabled; the per-lane mask matrix is
+allocated at construction so a captured decode graph bakes a stable pointer, not the nullptr it
+would have captured from a lazily allocated mask (that nullptr is what mixed two prompts' K/V).
 
 ---
 
