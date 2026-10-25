@@ -1521,46 +1521,68 @@ public:
     // header and cannot be named here.
     template <class ScoreFn, class SpillFn, class ReclaimFn>
     std::uint32_t grow_with_ring(KVAddressSpaceHandle handle, std::uint32_t tokens,
-                                 std::uint32_t window_pages, ScoreFn&& score, SpillFn&& spill,
-                                 ReclaimFn&& reclaim, cudaStream_t stream = nullptr) {
+                                 std::uint32_t window_pages, std::uint32_t budget_pages,
+                                 ScoreFn&& score, SpillFn&& spill, ReclaimFn&& reclaim,
+                                 cudaStream_t stream = nullptr) {
         Address& address = require_active(handle);
         const std::uint32_t target = pages_for_tokens(tokens);
         if (target > entitlement(address)) {
             throw std::invalid_argument("KV ring growth exceeds the active entitlement");
         }
-        std::uint32_t spilled = 0;
+        // Residency this address space holds on the Device right now. Under the ring a mapped page
+        // does not have to be resident, so `page_count` is the mapping, not the footprint.
+        std::uint32_t resident = 0;
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (pages_->valid(logical) && pages_->device_resident(logical)) { ++resident; }
+        }
+        std::uint32_t spilled          = 0;
         while (address.page_count < target) {
+            const std::uint32_t remaining = target - address.page_count;
             const std::uint32_t room =
                 pages_->physical_pool().capacity_pages() - pages_->physical_pool().allocated_pages();
-            if (room == 0) {
-                const std::uint32_t want = target - address.page_count;
-                std::uint32_t freed =
-                    spill_least_relevant_pages(handle, window_pages, want, score, spill);
-                if (freed == 0) {
-                    // Nothing of our OWN to give up: `keep_from` is `mapped - window`, so a sequence
-                    // shorter than the window has no candidate at all. The room is held by a CACHED
-                    // continuation from an earlier request, so reclaim from there.
-                    freed = reclaim(want);
-                    std::fprintf(stderr,
-                                 "[ring] grow: own pages exhausted (mapped=%u window=%u want=%u), "
-                                 "reclaimed %u from other owners\n",
-                                 address.page_count, window_pages, want, freed);
-                }
-                std::fprintf(stderr,
-                             "[ring] grow: mapped=%u target=%u window=%u room=0 spilled=%u\n",
-                             address.page_count, target, window_pages, freed);
-                if (freed == 0) {
-                    // Nothing left outside the window: the resident window itself does not fit the
-                    // pool. That is a capacity failure, not an invariant violation.
-                    throw std::bad_alloc();
-                }
-                spilled += freed;
+            // A lane may only hold `budget_pages` on the Device. Without this the ring grows until
+            // the whole POOL is allocated -- it only spills when the pool is out of room -- so one
+            // long sequence in a two-lane pool consumed every page and the other lane could not map
+            // its first chunk ("[ring] grow: own pages exhausted (mapped=0 ...), reclaimed 0").
+            std::uint32_t step = std::min(remaining, room);
+            step = budget_pages > resident ? std::min(step, budget_pages - resident) : 0U;
+            if (step != 0) {
+                const std::uint32_t mapped = address.page_count;
+                ensure_mapped_to_tokens(
+                    handle, (mapped + step) * static_cast<std::uint32_t>(kPagedKVPageSize), stream);
+                resident += step;
                 continue;
             }
-            const std::uint32_t mapped = address.page_count;
-            const std::uint32_t step   = std::min(target - mapped, room);
-            ensure_mapped_to_tokens(
-                handle, (mapped + step) * static_cast<std::uint32_t>(kPagedKVPageSize), stream);
+            // At this lane's budget, or the pool is full: demote the least relevant of this lane's
+            // own pages OUTSIDE its protected tail to make room for more. The tail stays `window`
+            // pages -- the budget only caps TOTAL residency, so the candidates are the pages older
+            // than the newest window, not the pages older than the budget.
+            const std::uint32_t want  = std::min(remaining, std::uint32_t{16});
+            std::uint32_t freed       = spill_least_relevant_pages(handle, window_pages, want, score, spill);
+            if (freed == 0) {
+                // Nothing of our OWN to give up: a sequence shorter than the protected tail has no
+                // candidate at all. The room is held by a CACHED continuation from an earlier
+                // request, so reclaim from there.
+                freed = reclaim(want);
+                std::fprintf(stderr,
+                             "[ring] grow: own pages exhausted (mapped=%u window=%u want=%u), "
+                             "reclaimed %u from other owners\n",
+                             address.page_count, window_pages, want, freed);
+            }
+            if (freed == 0) {
+                std::fprintf(stderr,
+                             "[ring] grow: mapped=%u target=%u window=%u budget=%u resident=%u "
+                             "spilled=%u allocated=%u capacity=%u\n",
+                             address.page_count, target, window_pages, budget_pages, resident,
+                             spilled, pages_->physical_pool().allocated_pages(),
+                             pages_->physical_pool().capacity_pages());
+                // Nothing left outside the protected tail: the tail itself does not fit the pool.
+                // That is a capacity failure, not an invariant violation.
+                throw std::bad_alloc();
+            }
+            resident -= std::min(resident, freed);
+            spilled += freed;
         }
         return spilled;
     }

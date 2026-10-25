@@ -748,17 +748,35 @@ private:
     // KVMem ring retrieval: the lexical query window (the prompt's last tokens) and the per-token
     // document frequency that weights it. A page scores as the summed IDF of the query tokens it
     // contains, so a rare match (a code, a name, an error string) dominates ordinary function words.
-    mutable std::vector<TokenId> ring_tokens_;  // the prompt, kept for page scoring
-    mutable std::vector<TokenId> ring_query_;
-    mutable std::vector<std::pair<TokenId, std::uint32_t>> ring_query_idf_;  // distinct (token, df)
-    mutable std::uint32_t ring_query_pages_ = 0;
+    //
+    // ONE PER ADDRESS SPACE (i.e. one per lane). With --max-concurrency 1 a single engine-global
+    // query was enough, but with N lanes the last lane to stage a prefill would own the scorer for
+    // everybody: lane A's eviction decisions would then be ranked by lane B's prompt and it would
+    // keep B's pages and drop its own. The address-space handle is unique per sequence and is never
+    // reused for a different one, so it is the key; past max_concurrency slots the least recently
+    // staged entry is evicted (a finished turn's handle can never be staged again).
+    struct RingQuery {
+        KVAddressSpaceHandle address{};
+        std::vector<TokenId> tokens;                                        // the prompt
+        std::vector<TokenId> query;                                         // the tail that scores
+        std::vector<std::pair<TokenId, std::uint32_t>> idf;                 // distinct (token, df)
+        std::uint32_t pages = 0;
+        std::uint64_t stamp = 0;
+    };
+    mutable std::vector<RingQuery> ring_queries_;
+    mutable std::uint64_t ring_query_stamp_ = 0;
+
+    // The slot belonging to `address`, created (or LRU-evicted) on demand.
+    [[nodiscard]] RingQuery& ring_query_slot(KVAddressSpaceHandle address) const;
 
     // Build the query window and its document frequencies from a prompt. Cheap enough to call once
     // per prefill: O(query * pages * page_size) with a 64-token query.
-    void set_ring_query(std::span<const TokenId> prompt_tokens);
+    void set_ring_query(KVAddressSpaceHandle address, std::span<const TokenId> prompt_tokens);
 
-    // Relevance of logical page `page` to the query window. 0 when no query token occurs in it.
-    [[nodiscard]] double ring_page_relevance(std::uint32_t page) const noexcept;
+    // Relevance of logical page `page` to `address`'s query window. 0 when no query token occurs in
+    // it (and when that address has no query staged yet).
+    [[nodiscard]] double ring_page_relevance(KVAddressSpaceHandle address,
+                                             std::uint32_t page) const noexcept;
 
     // KVMem ring: resident window in pages, from NINFER_KV_WINDOW (0 = the whole context).
     [[nodiscard]] std::uint32_t ring_window_pages() const noexcept;

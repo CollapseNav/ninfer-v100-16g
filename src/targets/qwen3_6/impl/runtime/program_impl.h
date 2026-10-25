@@ -6859,15 +6859,17 @@ ProgramImplCore::owner_exclusive_resources(const SequenceState& sequence) const 
                     throw std::logic_error("owner active KV entitlement is inconsistent");
                 }
                 std::uint32_t growth = entitlement - mapped;
-                // KVMem ring: the un-materialized growth is a LOGICAL promise, but the ring only
-                // ever materializes up to the pool -- the rest stays on the Host tier. Counting the
-                // whole growth as Device pages makes an active ring sequence report more Device
-                // pages than the pool can hold, and the admission check that compares this against
-                // the plan then fails on a state that is working exactly as designed.
+                // KVMem ring: the un-materialized growth is a LOGICAL promise, but a ring sequence
+                // only ever holds ONE LANE's budget on the Device; the rest stays on the Host tier.
+                // Capping the growth at the pool instead made one long sequence report the whole
+                // pool as its Device footprint, so with --max-concurrency 2 the second lane looked
+                // un-admittable and sat in the queue until it expired. The bound is the same one the
+                // plan states and grow_with_ring() enforces.
                 if (runtime::kv_ring_requested()) {
-                    const std::uint32_t capacity  = pages.physical_pool().capacity_pages();
+                    const std::uint32_t lane_bound = ring_lane_budget_pages(
+                        pages.physical_pool().capacity_pages(), max_concurrency);
                     const std::uint32_t free_room =
-                        capacity > device_pages ? capacity - device_pages : 0U;
+                        lane_bound > device_pages ? lane_bound - device_pages : 0U;
                     growth = std::min(growth, free_room);
                 }
                 if (growth > std::numeric_limits<std::uint32_t>::max() - device_pages) {
@@ -11151,70 +11153,115 @@ void ProgramImplCore::ring_grow(KVAddressSpaceStore& addresses, LogicalKVPageSto
         return freed;
     };
 
+    // Each lane may hold `budget` Device pages: the whole pool for one lane (the pre-multi-lane
+    // behaviour), an equal share for N. Without the budget the ring grows until the pool is
+    // exhausted -- it only spills when there is no room -- so one long sequence starves every other
+    // lane of the same pool.
+    const std::uint32_t budget =
+        ring_lane_budget_pages(pages.physical_pool().capacity_pages(), max_concurrency);
     (void)addresses.grow_with_ring(
-        address, tokens, window, [&](std::uint32_t page) { return ring_page_relevance(page); },
-        spill_pages, reclaim_from_cached_owners, device.stream);
+        address, tokens, window, budget,
+        [&](std::uint32_t page) { return ring_page_relevance(address, page); }, spill_pages,
+        reclaim_from_cached_owners, device.stream);
 }
 
 // KVMem ring retrieval: the lexical query window. The reference project's own measurement is that
 // a NARROW tail wins -- at its pool 4000 multi-needle fixture a 64-token window scored 6/6 while a
 // 256-token one scored 2/6, because the wider window is mostly filler plus the previous turn's
 // answer. So the window is fixed at 64 tokens rather than tunable.
-void ProgramImplCore::set_ring_query(std::span<const TokenId> prompt_tokens) {
+ProgramImplCore::RingQuery&
+ProgramImplCore::ring_query_slot(KVAddressSpaceHandle address) const {
+    for (RingQuery& slot : ring_queries_) {
+        if (slot.address == address) { return slot; }
+    }
+    const std::size_t lanes =
+        static_cast<std::size_t>(std::max<std::uint32_t>(max_concurrency, 1U));
+    if (ring_queries_.size() < lanes) {
+        ring_queries_.emplace_back();
+        ring_queries_.back().address = address;
+        return ring_queries_.back();
+    }
+    // Every lane already has a slot and none of them is this address: the sequence behind this
+    // handle never staged a prefill under a live lane (it was admitted after a previous lane's turn
+    // finished). Recycle the least recently staged entry -- that handle cannot be staged again.
+    auto oldest = std::min_element(ring_queries_.begin(), ring_queries_.end(),
+                                   [](const RingQuery& left, const RingQuery& right) {
+                                       return left.stamp < right.stamp;
+                                   });
+    *oldest = RingQuery{};
+    oldest->address = address;
+    return *oldest;
+}
+
+void ProgramImplCore::set_ring_query(KVAddressSpaceHandle address,
+                                     std::span<const TokenId> prompt_tokens) {
     constexpr std::size_t kQueryTailTokens = 64;
-    ring_query_.clear();
-    ring_query_idf_.clear();
-    ring_tokens_.clear();
-    ring_query_pages_ = 0;
+    RingQuery& slot = ring_query_slot(address);
+    slot.stamp = ++ring_query_stamp_;
+    slot.query.clear();
+    slot.idf.clear();
+    slot.tokens.clear();
+    slot.pages = 0;
     if (prompt_tokens.empty()) { return; }
-    ring_tokens_.assign(prompt_tokens.begin(), prompt_tokens.end());
+    slot.tokens.assign(prompt_tokens.begin(), prompt_tokens.end());
     const std::size_t begin = prompt_tokens.size() > kQueryTailTokens
                                   ? prompt_tokens.size() - kQueryTailTokens
                                   : 0;
-    ring_query_.assign(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(begin),
-                       prompt_tokens.end());
+    slot.query.assign(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(begin),
+                      prompt_tokens.end());
     const std::uint32_t page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
-    ring_query_pages_ = 1U + (static_cast<std::uint32_t>(prompt_tokens.size()) - 1U) / page_tokens;
-    for (const TokenId token : ring_query_) {
-        const bool seen = std::any_of(ring_query_idf_.begin(), ring_query_idf_.end(),
+    slot.pages = 1U + (static_cast<std::uint32_t>(prompt_tokens.size()) - 1U) / page_tokens;
+    for (const TokenId token : slot.query) {
+        const bool seen = std::any_of(slot.idf.begin(), slot.idf.end(),
                                       [token](const auto& item) { return item.first == token; });
         if (seen) { continue; }
         std::uint32_t document_frequency = 0;
-        for (std::uint32_t page = 0; page < ring_query_pages_; ++page) {
+        for (std::uint32_t page = 0; page < slot.pages; ++page) {
             const std::size_t lo = static_cast<std::size_t>(page) * page_tokens;
-            const std::size_t hi = std::min<std::size_t>(lo + page_tokens, prompt_tokens.size());
+            const std::size_t hi = std::min<std::size_t>(static_cast<std::size_t>(page + 1U) * page_tokens,
+                                                         prompt_tokens.size());
             if (std::find(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(lo),
                           prompt_tokens.begin() + static_cast<std::ptrdiff_t>(hi),
                           token) != prompt_tokens.begin() + static_cast<std::ptrdiff_t>(hi)) {
                 ++document_frequency;
             }
         }
-        ring_query_idf_.emplace_back(token, document_frequency);
+        slot.idf.emplace_back(token, document_frequency);
     }
 }
 
-double ProgramImplCore::ring_page_relevance(std::uint32_t page) const noexcept {
+double ProgramImplCore::ring_page_relevance(KVAddressSpaceHandle address,
+                                            std::uint32_t page) const noexcept {
     // NINFER_KV_RETRIEVE=0 is the negative control: with no relevance every page ties and the ring
     // falls back to oldest-first eviction. Without a way to switch it off, "relevance-aware
     // retrieval" and "spill the oldest" are indistinguishable from the outside -- which is how a
     // retrieval feature ships doing nothing at all.
     const char* retrieve = std::getenv("NINFER_KV_RETRIEVE");
     if (retrieve != nullptr && retrieve[0] == '0' && retrieve[1] == '\0') { return 0.0; }
-    if (ring_query_pages_ == 0 || ring_query_idf_.empty()) { return 0.0; }
-    const auto& ledger = ring_tokens_;
+    const RingQuery* slot = nullptr;
+    for (const RingQuery& candidate : ring_queries_) {
+        if (candidate.address == address) {
+            slot = &candidate;
+            break;
+        }
+    }
+    // No staged query for this lane yet (the first chunk of its own prefill): every page ties, so
+    // the ring falls back to oldest-first until the query exists.
+    if (slot == nullptr || slot->pages == 0 || slot->idf.empty()) { return 0.0; }
+    const auto& ledger = slot->tokens;
     const std::uint32_t page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
     const std::size_t lo = static_cast<std::size_t>(page) * page_tokens;
     if (lo >= ledger.size()) { return 0.0; }
     const std::size_t hi = std::min<std::size_t>(lo + page_tokens, ledger.size());
     double score = 0.0;
-    for (const auto& [token, document_frequency] : ring_query_idf_) {
+    for (const auto& [token, document_frequency] : slot->idf) {
         if (document_frequency == 0) { continue; }
         if (std::find(ledger.begin() + static_cast<std::ptrdiff_t>(lo),
                       ledger.begin() + static_cast<std::ptrdiff_t>(hi),
                       token) == ledger.begin() + static_cast<std::ptrdiff_t>(hi)) {
             continue;
         }
-        score += std::log(1.0 + static_cast<double>(ring_query_pages_) /
+        score += std::log(1.0 + static_cast<double>(slot->pages) /
                                     static_cast<double>(document_frequency));
     }
     return score;
@@ -11236,8 +11283,38 @@ void ProgramImplCore::install_residency_mask(const SequenceState& sequence) {
             residency_mask_[page >> 5] |= 1U << (page & 31U);
         }
     }
+    // One mask row per lane: the sequence's execution row, so a lane decoding in the same batch as
+    // another never reads the other lane's residency (and never attends a Device slot the other lane
+    // recycled).
+    const std::int32_t row =
+        text_kv_addresses->execution_row(sequence.kv->text).row_index();
     decoder->text_kv.install_selection(
-        std::span<const std::uint32_t>(residency_mask_.data(), words));
+        std::span<const std::uint32_t>(residency_mask_.data(), words), row);
+
+    // The MTP/masked-draft cache is a SEPARATE pool that the ring also demotes from, so its
+    // attention needs its own mask row too. Without it the draft head attends whatever page now
+    // occupies a demoted slot -- i.e. another lane's K/V once two lanes share the pool.
+    if (sequence.kv->backend && decoder->mtp_cache() != nullptr) {
+        const std::uint32_t backend_logical =
+            decoder->mtp_cache()->execution_tables().logical_page_capacity();
+        const std::size_t backend_words = (static_cast<std::size_t>(backend_logical) + 31U) / 32U;
+        if (residency_mask_.size() < backend_words) { residency_mask_.assign(backend_words, 0U); }
+        std::fill(residency_mask_.begin(),
+                  residency_mask_.begin() + static_cast<std::ptrdiff_t>(backend_words), 0U);
+        const std::uint32_t backend_mapped =
+            backend_kv_addresses->mapped_pages(*sequence.kv->backend);
+        for (std::uint32_t page = 0; page < backend_mapped && page < backend_logical; ++page) {
+            const LogicalKVPageHandle logical_page =
+                backend_kv_addresses->logical_page(*sequence.kv->backend, page);
+            if (backend_kv_pages->device_resident(logical_page)) {
+                residency_mask_[page >> 5] |= 1U << (page & 31U);
+            }
+        }
+        const std::int32_t backend_row =
+            backend_kv_addresses->execution_row(*sequence.kv->backend).row_index();
+        decoder->mtp_cache()->install_selection(
+            std::span<const std::uint32_t>(residency_mask_.data(), backend_words), backend_row);
+    }
 }
 
 void ProgramImplCore::commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
@@ -11341,8 +11418,13 @@ void ProgramImplCore::apply_kv_mask_control(bool prefill) const {
     const std::uint32_t pages = decoder->text_kv.execution_tables().logical_page_capacity();
     const std::size_t words   = (static_cast<std::size_t>(pages) + 31U) / 32U;
     if (mask_control_words_.size() < words) { mask_control_words_.assign(words, 0U); }
-    decoder->text_kv.install_selection(
-        std::span<const std::uint32_t>(mask_control_words_.data(), words));
+    // The control is an all-zero mask for EVERY lane: a lane left with a real mask would keep
+    // attending and the negative control would silently pass.
+    const std::int32_t rows = decoder->text_kv.execution_tables().row_count();
+    for (std::int32_t row = 0; row < rows; ++row) {
+        decoder->text_kv.install_selection(
+            std::span<const std::uint32_t>(mask_control_words_.data(), words), row);
+    }
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
@@ -12006,8 +12088,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             // the ring spill pages the earlier chunks have already committed.
             if (runtime::kv_ring_requested()) {
                 // The whole prompt is in hand here, so the query window is known before the first
-                // spill -- which is what lets the ring keep the pages the query needs.
-                set_ring_query(staged.prompt.token_ids);
+                // spill -- which is what lets the ring keep the pages the query needs. Keyed by this
+                // sequence's address space: with several lanes active, an engine-global query would
+                // be overwritten by whichever lane staged last.
+                set_ring_query(sequence.kv->text, staged.prompt.token_ids);
                 ensure_sequence_kv_mapped(sequence, staged.cursor + nominal,
                                           backend_kv_cache() ? staged.cursor + nominal : 0U);
             }

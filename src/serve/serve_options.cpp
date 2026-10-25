@@ -350,11 +350,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
     }
-    // The ring reclaims Device pages by demoting the pages of ONE sequence; it cannot reclaim
-    // another lane's. Refuse the combination loudly rather than serve it wrongly.
-    if (runtime::kv_ring_requested() && options.max_concurrency != 1) {
-        throw std::invalid_argument("NINFER_KV_WINDOW (KVMem ring) requires --max-concurrency 1");
-    }
+    // KVMem ring + multi-lane: every lane keeps its own resident window, so the DEVICE pool has to
+    // hold `concurrency * (window + prefill chunk) + slack` pages. minimum_main_page_groups()
+    // (layouts_impl.h) is where --kv-capacity is resolved against that requirement, so an
+    // undersized pool is rejected there with the number that would fit. No second gate here: the
+    // ring is per address space -- a lane spills only its own pages, and reclaim only ever takes
+    // INACTIVE cached continuations -- so lanes cannot demote each other.
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");
     }

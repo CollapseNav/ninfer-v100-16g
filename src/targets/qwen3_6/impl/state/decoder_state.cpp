@@ -90,42 +90,100 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
         static_cast<std::size_t>(layers_) * layer_storage_.planes_per_layer()) {
         throw std::invalid_argument("Paged KV layer plane inventory is inconsistent");
     }
+    // Allocate the per-lane mask matrix UP FRONT, filled with "attend every page". The decode CUDA
+    // graphs bake the mask POINTER into their kernel arguments at capture (warmup) time, so a mask
+    // allocated lazily on the first prefill would be invisible to every replayed graph: the kernels
+    // would run with the nullptr they captured and attend recycled Device slots. That is silent for
+    // one lane and mixes two prompts' K/V as soon as a second lane owns those slots. With the matrix
+    // present from construction, the graphs bake a stable base pointer and installing a mask is just
+    // a memcpy into it.
+    const std::size_t required =
+        (static_cast<std::size_t>(execution_tables_.logical_page_capacity()) + 31U) / 32U;
+    const std::int32_t rows = execution_tables_.row_count();
+    if (required != 0 && rows > 0) {
+        void* allocated = nullptr;
+        if (cudaMalloc(&allocated, static_cast<std::size_t>(rows) * required * sizeof(std::uint32_t)) !=
+            cudaSuccess) {
+            throw std::bad_alloc();
+        }
+        selection_device_ = static_cast<std::uint32_t*>(allocated);
+        selection_words_  = required;
+        if (cudaMemset(selection_device_, 0xFF,
+                       static_cast<std::size_t>(rows) * required * sizeof(std::uint32_t)) !=
+            cudaSuccess) {
+            (void)cudaFree(selection_device_);
+            selection_device_ = nullptr;
+            selection_words_  = 0;
+            throw std::runtime_error("KV selection mask allocation failed");
+        }
+    }
 }
 
 PagedKVCache::~PagedKVCache() {
     if (selection_device_ != nullptr) {
         (void)cudaFree(selection_device_);
         selection_device_ = nullptr;
-        selected_blocks_  = nullptr;
+        selection_words_  = 0;
     }
 }
 
-void PagedKVCache::install_selection(std::span<const std::uint32_t> words) {
+void PagedKVCache::install_selection(std::span<const std::uint32_t> words, std::int32_t row) {
     const std::uint32_t pages = execution_tables_.logical_page_capacity();
     const std::size_t required = (static_cast<std::size_t>(pages) + 31U) / 32U;
+    const std::int32_t rows    = execution_tables_.row_count();
+    if (row < 0 || row >= rows) {
+        throw std::out_of_range("KV selection row is outside the execution table");
+    }
     if (words.empty()) {
-        clear_selection();
+        // "No selection" is the all-ones row: attend every page.
+        if (selection_device_ != nullptr) {
+            std::vector<std::uint32_t> all_ones(required, 0xFFFFFFFFU);
+            (void)cudaMemcpy(selection_device_ + static_cast<std::size_t>(row) * selection_words_,
+                             all_ones.data(), required * sizeof(std::uint32_t),
+                             cudaMemcpyHostToDevice);
+        }
         return;
     }
     if (words.size() < required) {
         throw std::invalid_argument("KV selection mask does not cover the logical page capacity");
     }
-    if (selection_device_ == nullptr) {
-        void* allocated = nullptr;
-        if (cudaMalloc(&allocated, required * sizeof(std::uint32_t)) != cudaSuccess) {
-            throw std::bad_alloc();
-        }
-        selection_device_ = static_cast<std::uint32_t*>(allocated);
+    if (selection_device_ == nullptr || selection_words_ != required) {
+        throw std::logic_error("KV selection matrix was not allocated at construction");
     }
-    if (cudaMemcpy(selection_device_, words.data(), required * sizeof(std::uint32_t),
+    // One row per execution row: two lanes evict different pages, so their masks differ and neither
+    // may be applied to the other's block-table row.
+    const std::size_t offset = static_cast<std::size_t>(row) * selection_words_;
+    if (cudaMemcpy(selection_device_ + offset, words.data(), required * sizeof(std::uint32_t),
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         throw std::runtime_error("KV selection mask upload failed");
     }
-    selected_blocks_ = selection_device_;
 }
 
-PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
-    : cache_(&cache), block_table_(block_table) {}
+void PagedKVCache::clear_selection() noexcept {
+    if (selection_device_ == nullptr) { return; }
+    const std::int32_t rows = execution_tables_.row_count();
+    std::vector<std::uint32_t> all_ones(selection_words_, 0xFFFFFFFFU);
+    for (std::int32_t row = 0; row < rows; ++row) {
+        (void)cudaMemcpy(selection_device_ + static_cast<std::size_t>(row) * selection_words_,
+                         all_ones.data(), selection_words_ * sizeof(std::uint32_t),
+                         cudaMemcpyHostToDevice);
+    }
+}
+
+const std::uint32_t* PagedKVCache::selected_blocks(std::int32_t row) const noexcept {
+    if (selection_device_ == nullptr || row < 0 || row >= execution_tables_.row_count()) {
+        return nullptr;
+    }
+    return selection_device_ + static_cast<std::size_t>(row) * selection_words_;
+}
+
+std::int32_t PagedKVCache::selection_words() const noexcept {
+    return static_cast<std::int32_t>(selection_words_);
+}
+
+PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table,
+                                   const std::uint32_t* selected_blocks) noexcept
+    : cache_(&cache), block_table_(block_table), selected_blocks_(selected_blocks) {}
 
 std::uint32_t PagedKVCacheView::max_context() const noexcept {
     return cache_ == nullptr ? 0 : cache_->max_context();
@@ -133,17 +191,19 @@ std::uint32_t PagedKVCacheView::max_context() const noexcept {
 
 PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
     if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
-    return cache_->layer_view(layer, block_table_);
+    return cache_->layer_view(layer, block_table_, selected_blocks_);
 }
 
 PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) const {
     if (!row.belongs_to(execution_tables_)) {
         throw std::invalid_argument("Paged KV execution row belongs to another cache");
     }
-    return PagedKVCacheView(*this, execution_tables_.row(row.handle()));
+    return PagedKVCacheView(*this, execution_tables_.row(row.handle()),
+                            selected_blocks(row.row_index()));
 }
 
-PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
+PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table,
+                                          const std::uint32_t* selected_blocks) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
     const std::size_t stride        = layer_storage_.planes_per_layer();
     const std::size_t base          = static_cast<std::size_t>(layer) * stride;
@@ -156,7 +216,7 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .k_scale_pages   = layer_storage_.key.has_scale() ? pages_.plane(k_scale_index) : Tensor(),
         .v_scale_pages   = layer_storage_.value.has_scale() ? pages_.plane(v_scale_index) : Tensor(),
         .block_table     = block_table,
-        .selected_blocks = selected_blocks_,
+        .selected_blocks = selected_blocks,
         .head_dim        = layer_storage_.head_dim,
         .num_kv_heads    = kv_heads_,
         .storage         = layer_storage_.storage,
@@ -164,14 +224,17 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
 }
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
-    const PagedKVLayerView direct = layer_view(layer, Tensor());
+    const PagedKVLayerView direct = layer_view(layer, Tensor(), nullptr);
     return PagedKVBatchLayerView{
         .k_pages         = direct.k_pages,
         .v_pages         = direct.v_pages,
         .k_scale_pages   = direct.k_scale_pages,
         .v_scale_pages   = direct.v_scale_pages,
         .block_tables    = execution_tables_.matrix(),
-        .selected_blocks = selected_blocks_,
+        // Row-strided so each lane's kernel reads ITS OWN mask row: the two masks differ exactly
+        // where one lane demoted pages the other still needs.
+        .selected_blocks = selection_device_,
+        .selection_words = static_cast<std::int32_t>(selection_words_),
         .head_dim        = direct.head_dim,
         .num_kv_heads    = direct.num_kv_heads,
         .storage         = direct.storage,

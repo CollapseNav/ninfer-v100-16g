@@ -284,14 +284,28 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     // materialization produce what was planned?" check then fails on a state that is working exactly
     // as designed -- which is what broke reuse.
     const bool ring = runtime::kv_ring_requested();
+    // The Device expectation for a ring sequence is ONE LANE's budget, not the logical entitlement
+    // clamped to the pool. The logical count is what the sequence may MAP; everything past the
+    // budget lives on the Host tier. Planning the whole pool per sequence made a single long lane
+    // own it, so with --max-concurrency 2 the second request never became admissible ("inference
+    // request expired while waiting for admission"). grow_with_ring() enforces the same budget, and
+    // owner_exclusive_resources() caps the activated sequence at it, so plan, admission and the
+    // activation check agree.
+    const std::uint32_t ring_lane_pages =
+        ring ? ring_lane_budget_pages(decoder->text_kv.page_pool().capacity_pages(),
+                                      max_concurrency)
+             : 0U;
+    const std::uint32_t ring_backend_pages =
+        ring && decoder->mtp_cache() != nullptr
+            ? ring_lane_budget_pages(decoder->mtp_cache()->page_pool().capacity_pages(),
+                                     max_concurrency)
+            : 0U;
     const std::uint32_t device_main_pages =
-        ring ? std::min(base->text_kv_page_entitlement,
-                        decoder->text_kv.page_pool().capacity_pages())
+        ring ? std::min(base->text_kv_page_entitlement, ring_lane_pages)
              : base->text_kv_page_entitlement;
     const std::uint32_t device_backend_pages =
         ring && decoder->mtp_cache() != nullptr
-            ? std::min(base->backend_kv_page_entitlement,
-                       decoder->mtp_cache()->page_pool().capacity_pages())
+            ? std::min(base->backend_kv_page_entitlement, ring_backend_pages)
             : base->backend_kv_page_entitlement;
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,

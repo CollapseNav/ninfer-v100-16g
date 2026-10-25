@@ -243,7 +243,8 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 cache.block_tables.ne[0], invocation.width, invocation.full_width,
                 invocation.column_begin, logical_capacity, scale,
                 static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
-                static_cast<float*>(partial_l.data), cache.selected_blocks);
+                static_cast<float*>(partial_l.data), cache.selected_blocks,
+                cache.selection_words);
     };
     if constexpr (TokenTile == 6 && Geometry::GroupSize == 6) {
         // Below the 16K graph envelope the fifth-warp setup costs more than the tail pass it

@@ -84,8 +84,12 @@ std::uint32_t ring_resident_pages(std::uint32_t logical_pages, std::uint32_t pre
         window_tokens > 0 ? page_count(static_cast<std::uint32_t>(window_tokens)) : logical_pages;
     const std::uint32_t chunk_pages = page_count(prefill_chunk == 0 ? 1U : prefill_chunk);
     const std::uint64_t lanes       = concurrency == 0 ? 1U : concurrency;
+    // Per-lane residency is the window plus a chunk plus the sink -- the same bound the plan and the
+    // owner footprint use (ring_lane_resident_pages), so the pool this returns is exactly
+    // `lanes * lane_resident + slack` and admission can never admit a lane the pool cannot hold.
     const std::uint64_t per_lane =
-        std::min<std::uint64_t>(static_cast<std::uint64_t>(window_pages) + chunk_pages,
+        std::min<std::uint64_t>(static_cast<std::uint64_t>(
+                                    ring_lane_resident_pages(window_pages, chunk_pages)),
                                 logical_pages);
     const std::uint64_t demand = per_lane * lanes + kSlackPages;
     return static_cast<std::uint32_t>(

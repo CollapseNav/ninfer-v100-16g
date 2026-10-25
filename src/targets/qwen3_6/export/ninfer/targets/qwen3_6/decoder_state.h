@@ -50,10 +50,13 @@ public:
 
 private:
     friend class PagedKVCache;
-    PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept;
+    PagedKVCacheView(const PagedKVCache& cache, Tensor block_table,
+                     const std::uint32_t* selected_blocks) noexcept;
 
-    const PagedKVCache* cache_ = nullptr;
+    const PagedKVCache* cache_            = nullptr;
     Tensor block_table_;
+    // This sequence's row of the per-lane ring mask, or nullptr for "attend every page".
+    const std::uint32_t* selected_blocks_ = nullptr;
 };
 
 class PagedKVCache {
@@ -84,21 +87,27 @@ public:
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
-    // KVMem ring: install the per-logical-page attention mask that the attention kernels honour.
+    // KVMem ring: install the per-logical-page attention mask for ONE execution row (= one lane).
     // `words` holds one bit per logical page, bit p of word (p >> 5), and must cover
-    // execution_tables().logical_page_capacity() pages. Every view produced afterwards carries it.
-    // Passing an empty span is clear_selection(). A selection MUST be installed whenever a page can
-    // be demoted to the Host tier: the page's Device slot is recycled, so an unmasked read would
-    // attend to another page's K/V rather than merely degrade.
-    void install_selection(std::span<const std::uint32_t> words);
+    // execution_tables().logical_page_capacity() pages. A selection MUST be installed whenever a
+    // page can be demoted to the Host tier: the page's Device slot is recycled, so an unmasked read
+    // would attend to another page's K/V rather than merely degrade. The mask is per lane because
+    // two lanes evict different pages -- one shared mask either lets a lane read a recycled slot
+    // that now holds the other lane's K/V, or hides pages the lane still has resident.
+    void install_selection(std::span<const std::uint32_t> words, std::int32_t row);
 
-    void clear_selection() noexcept { selected_blocks_ = nullptr; }
+    void clear_selection() noexcept;
 
-    [[nodiscard]] const std::uint32_t* selected_blocks() const noexcept { return selected_blocks_; }
+    // Row `row`'s mask, or nullptr when that row has no selection installed.
+    [[nodiscard]] const std::uint32_t* selected_blocks(std::int32_t row) const noexcept;
+
+    // 32-bit words per mask row (the row stride of the matrix the batched kernels index).
+    [[nodiscard]] std::int32_t selection_words() const noexcept;
 
 private:
     friend class PagedKVCacheView;
-    [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
+    [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table,
+                                              const std::uint32_t* selected_blocks) const;
 
     DeviceKVPagePool pages_;
     KVExecutionTablePool execution_tables_;
@@ -106,9 +115,10 @@ private:
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;
     PagedKVStorageLayout layer_storage_;
-    // Owned Device copy of the selection mask, or nullptr for "attend every page".
+    // Owned Device copy of the per-lane selection masks (one row per execution row), and which rows
+    // currently have a mask installed. Empty/nullptr means every row attends every page.
     std::uint32_t* selection_device_ = nullptr;
-    const std::uint32_t* selected_blocks_ = nullptr;
+    std::size_t selection_words_     = 0;
 };
 
 struct DecoderStateLayout {

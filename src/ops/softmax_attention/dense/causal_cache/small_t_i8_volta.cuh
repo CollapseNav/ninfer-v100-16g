@@ -139,7 +139,7 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     float* partial_acc, float* partial_m, float* partial_l,
-    const std::uint32_t* selected_blocks) {
+    const std::uint32_t* selected_blocks, std::int32_t selection_words) {
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
     static_assert(WarpsPerCta == 4 || WarpsPerCta == 5);
 
@@ -218,6 +218,15 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
         input.v += static_cast<std::int64_t>(kCausalHeadDim) * Geometry::KVHeads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
+    // KVMem ring: one mask row per lane. A shared mask would let this lane attend a recycled Device
+    // slot that already holds ANOTHER lane's K/V -- measured as a blended answer that mixed two
+    // prompts' needles. The mask row is keyed by the sequence's EXECUTION ROW (the same `table_rows`
+    // index the block table uses), not by its batch slot: those differ as soon as lanes are recycled,
+    // and indexing by the batch slot hands each lane the other one's mask.
+    const std::uint32_t* selected =
+        (selected_blocks == nullptr || selection_words <= 0)
+            ? selected_blocks
+            : selected_blocks + static_cast<std::int64_t>(table_row) * selection_words;
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
@@ -563,7 +572,7 @@ __launch_bounds__(WarpsPerCta * 32, 3) __global__
                     const int qabs  = lo ? qabs_lo : qabs_hi;
                     const bool ok =
                         row < worker_rows && key >= split_start && key < split_end && key <= qabs &&
-                        paged_kv_block_selected(selected_blocks, key);
+                        paged_kv_block_selected(selected, key);
                     d_score[l] = ok ? d_score[l] * scale : -CUDART_INF_F;
                 }
 

@@ -62,3 +62,6 @@ profiles/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Fetched by CMake FetchContent for the sm_70 build (not vendored)
+third_party/cutlass/

@@ -39,7 +39,13 @@ struct PagedKVBatchLayerView {
     Tensor k_scale_pages;
     Tensor v_scale_pages;
     Tensor block_tables;
+    // KVMem ring: base of the per-ROW mask matrix (one row per execution row, i.e. per lane). The
+    // masks cannot be shared: two lanes evict different pages, so a single mask either lets one lane
+    // read a recycled slot that now holds the other lane's K/V or masks pages it still needs.
+    // `selection_words` is the row stride in 32-bit words; 0 means `selected_blocks` is the single
+    // per-sequence mask (prefill), which is what the non-batched kernels consume.
     const std::uint32_t* selected_blocks = nullptr;
+    std::int32_t selection_words = 0;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;

@@ -6,18 +6,44 @@
 #include "core/dtype.h"
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "runtime/engine/kv_window.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/state_image.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+
+// Pages ONE KVMem ring lane may hold resident on the Device: its resident window, one prefill chunk
+// (a chunk is mapped before any of it can be demoted, so the peak is window + chunk), and the
+// attention sink, which the ring never demotes. This is the bound the ring actually honours, so the
+// pool minimum, the plan's Device expectation and the owner footprint all use it -- with
+// --max-concurrency N, `N * ring_lane_resident_pages(...) + slack` is what the Device pool needs.
+[[nodiscard]] inline std::uint32_t ring_lane_resident_pages(std::uint32_t window_pages,
+                                                            std::uint32_t chunk_pages) {
+    const auto page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t sink_pages = (runtime::kv_ring_sink_tokens() + page_tokens - 1U) /
+                                     page_tokens;
+    return window_pages + chunk_pages + sink_pages;
+}
+
+// Device pages ONE ring lane may hold. One lane gets the whole pool, exactly as before multi-lane
+// support existed; N lanes each get an equal share. minimum_main_page_groups() guarantees that
+// share covers ring_lane_resident_pages(), so a lane can always map a whole chunk before it has to
+// demote anything.
+[[nodiscard]] inline std::uint32_t ring_lane_budget_pages(std::uint32_t pool_capacity_pages,
+                                                          std::uint32_t lanes) {
+    if (lanes <= 1) { return pool_capacity_pages; }
+    return std::max<std::uint32_t>(pool_capacity_pages / lanes, 1U);
+}
 
 using TensorLayout                              = TensorRegion;
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
