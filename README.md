@@ -193,6 +193,16 @@ Two limits this profile does not fix: **prefill is still serialized** (each requ
 own prefill time, and four requests' wall is four prefills back to back), and a lane that is already
 decoding drops from ~70 tok/s to **3–4 tok/s** while another lane prefills.
 
+Prefill throughput tracks the chunk's row count, so spend the artifact's VRAM headroom on it:
+`swift15` (8.15 GiB) fits `--prefill-chunk 2048` at four lanes and measures **1003 tok/s / 62.9 s
+wall / 15.7 s TTFT** against 870 / 72.3 s / 18.0 s for chunk 1024 (+15%). `coder390` (12.3 GiB)
+cannot: its runtime reservation needs 3.56 GB at chunk 2048 and only 3.29 GB is available.
+
+The decode rate during another lane's prefill is arithmetic, not a scheduling gap: the engine
+already alternates decode and prefill units (log: `prefill 733 tok/s | decode 1.2 tok/s | running 2
+(prefill 1, decode-ready 1)`), but one 1024-token chunk costs ~1.1 s, so the decoding lane gets one
+step per chunk. Smaller chunks buy responsiveness at the throughput listed above.
+
 ---
 
 ## Models on a 16GB V100 *(this fork)*
