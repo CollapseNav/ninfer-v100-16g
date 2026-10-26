@@ -397,14 +397,24 @@ public:
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand);
         if (!selected) {
-            // KVMem ring: with the ring on, a request larger than the Device pool is ADMITTED (its
-            // reservation is a logical promise) but cannot be SCHEDULED yet -- the ring's demotion
-            // of resident pages during growth is not implemented, so nothing can relieve the pool.
-            // TemporarilyBlocked would make an idle Engine throw "isolated-feasible request is
-            // blocked in an idle Engine" (HTTP 500) for a condition that is really a capacity limit.
-            // Report it as the capacity failure it is, which is also what the dense configuration
-            // reports for the same request, so the ring is never WORSE than dense.
+            // KVMem ring: a request larger than the Device pool is admitted on a logical promise and
+            // cannot be SCHEDULED yet. The old note here said the ring could not relieve the pool at
+            // all; grow_with_ring() now demotes, so with lanes already running this is a TRANSIENT
+            // wait -- the running lanes' pages are released as they finish -- and it must be queued,
+            // not failed. Failing it made four concurrent long prompts lose the fourth one to
+            // "context length exceeded" while three ran, which is a capacity wait reported as a
+            // permanent request error.
+            //
+            // An IDLE engine that cannot plan the request on its own is still permanent: nothing is
+            // holding the pool, so the configuration genuinely cannot serve it, and reporting that as
+            // the capacity failure (rather than letting the idle-engine guard raise a 500) keeps the
+            // ring no worse than the dense configuration.
             if (runtime::kv_ring_requested()) {
+                for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
+                    if (lanes_[lane] != LogicalLaneState::Free) {
+                        return {.readiness = Readiness::TemporarilyBlocked};
+                    }
+                }
                 return {.readiness = Readiness::PermanentlyInfeasible};
             }
             return {.readiness = Readiness::TemporarilyBlocked};
