@@ -171,6 +171,28 @@ at 574 tok/s prefill / 62 tok/s decode. CUDA graphs stay enabled; the per-lane m
 allocated at construction so a captured decode graph bakes a stable pointer, not the nullptr it
 would have captured from a lazily allocated mask (that nullptr is what mixed two prompts' K/V).
 
+### Medium context under concurrency: raise the prefill chunk *(this fork)*
+
+`coder390`, four concurrent requests of **15,442 prompt tokens** each, `--max-concurrency 4`, MTP
+draft 3, 256 output tokens:
+
+| profile | wall | prefill | TTFT | answers |
+|---|---:|---:|---:|---:|
+| `--prefill-chunk 512`, `NINFER_KV_WINDOW=4096`, pool 312 pages | 86.9 s | 720 tok/s | 21.6 s | 4/4 |
+| **`--prefill-chunk 1024`, `NINFER_KV_WINDOW=1024`, pool 152 pages** | **71.0 s** | **890 tok/s** | **17.5 s** | **4/4** |
+
+−18% wall, +24% prefill, −19% TTFT. The prefill GEMM is the int8/dp4a MMQ path, so doubling the
+chunk doubles its row count and the dp4a pipeline utilises better — the same effect that makes a
+wider decode batch cheaper per token.
+
+The chunk is bounded by VRAM: `prefill_chunk 1024` needs the smaller window to fit at four lanes
+(3.45 GB of runtime reservation vs 3.29 GB available); at two lanes the larger window fits. Chunk
+2048 does not fit at four lanes with this 12.3 GiB artifact.
+
+Two limits this profile does not fix: **prefill is still serialized** (each request's TTFT is its
+own prefill time, and four requests' wall is four prefills back to back), and a lane that is already
+decoding drops from ~70 tok/s to **3–4 tok/s** while another lane prefills.
+
 ---
 
 ## Models on a 16GB V100 *(this fork)*
