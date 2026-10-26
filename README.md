@@ -196,7 +196,13 @@ decoding drops from ~70 tok/s to **3–4 tok/s** while another lane prefills.
 Prefill throughput tracks the chunk's row count, so spend the artifact's VRAM headroom on it:
 `swift15` (8.15 GiB) fits `--prefill-chunk 2048` at four lanes and measures **1003 tok/s / 62.9 s
 wall / 15.7 s TTFT** against 870 / 72.3 s / 18.0 s for chunk 1024 (+15%). `coder390` (12.3 GiB)
-cannot: its runtime reservation needs 3.56 GB at chunk 2048 and only 3.29 GB is available.
+reaches chunk 2048 too once `--device-state-slots 2` gives back the checkpoint state images the
+default (one per lane) reserves: **1015 tok/s / 62.1 s wall / 15 s TTFT, 4/4 answers correct**,
+against 890 / 71.0 s / 17.5 s at chunk 1024.
+
+`--device-state-slots 0` is not usable: requests fail outright. One extra slot per lane is enough
+to keep every lane concurrent, and the rest of the default reservation is checkpoint capacity this
+profile does not need.
 
 The decode rate during another lane's prefill is arithmetic, not a scheduling gap: the engine
 already alternates decode and prefill units (log: `prefill 733 tok/s | decode 1.2 tok/s | running 2
