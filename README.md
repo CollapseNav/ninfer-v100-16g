@@ -204,6 +204,30 @@ against 890 / 71.0 s / 17.5 s at chunk 1024.
 to keep every lane concurrent, and the rest of the default reservation is checkpoint capacity this
 profile does not need.
 
+### Context-cache reuse does not survive the ring *(this fork)*
+
+The KVMem ring gives a sequence more logical context than the device pool holds, but a checkpoint it
+publishes cannot be restored: the ring keeps retention, not recall. The context cache therefore
+stops paying off under the ring.
+
+Measured on `swift15`, four concurrent 15,424-token prompts that share a 15,412-token prefix, with
+that prefix first prefilled once by a probe request:
+
+| | cache hit | prefill per request | TTFT | wall |
+|---|---:|---:|---:|---:|
+| ring (`NINFER_KV_WINDOW=1024`, pool 13,824) | **0** | 15.4K tokens | 14.7–15.2 s | **60.8 s** |
+| dense (`--kv-capacity 24576`) | **15,405** | **19 tokens** | **0.1–0.2 s** | **3.7 s** |
+
+Dense mode costs nothing when the prompts do *not* share a prefix: four distinct 15,424-token
+prompts take 63.0 s dense against 62.9 s ring at the same 1,035 tok/s prefill. So for medium context
+the dense configuration is strictly better, and the ring is worth its lost cache only when a
+sequence's logical context exceeds the device pool (the 77K single-request profile).
+
+Simultaneous arrivals do not coalesce in either mode: four shared-prefix requests sent together
+report a 0-token cache and each prefills the whole prefix, because the first has to publish before
+the rest can reuse. Turning that around needs prefill coalescing (one prefill of the common prefix,
+then per-request suffixes), which this fork does not implement.
+
 The decode rate during another lane's prefill is arithmetic, not a scheduling gap: the engine
 already alternates decode and prefill units (log: `prefill 733 tok/s | decode 1.2 tok/s | running 2
 (prefill 1, decode-ready 1)`), but one 1024-token chunk costs ~1.1 s, so the decoding lane gets one
