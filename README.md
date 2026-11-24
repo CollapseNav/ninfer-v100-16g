@@ -107,6 +107,64 @@ capacity | KV 24,576 tokens, int8, explicit | pages 384/4,096 | runtime 2.67 GiB
 
 ---
 
+## Which KVMem mode to run *(this fork)*
+
+Two configurations cover the workloads this fork was tuned on, and they are not interchangeable. The
+ring wins where a sequence's logical context exceeds the device pool; everywhere else it loses,
+because a checkpoint published under the ring cannot be restored and the context cache stops paying
+off (see [Context-cache reuse does not survive the ring](#context-cache-reuse-does-not-survive-the-ring-this-fork)).
+
+| workload | mode | why |
+|---|---|---|
+| one request, context beyond the device pool (77K–262K) | **KVMem ring** | dense cannot allocate that KV at all |
+| up to ~24K per request, several lanes | **dense** | same throughput, and shared prefixes hit the cache: 60.8 s → 3.7 s on 4×15.4K |
+| short requests | dense, small `--prefill-chunk` | the ring adds spill work for nothing |
+
+### Long single request: KVMem ring
+
+```bash
+NINFER_KV_WINDOW=16384 ./build-sm70/apps/ninfer-serve /models/swift15_iq2xs_mtp.ninfer \
+  --host 0.0.0.0 --port 8080 --cors \
+  --max-context 262144 --kv-capacity 24576 --host-kv-mib 12288 \
+  --kv-dtype int8 --prefill-chunk 512 --max-concurrency 1 \
+  --spec mtp --draft-tokens 3
+```
+
+At 128K context: 520 tok/s prefill, 59.5 tok/s decode, 2.23 GiB runtime (dense needs 5.79 GiB for the
+same prompt), needle at the start of a 124K prompt answered correctly.
+
+### Medium context, four lanes: dense
+
+```bash
+./build-sm70/apps/ninfer-serve /models/swift15_iq2xs_mtp.ninfer \
+  --host 0.0.0.0 --port 8080 --cors \
+  --max-context 24576 --kv-capacity 24576 \
+  --kv-dtype int8 --prefill-chunk 2048 --max-concurrency 4 --device-state-slots 2 \
+  --spec mtp --draft-tokens 3
+```
+
+Four concurrent 15,424-token prompts: 1,031 tok/s prefill, 63.0 s wall, all four answered; with the
+prefix already cached, the same four take 3.7 s. `--kv-capacity` equal to `--max-context` is what makes
+this dense, and leaving `NINFER_KV_WINDOW` unset is what keeps the cache usable.
+
+`coder390` (12.3 GiB) cannot run this dense at four lanes — its 15.4K/4-lane profile needs 3.34 GB of
+runtime against 3.29 GB available — so it stays on the ring (`window 1024`, `--prefill-chunk 2048`,
+`--device-state-slots 2`): 1,015 tok/s prefill, 62.1 s wall, no prefix reuse.
+
+### Sizing and diagnostics
+
+- **Window**: `16384` is the validated long-context value; the multi-lane profiles here use `1024`,
+  which is what lets the chunk reach 2048. No quality measurement exists, so a smaller window is a
+  throughput/memory trade with an unquantified quality cost.
+- **Pool**: `N × (window + prefill-chunk + sink) + 8` pages of 64 tokens. Startup prints the resolved
+  layout; a smaller number left of the slash (`pages 384/4,096`) means the ring is active.
+- **`kv_capacity is outside the usable range` at startup**: the pool is below that minimum — raise
+  `--kv-capacity`, or lower `--prefill-chunk`/window.
+- **Turning it off**: unset `NINFER_KV_WINDOW`. `--device-state-slots 0` is unusable (requests fail);
+  one extra slot per lane is enough and the rest of the default is checkpoint capacity.
+
+---
+
 ## KVMem: device pool smaller than the context *(this fork)*
 
 A 16GB V100 cannot hold the KV for a 262,144-token context. KVMem keeps only a resident window on the
