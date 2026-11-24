@@ -60,7 +60,6 @@ shares the card. Comparisons between rows of the same table are the part that ge
 | CPU | Intel Xeon E5-2696 v3 @ 2.30 GHz, 18 cores / 36 threads |
 | RAM | 61 GiB |
 | OS | Ubuntu 26.04.1 LTS, kernel 7.0.0-43-generic |
-| Disk | 179 GB NVMe, ~13 GB free while these runs were taken |
 | Client | same host over loopback HTTP (Python threads), no network hops |
 | Artifacts | `swift15_iq2xs_mtp.ninfer` 8.15 GiB; coder390 Q4-MTP 12.3 GiB |
 
