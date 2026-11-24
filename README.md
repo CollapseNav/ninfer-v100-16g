@@ -44,6 +44,31 @@ Two things follow from that table:
 
 ---
 
+## Measurement environment *(this fork)*
+
+Every number in this README was measured on the single machine below, one run per configuration
+rather than averaged over repeats. Treat them as *what this box does*, not as a specification:
+absolute throughput moves with the driver, the CUDA build, CPU fan-out, and anything else that
+shares the card. Comparisons between rows of the same table are the part that generalizes.
+
+| | |
+|---|---|
+| GPU | Tesla V100-SXM2-16GB, 16,384 MiB, compute capability 7.0, 300 W limit, ECC on |
+| GPU clocks under load | ~1,500 MHz (max 1,530), 281 W, 48 °C — no throttling observed |
+| Driver | 580.178.04 (reports CUDA 13.0) |
+| Build toolkit | CUDA 12.8.93 `nvcc`, host gcc 13.3.0, `-arch=sm_70`, Ninja `Release` |
+| CPU | Intel Xeon E5-2696 v3 @ 2.30 GHz, 18 cores / 36 threads |
+| RAM | 61 GiB |
+| OS | Ubuntu 26.04.1 LTS, kernel 7.0.0-43-generic |
+| Disk | 179 GB NVMe, ~13 GB free while these runs were taken |
+| Client | same host over loopback HTTP (Python threads), no network hops |
+| Artifacts | `swift15_iq2xs_mtp.ninfer` 8.15 GiB; coder390 Q4-MTP 12.3 GiB |
+
+The card was idle apart from the server under test, and "concurrency" here always means lanes inside
+one `ninfer-serve` process, never several processes on the card.
+
+---
+
 ## Build
 
 ```bash
